@@ -17,17 +17,21 @@ Milestone 1: rough MDGA chrome on GPU —
 
 Painted with Pillow → uploaded as a wgpu texture (crude, fine for POC).
 
-## Run (no install of this package required)
+## Install (library)
 
 ```bash
-# deps once in the shared DNA venv
 source ../venv/bin/activate
-pip install wgpu rendercanvas glfw pillow
+pip install -e /path/to/textual-wgpu
+```
 
-# from textual-wgpu
-PYTHONPATH=src python -m textual_wgpu
+## Run
 
-# or from make-dna-great-again (experimental branch)
+```bash
+textual-wgpu-demo
+# or
+python -m textual_wgpu
+
+# from make-dna-great-again (experimental branch)
 python -m ydna --ui wgpu
 ```
 

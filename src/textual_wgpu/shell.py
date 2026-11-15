@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import sys
-from typing import Any
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -33,6 +34,17 @@ MUTED = (140, 130, 150, 255)
 ACCENT = (212, 173, 114, 255)
 ACTIVE_BG = (212, 173, 114, 255)
 ACTIVE_FG = (18, 16, 22, 255)
+MODAL_DIM = (0, 0, 0, 160)
+MODAL_BG = (40, 36, 48, 255)
+
+
+@dataclass(frozen=True)
+class Hit:
+    x0: int
+    y0: int
+    x1: int
+    y1: int
+    action: Callable[[], None]
 
 
 def _font(size: int) -> ImageFont.ImageFont:
@@ -60,12 +72,13 @@ class ShellApp(App):
     def __init__(self) -> None:
         super().__init__()
         self.mode_index = 0
+        self.quit_modal = False
         self._blitter: FrameBlitter | None = None
-        self._dirty = True
         self._pixel_size = self.SIZE
         self._font = _font(15)
         self._font_sm = _font(13)
         self._font_lg = _font(22)
+        self._hits: list[Hit] = []
 
     @property
     def mode_key(self) -> str:
@@ -80,34 +93,59 @@ class ShellApp(App):
         self._blitter = FrameBlitter(self._device, self._format)
         for i in range(10):
             self.bind(f"f{i + 1}", lambda i=i: self.set_mode(i))
-        self.bind("q", self.exit)
-        self.bind("escape", self.exit)
-        print("shell · F1–F10 modes · Q quit", file=sys.stderr, flush=True)
-        if self._canvas is not None:
-            @self._canvas.add_event_handler("resize")
-            def _on_resize(event: dict) -> None:
-                w = int(event.get("width") or self._pixel_size[0])
-                h = int(event.get("height") or self._pixel_size[1])
-                if w > 0 and h > 0:
-                    self._pixel_size = (w, h)
-                    self._dirty = True
-                    self._canvas.request_draw(self.draw)
+        self.bind("q", self.ask_quit)
+        self.bind("escape", self.on_escape)
+        self.bind("y", self.confirm_quit_yes)
+        self.bind("n", self.confirm_quit_no)
+        self.bind("enter", self.confirm_quit_yes)
+        self.bind("return", self.confirm_quit_yes)
+        print("shell · F1–F10 · click ModeBar · Q quit modal", file=sys.stderr, flush=True)
 
-            @self._canvas.add_event_handler("key_down")
-            def _redraw(_event: dict) -> None:
-                # Binding already ran; force a frame after mode switch.
-                self._dirty = True
-                self._canvas.request_draw(self.draw)
+    def on_resize(self, width: int, height: int) -> None:
+        self._pixel_size = (width, height)
+
+    def on_pointer(self, x: float, y: float, button: int) -> None:
+        if button not in (0, 1):  # primary
+            return
+        ix, iy = int(x), int(y)
+        # Topmost hit wins (modal buttons are appended last).
+        for hit in reversed(self._hits):
+            if hit.x0 <= ix < hit.x1 and hit.y0 <= iy < hit.y1:
+                hit.action()
+                return
 
     def set_mode(self, index: int) -> None:
+        if self.quit_modal:
+            return
         if 0 <= index < len(MODE_LABELS):
             self.mode_index = index
-            self._dirty = True
+
+    def ask_quit(self) -> None:
+        self.quit_modal = True
+
+    def on_escape(self) -> None:
+        if self.quit_modal:
+            self.quit_modal = False
+        else:
+            self.ask_quit()
+
+    def confirm_quit_yes(self) -> None:
+        if self.quit_modal:
+            self.exit()
+
+    def confirm_quit_no(self) -> None:
+        if self.quit_modal:
+            self.quit_modal = False
+
+    def _add_hit(self, box: tuple[int, int, int, int], action: Callable[[], None]) -> None:
+        x0, y0, x1, y1 = box
+        self._hits.append(Hit(x0, y0, x1, y1, action))
 
     def _paint(self) -> Image.Image:
         w, h = self._pixel_size
         img = Image.new("RGBA", (w, h), BG)
         draw = ImageDraw.Draw(img)
+        self._hits = []
 
         # ModeBar
         draw.rectangle([0, 0, w, self.BAR_H], fill=BAR)
@@ -118,21 +156,26 @@ class ShellApp(App):
             tw = bbox[2] - bbox[0] + 14
             th = bbox[3] - bbox[1] + 8
             y = (self.BAR_H - th) // 2
+            box = (x, y, x + tw, y + th)
             if i == self.mode_index:
-                draw.rectangle([x, y, x + tw, y + th], fill=ACTIVE_BG)
+                draw.rectangle(box, fill=ACTIVE_BG)
                 draw.text((x + 7, y + 3), label, font=self._font_sm, fill=ACTIVE_FG)
             else:
                 draw.text((x + 7, y + 3), label, font=self._font_sm, fill=MUTED)
+            self._add_hit(box, lambda i=i: self.set_mode(i))
             x += tw + 6
 
         # Body
         body_top = self.BAR_H + 2
         body_bot = h - self.KEY_H - self.STATUS_H - 2
         draw.rectangle([8, body_top, w - 8, body_bot], fill=BODY, outline=ACCENT)
-        title = self.mode_title
-        note = "Rough shell — body placeholder (no screen copy yet)"
-        draw.text((28, body_top + 28), title, font=self._font_lg, fill=TEXT)
-        draw.text((28, body_top + 64), note, font=self._font, fill=MUTED)
+        draw.text((28, body_top + 28), self.mode_title, font=self._font_lg, fill=TEXT)
+        draw.text(
+            (28, body_top + 64),
+            "Rough shell — click ModeBar · Q opens quit modal",
+            font=self._font,
+            fill=MUTED,
+        )
         draw.text(
             (28, body_top + 96),
             f"mode key: {self.mode_key}",
@@ -143,8 +186,23 @@ class ShellApp(App):
         # KeyBar
         key_y = h - self.STATUS_H - self.KEY_H
         draw.rectangle([0, key_y, w, key_y + self.KEY_H], fill=BAR)
-        keys = f"F1–F10 Mode   Q Quit   ·  {self.mode_title}"
-        draw.text((12, key_y + 8), keys, font=self._font_sm, fill=MUTED)
+        draw.text((12, key_y + 8), "F1–F10 Mode", font=self._font_sm, fill=MUTED)
+        q_label = "Q Quit"
+        q_bbox = draw.textbbox((0, 0), q_label, font=self._font_sm)
+        qx = 140
+        qy = key_y + 6
+        qw = q_bbox[2] - q_bbox[0] + 16
+        qh = q_bbox[3] - q_bbox[1] + 8
+        q_box = (qx, qy, qx + qw, qy + qh)
+        draw.rectangle(q_box, outline=ACCENT)
+        draw.text((qx + 8, qy + 3), q_label, font=self._font_sm, fill=ACCENT)
+        self._add_hit(q_box, self.ask_quit)
+        draw.text(
+            (qx + qw + 16, key_y + 8),
+            f"·  {self.mode_title}",
+            font=self._font_sm,
+            fill=MUTED,
+        )
 
         # Status
         st_y = h - self.STATUS_H
@@ -155,16 +213,42 @@ class ShellApp(App):
             font=self._font_sm,
             fill=ACCENT,
         )
+
+        if self.quit_modal:
+            self._paint_quit_modal(draw, w, h)
+
         return img
+
+    def _paint_quit_modal(self, draw: ImageDraw.ImageDraw, w: int, h: int) -> None:
+        draw.rectangle([0, 0, w, h], fill=MODAL_DIM)
+        mw, mh = 360, 160
+        mx = (w - mw) // 2
+        my = (h - mh) // 2
+        draw.rectangle([mx, my, mx + mw, my + mh], fill=MODAL_BG, outline=ACCENT, width=2)
+        draw.text((mx + 28, my + 28), "Quit MDGA?", font=self._font_lg, fill=TEXT)
+        draw.text(
+            (mx + 28, my + 64),
+            "Y / Enter — yes    N / Esc — no",
+            font=self._font_sm,
+            fill=MUTED,
+        )
+
+        bw, bh = 100, 34
+        yes = (mx + 40, my + mh - 52, mx + 40 + bw, my + mh - 52 + bh)
+        no = (mx + mw - 40 - bw, my + mh - 52, mx + mw - 40, my + mh - 52 + bh)
+        draw.rectangle(yes, fill=ACTIVE_BG)
+        draw.text((yes[0] + 28, yes[1] + 8), "Yes", font=self._font, fill=ACTIVE_FG)
+        draw.rectangle(no, outline=MUTED)
+        draw.text((no[0] + 34, no[1] + 8), "No", font=self._font, fill=TEXT)
+        self._add_hit(yes, self.confirm_quit_yes)
+        self._add_hit(no, self.confirm_quit_no)
 
     def draw(self) -> None:
         if self._blitter is None or self._context is None:
             return
         try:
-            # Always paint for POC (cheap at this resolution).
             img = self._paint()
             self._blitter.upload(img.tobytes("raw", "RGBA"), img.size)
-            self._dirty = False
             view = self._context.get_current_texture().create_view()
             self._blitter.draw(view)
         except Exception as exc:  # noqa: BLE001

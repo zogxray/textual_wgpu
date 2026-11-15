@@ -1,4 +1,4 @@
-"""Minimal App shell: window, clear color, key bindings, draw hook."""
+"""Minimal App shell: window, clear color, key bindings, pointer, draw hook."""
 
 from __future__ import annotations
 
@@ -23,16 +23,23 @@ class App:
         self._context: Any = None
         self._format: str | None = None
         self._running = False
-        self._bindings: dict[str, Callable[[], None]] = {
-            "q": self.exit,
-            "escape": self.exit,
-        }
+        self._bindings: dict[str, Callable[[], None]] = {}
 
     def bind(self, key: str, callback: Callable[[], None]) -> None:
         self._bindings[key.lower()] = callback
 
+    def request_draw(self) -> None:
+        if self._canvas is not None:
+            self._canvas.request_draw(self.draw)
+
     def on_mount(self) -> None:
         """Override for setup after the GPU context exists."""
+
+    def on_pointer(self, x: float, y: float, button: int) -> None:
+        """Override for mouse / touch. Coordinates are canvas pixels."""
+
+    def on_resize(self, width: int, height: int) -> None:
+        """Override when the canvas size changes."""
 
     def draw(self) -> None:
         """Override to issue GPU work each frame. Default: clear only."""
@@ -87,7 +94,24 @@ class App:
             cb = self._bindings.get(key)
             if cb is not None:
                 cb()
+            self.request_draw()
+
+        @self._canvas.add_event_handler("pointer_down")
+        def _on_pointer(event: dict) -> None:
+            x = float(event.get("x") or 0)
+            y = float(event.get("y") or 0)
+            button = int(event.get("button") or 1)
+            self.on_pointer(x, y, button)
+            self.request_draw()
+
+        @self._canvas.add_event_handler("resize")
+        def _on_resize(event: dict) -> None:
+            w = int(event.get("width") or 0)
+            h = int(event.get("height") or 0)
+            if w > 0 and h > 0:
+                self.on_resize(w, h)
+                self.request_draw()
 
         self.on_mount()
-        self._canvas.request_draw(self.draw)
+        self.request_draw()
         loop.run()
