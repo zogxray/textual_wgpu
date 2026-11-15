@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "textual-wgpu"
+version = "0.1.0"
+description = "Textual-inspired UI runtime on wgpu (not a Textual drop-in yet)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "MDGA / textual-wgpu" }]
+dependencies = [
+  "wgpu>=0.22",
+  "rendercanvas>=2.0",
+  "glfw>=2.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+textual-wgpu-demo = "textual_wgpu.demo:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/textual_wgpu"]
+
+[tool.hatch.build.targets.wheel.sources]
+"src/textual_wgpu" = "textual_wgpu"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
