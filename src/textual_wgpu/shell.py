@@ -1,4 +1,7 @@
-"""Rough MDGA chrome: ModeBar + body + KeyBar + status (CPU paint → GPU blit)."""
+"""Rough app chrome: ModeBar + body + KeyBar + status (CPU paint → GPU blit).
+
+Colors come only from ``Theme`` supplied by the application (or ``Theme.system()``).
+"""
 
 from __future__ import annotations
 
@@ -10,8 +13,9 @@ from PIL import Image, ImageDraw, ImageFont
 
 from .app import App
 from .blit import FrameBlitter
+from .theme import Theme
 
-# Same order as MDGA MODE_LABELS — labels only, no DNA logic.
+# Generic mode labels for the chrome demo (apps can replace later).
 MODE_LABELS = (
     ("genome", "Genome"),
     ("data", "Data"),
@@ -24,18 +28,6 @@ MODE_LABELS = (
     ("samples", "Samples"),
     ("help", "Help"),
 )
-
-# Brand-ish dark + gold (rough, not pixel-perfect Textual theme).
-BG = (18, 16, 22, 255)
-BAR = (32, 28, 38, 255)
-BODY = (24, 22, 30, 255)
-TEXT = (251, 246, 240, 255)
-MUTED = (140, 130, 150, 255)
-ACCENT = (212, 173, 114, 255)
-ACTIVE_BG = (212, 173, 114, 255)
-ACTIVE_FG = (18, 16, 22, 255)
-MODAL_DIM = (0, 0, 0, 160)
-MODAL_BG = (40, 36, 48, 255)
 
 
 @dataclass(frozen=True)
@@ -63,16 +55,16 @@ def _font(size: int) -> ImageFont.ImageFont:
 class ShellApp(App):
     """Shared shell sketch. Body is a placeholder per mode."""
 
-    TITLE = "MDGA · textual-wgpu shell"
+    TITLE = "textual-wgpu shell"
     SIZE = (1100, 700)
-    # Opaque clear while the first blit prepares (avoids transparent flash).
-    CLEAR = (18 / 255, 16 / 255, 22 / 255, 1.0)
     BAR_H = 36
     KEY_H = 32
     STATUS_H = 28
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, theme: Theme | None = None, *, title: str | None = None) -> None:
+        super().__init__(theme=theme)
+        if title:
+            self.TITLE = title
         self.mode_index = 0
         self.quit_modal = False
         self._blitter: FrameBlitter | None = None
@@ -107,10 +99,9 @@ class ShellApp(App):
         self._pixel_size = (width, height)
 
     def on_pointer(self, x: float, y: float, button: int) -> None:
-        if button not in (0, 1):  # primary
+        if button not in (0, 1):
             return
         ix, iy = int(x), int(y)
-        # Topmost hit wins (modal buttons are appended last).
         for hit in reversed(self._hits):
             if hit.x0 <= ix < hit.x1 and hit.y0 <= iy < hit.y1:
                 hit.action()
@@ -144,13 +135,23 @@ class ShellApp(App):
         self._hits.append(Hit(x0, y0, x1, y1, action))
 
     def _paint(self) -> Image.Image:
+        t = self.theme
+        bg = t.rgba("background")
+        bar = t.rgba("boost")
+        body = t.rgba("panel")
+        text = t.rgba("foreground")
+        muted = t.rgba("muted")
+        accent = t.rgba("accent")
+        active_bg = accent
+        active_fg = t.rgba("background")
+        modal_bg = t.rgba("surface")
+
         w, h = self._pixel_size
-        img = Image.new("RGBA", (w, h), BG)
+        img = Image.new("RGBA", (w, h), bg)
         draw = ImageDraw.Draw(img)
         self._hits = []
 
-        # ModeBar
-        draw.rectangle([0, 0, w, self.BAR_H], fill=BAR)
+        draw.rectangle([0, 0, w, self.BAR_H], fill=bar)
         x = 10
         for i, (_key, title) in enumerate(MODE_LABELS):
             label = f"F{i + 1} {title}"
@@ -160,35 +161,33 @@ class ShellApp(App):
             y = (self.BAR_H - th) // 2
             box = (x, y, x + tw, y + th)
             if i == self.mode_index:
-                draw.rectangle(box, fill=ACTIVE_BG)
-                draw.text((x + 7, y + 3), label, font=self._font_sm, fill=ACTIVE_FG)
+                draw.rectangle(box, fill=active_bg)
+                draw.text((x + 7, y + 3), label, font=self._font_sm, fill=active_fg)
             else:
-                draw.text((x + 7, y + 3), label, font=self._font_sm, fill=MUTED)
+                draw.text((x + 7, y + 3), label, font=self._font_sm, fill=muted)
             self._add_hit(box, lambda i=i: self.set_mode(i))
             x += tw + 6
 
-        # Body
         body_top = self.BAR_H + 2
         body_bot = h - self.KEY_H - self.STATUS_H - 2
-        draw.rectangle([8, body_top, w - 8, body_bot], fill=BODY, outline=ACCENT)
-        draw.text((28, body_top + 28), self.mode_title, font=self._font_lg, fill=TEXT)
+        draw.rectangle([8, body_top, w - 8, body_bot], fill=body, outline=accent)
+        draw.text((28, body_top + 28), self.mode_title, font=self._font_lg, fill=text)
         draw.text(
             (28, body_top + 64),
-            "Rough shell — click ModeBar · Q opens quit modal",
+            "Shell chrome — theme from app / Theme.system()",
             font=self._font,
-            fill=MUTED,
+            fill=muted,
         )
         draw.text(
             (28, body_top + 96),
             f"mode key: {self.mode_key}",
             font=self._font_sm,
-            fill=MUTED,
+            fill=muted,
         )
 
-        # KeyBar
         key_y = h - self.STATUS_H - self.KEY_H
-        draw.rectangle([0, key_y, w, key_y + self.KEY_H], fill=BAR)
-        draw.text((12, key_y + 8), "F1–F10 Mode", font=self._font_sm, fill=MUTED)
+        draw.rectangle([0, key_y, w, key_y + self.KEY_H], fill=bar)
+        draw.text((12, key_y + 8), "F1–F10 Mode", font=self._font_sm, fill=muted)
         q_label = "Q Quit"
         q_bbox = draw.textbbox((0, 0), q_label, font=self._font_sm)
         qx = 140
@@ -196,54 +195,51 @@ class ShellApp(App):
         qw = q_bbox[2] - q_bbox[0] + 16
         qh = q_bbox[3] - q_bbox[1] + 8
         q_box = (qx, qy, qx + qw, qy + qh)
-        draw.rectangle(q_box, outline=ACCENT)
-        draw.text((qx + 8, qy + 3), q_label, font=self._font_sm, fill=ACCENT)
+        draw.rectangle(q_box, outline=accent)
+        draw.text((qx + 8, qy + 3), q_label, font=self._font_sm, fill=accent)
         self._add_hit(q_box, self.ask_quit)
         draw.text(
             (qx + qw + 16, key_y + 8),
             f"·  {self.mode_title}",
             font=self._font_sm,
-            fill=MUTED,
+            fill=muted,
         )
 
-        # Status
         st_y = h - self.STATUS_H
-        draw.rectangle([0, st_y, w, h], fill=BAR)
+        draw.rectangle([0, st_y, w, h], fill=bar)
         draw.text(
             (12, st_y + 6),
-            f"textual-wgpu shell · {w}×{h} · {self.mode_key}",
+            f"textual-wgpu · {w}×{h} · {self.mode_key}",
             font=self._font_sm,
-            fill=ACCENT,
+            fill=accent,
         )
 
         if self.quit_modal:
-            self._paint_quit_modal(draw, w, h)
+            draw.rectangle([0, 0, w, h], fill=(0, 0, 0, 160))
+            mw, mh = 360, 160
+            mx = (w - mw) // 2
+            my = (h - mh) // 2
+            draw.rectangle(
+                [mx, my, mx + mw, my + mh], fill=modal_bg, outline=accent, width=2,
+            )
+            draw.text((mx + 28, my + 28), "Quit?", font=self._font_lg, fill=text)
+            draw.text(
+                (mx + 28, my + 64),
+                "Y / Enter — yes    N / Esc — no",
+                font=self._font_sm,
+                fill=muted,
+            )
+            bw, bh = 100, 34
+            yes = (mx + 40, my + mh - 52, mx + 40 + bw, my + mh - 52 + bh)
+            no = (mx + mw - 40 - bw, my + mh - 52, mx + mw - 40, my + mh - 52 + bh)
+            draw.rectangle(yes, fill=active_bg)
+            draw.text((yes[0] + 28, yes[1] + 8), "Yes", font=self._font, fill=active_fg)
+            draw.rectangle(no, outline=muted)
+            draw.text((no[0] + 34, no[1] + 8), "No", font=self._font, fill=text)
+            self._add_hit(yes, self.confirm_quit_yes)
+            self._add_hit(no, self.confirm_quit_no)
 
         return img
-
-    def _paint_quit_modal(self, draw: ImageDraw.ImageDraw, w: int, h: int) -> None:
-        draw.rectangle([0, 0, w, h], fill=MODAL_DIM)
-        mw, mh = 360, 160
-        mx = (w - mw) // 2
-        my = (h - mh) // 2
-        draw.rectangle([mx, my, mx + mw, my + mh], fill=MODAL_BG, outline=ACCENT, width=2)
-        draw.text((mx + 28, my + 28), "Quit MDGA?", font=self._font_lg, fill=TEXT)
-        draw.text(
-            (mx + 28, my + 64),
-            "Y / Enter — yes    N / Esc — no",
-            font=self._font_sm,
-            fill=MUTED,
-        )
-
-        bw, bh = 100, 34
-        yes = (mx + 40, my + mh - 52, mx + 40 + bw, my + mh - 52 + bh)
-        no = (mx + mw - 40 - bw, my + mh - 52, mx + mw - 40, my + mh - 52 + bh)
-        draw.rectangle(yes, fill=ACTIVE_BG)
-        draw.text((yes[0] + 28, yes[1] + 8), "Yes", font=self._font, fill=ACTIVE_FG)
-        draw.rectangle(no, outline=MUTED)
-        draw.text((no[0] + 34, no[1] + 8), "No", font=self._font, fill=TEXT)
-        self._add_hit(yes, self.confirm_quit_yes)
-        self._add_hit(no, self.confirm_quit_no)
 
     def draw(self) -> None:
         if self._blitter is None or self._context is None:
@@ -258,8 +254,8 @@ class ShellApp(App):
             raise
 
 
-def main() -> None:
-    ShellApp().run()
+def main(theme: Theme | None = None) -> None:
+    ShellApp(theme=theme or Theme.system()).run()
 
 
 if __name__ == "__main__":

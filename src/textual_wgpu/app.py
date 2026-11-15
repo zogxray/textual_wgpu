@@ -1,29 +1,35 @@
-"""Minimal App shell: window, clear color, key bindings, pointer, draw hook."""
+"""Minimal App shell: window, theme, bindings, pointer, draw hook."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from typing import Any
 
+from .theme import Theme
+
 
 class App:
     """Tiny Textual-flavoured shell.
 
-    Not API-compatible with Textual. Enough to host a GPU demo and grow
-    toward screens / compose later.
+    Not API-compatible with Textual. The application owns the Theme;
+    this runtime only paints with it (same idea as Textual + terminal/app CSS).
     """
 
     TITLE = "textual-wgpu"
     SIZE = (960, 600)
-    CLEAR = (0.05, 0.35, 0.18, 1.0)
 
-    def __init__(self) -> None:
+    def __init__(self, theme: Theme | None = None) -> None:
+        self.theme = theme or Theme.system()
         self._canvas: Any = None
         self._device: Any = None
         self._context: Any = None
         self._format: str | None = None
         self._running = False
         self._bindings: dict[str, Callable[[], None]] = {}
+
+    @property
+    def CLEAR(self) -> tuple[float, float, float, float]:
+        return self.theme.clear_rgba_f()
 
     def bind(self, key: str, callback: Callable[[], None]) -> None:
         self._bindings[key.lower()] = callback
@@ -113,15 +119,12 @@ class App:
                 self.request_draw()
 
         self.on_mount()
-        # Sync size from the real framebuffer before the first paint.
         try:
             pw, ph = self._canvas.get_physical_size()
             if pw > 0 and ph > 0:
                 self.on_resize(int(pw), int(ph))
         except Exception:  # noqa: BLE001
             pass
-        # Register the draw callback, then present one frame *before* the
-        # event loop — otherwise GLFW shows an empty/transparent window.
         self.request_draw()
         try:
             self._canvas.force_draw()

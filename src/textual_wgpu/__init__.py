@@ -2,6 +2,7 @@
 
 from .app import App
 from .shell import ShellApp
+from .theme import Theme
 
 __version__ = "0.1.0"
-__all__ = ["App", "ShellApp", "__version__"]
+__all__ = ["App", "ShellApp", "Theme", "__version__"]

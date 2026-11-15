@@ -11,11 +11,15 @@ keep using Textual until this API is useful enough to try one screen.
 
 ## Status
 
-Milestone 1: rough MDGA chrome on GPU —
+Milestone 1: rough app chrome on GPU —
 
 `ModeBar` (F1–F10) · placeholder `body` · `KeyBar` · `status`
 
 Painted with Pillow → uploaded as a wgpu texture (crude, fine for POC).
+
+**Theme:** the library does not own brand colors. Pass ``Theme`` from the app
+(``Theme.from_mapping(...)``) or use ``Theme.system()`` (host light/dark).
+Same idea as Textual: app/host style → runtime paints.
 
 ## Install (library)
 
