@@ -59,7 +59,15 @@ class App:
     def exit(self) -> None:
         self._running = False
         if self._canvas is not None:
-            self._canvas.close()
+            try:
+                self._canvas.close()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            from rendercanvas.auto import loop
+            loop.stop()
+        except Exception:  # noqa: BLE001
+            pass
 
     def run(self) -> None:
         import wgpu

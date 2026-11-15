@@ -11,44 +11,44 @@ keep using Textual until this API is useful enough to try one screen.
 
 ## Status
 
-Milestone 0: GPU window that clears a color and quits on **Q**.
+Milestone 1: rough MDGA chrome on GPU —
 
-## Install
+`ModeBar` (F1–F10) · placeholder `body` · `KeyBar` · `status`
+
+Painted with Pillow → uploaded as a wgpu texture (crude, fine for POC).
+
+## Run (no install of this package required)
 
 ```bash
-# from DNA/textual-wgpu
-python -m venv .venv && source .venv/bin/activate
-pip install -e .
-
-# or into the shared DNA venv
+# deps once in the shared DNA venv
 source ../venv/bin/activate
-pip install -e .
+pip install wgpu rendercanvas glfw pillow
+
+# from textual-wgpu
+PYTHONPATH=src python -m textual_wgpu
+
+# or from make-dna-great-again (experimental branch)
+python -m ydna --ui wgpu
 ```
 
-## Demo
-
-```bash
-textual-wgpu-demo
-# or
-python -m textual_wgpu
-```
-
+- **F1–F10** — switch mode (body title only)  
 - **Q** / Escape — quit  
-- green clear color = GPU path is alive  
 
 ## Layout
 
 ```text
 src/textual_wgpu/
-  app.py      # tiny App shell (bindings + draw hook)
-  demo.py     # milestone-0 clear-screen demo
+  app.py      # window, bindings, draw hook
+  blit.py     # RGBA → fullscreen GPU blit
+  shell.py    # ModeBar + body + KeyBar + status
+  demo.py     # milestone-0 clear-screen
 ```
 
 ## Next (not done)
 
-1. `compose` + one text/static widget  
-2. `Viewport3D` (rotating cube)  
-3. Grow API toward what MDGA actually imports from Textual  
+1. Clickable ModeBar  
+2. One real mode body (e.g. F6 panels, still rough)  
+3. `Viewport3D` inside body  
 
 ## Non-goals (for now)
 

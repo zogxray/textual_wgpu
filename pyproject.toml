@@ -14,13 +14,14 @@ dependencies = [
   "wgpu>=0.22",
   "rendercanvas>=2.0",
   "glfw>=2.6",
+  "pillow>=10.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 
 [project.scripts]
-textual-wgpu-demo = "textual_wgpu.demo:main"
+textual-wgpu-demo = "textual_wgpu.shell:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/textual_wgpu"]
