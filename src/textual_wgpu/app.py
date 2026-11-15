@@ -51,23 +51,57 @@ class App:
         """Override to issue GPU work each frame. Default: clear only."""
         self.clear()
 
-    def clear(self, color: tuple[float, float, float, float] | None = None) -> None:
+    def _wgpu_surface(self) -> Any:
+        """Underlying wgpu GPUCanvasContext (rendercanvas wraps it)."""
+        ctx = self._context
+        if ctx is None:
+            return None
+        return getattr(ctx, "_wgpu_context", None) or ctx
+
+    def clear(
+        self,
+        color: tuple[float, float, float, float] | None = None,
+        *,
+        present: bool = True,
+    ) -> None:
+        """Fill the swapchain with an opaque color and optionally present it."""
         import wgpu
 
         assert self._device is not None and self._context is not None
+        c = color or self.CLEAR
+        # Force opaque — transparent flash is usually alpha=0 leftovers.
+        if len(c) == 4 and c[3] < 1.0:
+            c = (c[0], c[1], c[2], 1.0)
         encoder = self._device.create_command_encoder()
         view = self._context.get_current_texture().create_view()
         encoder.begin_render_pass(
             color_attachments=[
                 {
                     "view": view,
-                    "clear_value": color or self.CLEAR,
+                    "clear_value": c,
                     "load_op": wgpu.LoadOp.clear,
                     "store_op": wgpu.StoreOp.store,
                 }
             ]
         ).end()
         self._device.queue.submit([encoder.finish()])
+        if present:
+            surf = self._wgpu_surface()
+            if surf is not None and hasattr(surf, "present"):
+                surf.present()
+
+    def _set_window_visible(self, visible: bool) -> None:
+        try:
+            import glfw
+            win = getattr(self._canvas, "_window", None)
+            if win is None:
+                return
+            if visible:
+                glfw.show_window(win)
+            else:
+                glfw.hide_window(win)
+        except Exception:  # noqa: BLE001
+            pass
 
     def exit(self) -> None:
         self._running = False
@@ -89,10 +123,16 @@ class App:
         adapter = wgpu.gpu.request_adapter_sync()
         self._device = adapter.request_device_sync()
         self._canvas = RenderCanvas(size=self.SIZE, title=self.TITLE)
+        # GLFW shows the window during __init__; hide until we solid-fill.
+        self._set_window_visible(False)
         self._context = self._canvas.get_wgpu_context()
         self._format = self._context.get_preferred_format(self._device.adapter)
         self._context.configure(device=self._device, format=self._format)
         self._running = True
+
+        # Immediate opaque fill + present (no UI yet — just theme background).
+        self.clear(present=True)
+        self._set_window_visible(True)
 
         @self._canvas.add_event_handler("key_down")
         def _on_key(event: dict) -> None:
@@ -116,6 +156,8 @@ class App:
             h = int(event.get("height") or 0)
             if w > 0 and h > 0:
                 self.on_resize(w, h)
+                # Keep resize flashes opaque.
+                self.clear(present=True)
                 self.request_draw()
 
         self.on_mount()
@@ -129,8 +171,5 @@ class App:
         try:
             self._canvas.force_draw()
         except Exception:  # noqa: BLE001
-            try:
-                self.clear()
-            except Exception:  # noqa: BLE001
-                pass
+            self.clear(present=True)
         loop.run()
