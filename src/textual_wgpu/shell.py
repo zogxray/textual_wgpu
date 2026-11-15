@@ -65,6 +65,8 @@ class ShellApp(App):
 
     TITLE = "MDGA · textual-wgpu shell"
     SIZE = (1100, 700)
+    # Opaque clear while the first blit prepares (avoids transparent flash).
+    CLEAR = (18 / 255, 16 / 255, 22 / 255, 1.0)
     BAR_H = 36
     KEY_H = 32
     STATUS_H = 28

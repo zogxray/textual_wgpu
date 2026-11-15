@@ -113,5 +113,21 @@ class App:
                 self.request_draw()
 
         self.on_mount()
+        # Sync size from the real framebuffer before the first paint.
+        try:
+            pw, ph = self._canvas.get_physical_size()
+            if pw > 0 and ph > 0:
+                self.on_resize(int(pw), int(ph))
+        except Exception:  # noqa: BLE001
+            pass
+        # Register the draw callback, then present one frame *before* the
+        # event loop — otherwise GLFW shows an empty/transparent window.
         self.request_draw()
+        try:
+            self._canvas.force_draw()
+        except Exception:  # noqa: BLE001
+            try:
+                self.clear()
+            except Exception:  # noqa: BLE001
+                pass
         loop.run()
