@@ -126,7 +126,10 @@ class App:
         # GLFW shows the window during __init__; hide until we solid-fill.
         self._set_window_visible(False)
         self._context = self._canvas.get_wgpu_context()
-        self._format = self._context.get_preferred_format(self._device.adapter)
+        preferred = self._context.get_preferred_format(self._device.adapter)
+        # Pillow / theme hexes are already sRGB bytes. Prefer a *non*-sRGB
+        # surface so those values are not gamma-encoded again (washed-out UI).
+        self._format = str(preferred).replace("-srgb", "") or "bgra8unorm"
         self._context.configure(device=self._device, format=self._format)
         self._running = True
 

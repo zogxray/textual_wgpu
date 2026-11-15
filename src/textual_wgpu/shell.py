@@ -174,7 +174,7 @@ class ShellApp(App):
         draw.text((28, body_top + 28), self.mode_title, font=self._font_lg, fill=text)
         draw.text(
             (28, body_top + 64),
-            "Shell chrome — theme from app / Theme.system()",
+            f"Shell chrome · accent {t.accent} · bg {t.background}",
             font=self._font,
             fill=muted,
         )
