@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from ..fonts import cell_width, columns_for_width
+from ..fonts import cell_height, cell_width, columns_for_width
 from ..geometry import Rect
 from ..widget import Widget
 from .containers import Vertical
@@ -56,6 +56,7 @@ class ScrollableContainer(Widget):
             self.child = Static("")
 
         self.scroll_y = 0
+        self.scroll_py: float = 0.0
         self.scroll_x = 0
         self._scrollbar = Scrollbar(vertical=True, on_scroll=self._on_bar_scroll)
         self._hbar = Scrollbar(vertical=False, on_scroll=self._on_hbar_scroll)
@@ -105,14 +106,15 @@ class ScrollableContainer(Widget):
 
     def _sync_scrollbar(self) -> None:
         if self._allow_vertical:
-            max_s = self._max_scroll()
+            rh = self._row_h
+            max_px = self._max_scroll() * rh
             total = max(1, self._line_count())
             visible = self._visible_lines()
-            if max_s <= 0:
+            if max_px <= 0:
                 self._scrollbar.set_metrics(position=0.0, window=1.0)
             else:
                 self._scrollbar.set_metrics(
-                    position=self.scroll_y / max_s,
+                    position=self.scroll_py / max_px,
                     window=min(1.0, visible / total),
                 )
         if self._allow_horizontal:
@@ -163,8 +165,15 @@ class ScrollableContainer(Widget):
                 pass
         return 0
 
+    @property
+    def _row_h(self) -> int:
+        fs = getattr(self.child, "RENDER_FONT_SIZE", getattr(self.child, "FONT_SIZE", None))
+        if isinstance(fs, int) and fs > 0:
+            return max(1, cell_height(fs))
+        return max(1, int(self.LINE_H))
+
     def _visible_lines(self) -> int:
-        return max(1, self._content_box().h // self.LINE_H)
+        return max(1, self._content_box().h // self._row_h)
 
     def _visible_cols(self) -> int:
         fs = getattr(self.child, "RENDER_FONT_SIZE", 13)
@@ -177,15 +186,29 @@ class ScrollableContainer(Widget):
         return max(0, self._col_count() - self._visible_cols())
 
     def scroll(self, delta: int) -> None:
+        rh = self._row_h
         self.scroll_y = max(0, min(self._max_scroll(), self.scroll_y + delta))
+        self.scroll_py = float(self.scroll_y * rh)
+        self._sync_scrollbar()
+        if len(self._raw_children) > 1 and self.rect.w > 0:
+            self.layout_children()
+        self.refresh()
+
+    def scroll_pixels(self, delta_px: float) -> None:
+        rh = self._row_h
+        max_px = float(self._max_scroll() * rh)
+        self.scroll_py = max(0.0, min(max_px, self.scroll_py + float(delta_px)))
+        self.scroll_y = int(round(self.scroll_py / rh)) if rh else 0
         self._sync_scrollbar()
         if len(self._raw_children) > 1 and self.rect.w > 0:
             self.layout_children()
         self.refresh()
 
     def scroll_to(self, x: int | None = None, y: int | None = None, **_kw) -> None:
+        rh = self._row_h
         if y is not None:
             self.scroll_y = max(0, min(self._max_scroll(), int(y)))
+            self.scroll_py = float(self.scroll_y * rh)
         if x is not None:
             self.scroll_x = max(0, min(self._max_scroll_x(), int(x)))
         self._sync_scrollbar()
@@ -207,12 +230,14 @@ class ScrollableContainer(Widget):
     def scroll_home(self, *, animate: bool = True) -> None:
         _ = animate
         self.scroll_y = 0
+        self.scroll_py = 0.0
         self.scroll_x = 0
         self._sync_scrollbar()
 
     def scroll_end(self, *, animate: bool = True) -> None:
         _ = animate
         self.scroll_y = self._max_scroll()
+        self.scroll_py = float(self.scroll_y * self._row_h)
         self._sync_scrollbar()
 
     def scroll_relative(
@@ -227,6 +252,7 @@ class ScrollableContainer(Widget):
             self.scroll_x = max(0, min(self._max_scroll_x(), self.scroll_x + int(x)))
         if y:
             self.scroll_y = max(0, min(self._max_scroll(), self.scroll_y + int(y)))
+            self.scroll_py = float(self.scroll_y * self._row_h)
         self._sync_scrollbar()
         if len(self._raw_children) > 1 and self.rect.w > 0:
             self.layout_children()
@@ -263,17 +289,21 @@ class ScrollableContainer(Widget):
         self.scroll_page_down()
 
     def scroll_to_fraction(self, frac: float) -> None:
+        rh = self._row_h
         frac = max(0.0, min(1.0, frac))
-        self.scroll_y = int(round(self._max_scroll() * frac))
+        max_px = float(self._max_scroll() * rh)
+        self.scroll_py = max_px * frac
+        self.scroll_y = int(round(self.scroll_py / rh)) if rh else 0
         self._sync_scrollbar()
 
     def on_key(self, key: str) -> bool:
         if self._allow_vertical:
+            rh = self._row_h
             if key == "up":
-                self.scroll(-3)
+                self.scroll_pixels(-rh)
                 return True
             if key == "down":
-                self.scroll(3)
+                self.scroll_pixels(rh)
                 return True
             if key == "pageup":
                 self.scroll(-self._visible_lines())
@@ -349,6 +379,7 @@ class ScrollableContainer(Widget):
                 width=content_w,
                 height=self.child.rect.h - 4,
                 scroll=self.scroll_y,
+                scroll_px=int(round(self.scroll_py)),
                 line_h=self.LINE_H,
             )
         elif hasattr(child, "render_lines"):
@@ -371,6 +402,7 @@ class ScrollableContainer(Widget):
                 pad_x=4,
                 pad_y=2,
                 scroll_y=self.scroll_y,
+                scroll_px=int(round(self.scroll_py)),
                 fill_bg=False,
             )
         else:

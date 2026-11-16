@@ -94,15 +94,15 @@ class ModeApp(App):
                     break
         self.quit_modal = False
         self._prompt: dict | None = None  # title, value, callback
-        # Multiline text editor (EditScreen analogue): title, value, hint, callback.
+        # Multiline text editor modal: title, value, hint, callback.
         self._text: dict | None = None
         self._pick: dict | None = None  # title, options[(id,label)], index, callback
         self._confirm: dict | None = None  # title, detail, ok, danger, callback
-        # OpenFileScreen analogue: path field + filtered directory list + Add/Cancel.
+        # File/folder picker modal: path field + filtered directory list + Add/Cancel.
         self._open_file: dict | None = None
-        # Multi-field form (FilterScreen analogue): fields[(id,label,value)], focus, callback.
+        # Multi-field form modal: fields[(id,label,value)], focus, callback.
         self._form: dict | None = None
-        # Fullscreen custom overlay (MapScreen analogue): paint/on_key/on_wheel callbacks.
+        # Fullscreen custom overlay modal: paint/on_key/on_wheel callbacks.
         self._overlay: dict | None = None
         # Nested modals (Textual push_screen stack): underlays beneath the active modal.
         self._modal_stack: list[dict[str, object]] = []
@@ -235,38 +235,49 @@ class ModeApp(App):
         super().set_focus(widget, scroll_visible=scroll_visible)
 
     def _focusables(self) -> list[object]:
+        from .widgets import RichText, VerticalScroll
+
         root = self.screen or self._root
         if root is None:
             return []
         out: list[object] = []
-        for w in root._walk(root):
-            # Textual-style: can_focus, or legacy _focusable flag.
-            focusable = bool(getattr(w, "can_focus", False) or getattr(w, "_focusable", False))
-            if not focusable:
-                continue
-            if getattr(w, "disabled", False):
-                continue
-            if (getattr(w, "styles", None) or {}).get("display") == "none":
-                continue
-            # Skip collapsed panes (e.g. Chat select-mode twin).
-            if getattr(w, "layout_hint_h", None) == 0:
-                continue
-            out.append(w)
+
+        def _walk_vis(node: Any) -> None:
+            if getattr(node, "disabled", False):
+                return
+            if (getattr(node, "styles", None) or {}).get("display") == "none":
+                return
+            if getattr(node, "layout_hint_h", None) == 0:
+                return
+            focusable = bool(getattr(node, "can_focus", False) or getattr(node, "_focusable", False))
+            parent = getattr(node, "parent", None)
+            if focusable and isinstance(node, RichText) and isinstance(parent, VerticalScroll):
+                focusable = False
+            if focusable and node is not root:
+                out.append(node)
+            for child in getattr(node, "children", ()) or ():
+                _walk_vis(child)
+
+        _walk_vis(root)
         return out
 
-    def _cycle_focus(self) -> None:
+    def _cycle_focus(self, step: int = 1) -> None:
         items = self._focusables()
         if not items:
             return
         if self._focus not in items:
-            self.set_focus(items[0])
+            self.set_focus(items[0] if step >= 0 else items[-1])
             return
         i = items.index(self._focus)  # type: ignore[arg-type]
-        self.set_focus(items[(i + 1) % len(items)])
+        self.set_focus(items[(i + step) % len(items)])
 
     def focus_next(self) -> None:
         """Textual ``app.focus_next`` analogue (KeyBar Tab)."""
-        self._cycle_focus()
+        self._cycle_focus(1)
+
+    def focus_previous(self) -> None:
+        """Textual ``app.focus_previous`` analogue (Shift+Tab)."""
+        self._cycle_focus(-1)
 
     def _ensure_screen(self) -> Screen:
         key = self.mode_key
@@ -345,7 +356,7 @@ class ModeApp(App):
     ) -> None:
         """Modal text prompt (Enter = apply, Esc = cancel). ``password`` masks input.
 
-        ``esc_clears_if_empty``: Esc on blank field → ``callback(\"\")`` (QueryScreen).
+        ``esc_clears_if_empty``: Esc on blank field → ``callback("")``.
         Nested over an open modal (Textual push_screen stack).
         """
         if not self._begin_modal():
@@ -369,7 +380,7 @@ class ModeApp(App):
         *,
         hint: str = "Enter = new line · Ctrl+S OK · Esc cancel",
     ) -> None:
-        """Multiline modal editor (EditScreen analogue).
+        """Multiline modal editor.
 
         Enter inserts a newline; Ctrl+S / OK applies; Esc cancels (callback(None)).
         """
@@ -418,7 +429,7 @@ class ModeApp(App):
         ok: str = "OK",
         danger: bool = False,
     ) -> None:
-        """Yes/No confirm (Y/Enter · N/Esc). callback(True) on OK. ConfirmScreen analogue."""
+        """Yes/No confirm (Y/Enter · N/Esc). callback(True) on OK."""
         if callback is None or not self._begin_modal():
             return
         self._confirm = {
@@ -436,19 +447,16 @@ class ModeApp(App):
         start: Path | str,
         callback: Callable[[Path | None], None],
         *,
-        title: str = "Add genotype file",
-        subtitle: str = (
-            "23andMe, Argenética, MyHeritage, FTDNA, Big Y CSV, AncestryDNA, VCF; "
-            ".txt .csv .tsv .vcf .zip .gz .bz2"
-        ),
+        title: str = "Open file",
+        subtitle: str = "Select a file or folder",
         suffixes: Collection[str] | None = None,
         kind: str = "file",
         must_exist: bool = True,
         ok_label: str = "Add",
     ) -> None:
-        """DirectoryTree + path field modal (OpenFileScreen / PathScreen analogue).
+        """DirectoryTree + path field modal.
 
-        ``kind``: ``\"file\"`` or ``\"folder\"``.
+        ``kind``: ``"file"`` or ``"folder"``.
         ``must_exist``: False allows confirming a typed path that is not on disk yet.
         callback(path) on chosen; callback(None) on cancel.
         Nested over an open modal (Textual push_screen stack).
@@ -500,7 +508,7 @@ class ModeApp(App):
         box_w: int | None = None,
         password_fields: Collection[str] | None = None,
     ) -> None:
-        """Multi-field modal (FilterScreen / GeminiConfigScreen analogue).
+        """Multi-field modal form.
 
         fields: (id, label, initial_value).
         ``password_fields``: field ids rendered as ``•`` masks.
@@ -531,7 +539,7 @@ class ModeApp(App):
         on_wheel: Callable[[int], None] | None = None,
         on_close: Callable[[], None] | None = None,
     ) -> None:
-        """Fullscreen custom modal (MapScreen analogue).
+        """Fullscreen custom overlay modal.
 
         ``paint(draw, w, h) → hits``.
         ``on_key`` may return ``\"close\"`` / ``\"handled\"`` / None (fall through to Esc→close).
@@ -557,7 +565,7 @@ class ModeApp(App):
         box_w: int | None = None,
         box_h: int | None = None,
     ) -> None:
-        """Centered scrollable text modal (HelpScreen / IssuesScreen analogue).
+        """Centered scrollable text modal.
 
         ``body`` is ``rich.text.Text`` or plain ``str``.
         Uses ``show_overlay`` (push-stack aware).
@@ -692,7 +700,7 @@ class ModeApp(App):
             elif kind == "file" and (not suf or p.suffix.lower() in suf):
                 entries.append(("file", str(p), f"  {p.name}"))
             elif kind == "folder":
-                # PathScreen: files still listed so picking fills parent folder.
+                # Files still listed so picking fills parent folder.
                 entries.append(("file", str(p), f"  {p.name}"))
         self._open_file["entries"] = entries
         self._open_file["index"] = min(self._open_file["index"], max(0, len(entries) - 1))
@@ -732,7 +740,7 @@ class ModeApp(App):
         cb(path.resolve())
 
     def _open_file_confirm_path(self, raw: str) -> None:
-        """OK / Enter: validate and accept path (PathScreen._confirm)."""
+        """OK / Enter: validate and accept path."""
         if self._open_file is None:
             return
         text = raw.strip()
@@ -742,7 +750,7 @@ class ModeApp(App):
         kind = self._open_file.get("kind") or "file"
         must_exist = bool(self._open_file.get("must_exist", True))
         if p.is_dir() and kind == "file" and self._open_file.get("focus") == "path":
-            # Enter in field on a folder → navigate tree (PathScreen).
+            # Enter in field on a folder → navigate into folder.
             self._open_file["folder"] = p.resolve()
             self._open_file["index"] = 0
             self._open_file["scroll"] = 0
@@ -1075,7 +1083,7 @@ class ModeApp(App):
         if button not in (0, 1):
             return
         if self._busy_open():
-            return  # BusyModal blocks all pointer input
+            return  # Busy modal blocks all pointer input
         ix, iy = int(x), int(y)
         self._pending_hit = None
         self._pending_hit_xy = None
@@ -1298,20 +1306,28 @@ class ModeApp(App):
 
         ix, iy = int(x), int(y)
         root = self._ensure_screen()
+        # Sub-line wheel accumulator for line-based widgets (prevents 3-line jumps on trackpads).
+        acc = float(getattr(self, "_wheel_accum", 0.0) or 0.0) + (dy / 45.0)
+        line_steps = int(acc)
+        self._wheel_accum = acc - line_steps
         for w in root._walk(root):
             if isinstance(w, OptionList) and w.rect.contains(ix, iy):
-                w.move_highlight(steps)
+                if line_steps:
+                    w.move_highlight(line_steps)
                 return
             if isinstance(w, (RichText, _LogBase)) and w.rect.contains(ix, iy):
-                w.scroll(steps)
+                if line_steps:
+                    w.scroll(line_steps)
                 return
             focusable = bool(getattr(w, "can_focus", False) or getattr(w, "_focusable", False))
             if focusable and w.rect.contains(ix, iy) and hasattr(w, "move"):
-                w.move(getattr(w, "cursor", 0) + steps)  # type: ignore[misc]
+                if line_steps:
+                    w.move(getattr(w, "cursor", 0) + line_steps)  # type: ignore[misc]
                 return
             # Tree / DataTable / other ScrollView without custom move().
             if isinstance(w, ScrollView) and w.rect.contains(ix, iy):
-                w.scroll(steps)
+                if line_steps:
+                    w.scroll(line_steps)
                 return
         target: VerticalScroll | None = None
         for w in root._walk(root):
@@ -1324,7 +1340,10 @@ class ModeApp(App):
                     target = w
                     break
         if target is not None:
-            target.scroll(steps)
+            if hasattr(target, "scroll_pixels") and dy != 0:
+                target.scroll_pixels(dy * 0.45)
+            else:
+                target.scroll(steps)
 
     def on_char(self, ch: str) -> None:
         from .widgets import TextArea
@@ -1376,7 +1395,7 @@ class ModeApp(App):
         """Central key router — modals, stack, focus, F-keys/q, then screen bindings."""
         from .widgets import TextArea
 
-        # BusyModal: block all keys (including F-keys / Q) until hide_busy.
+        # Busy modal: block all keys (including F-keys / Q) until hide_busy.
         if self._busy_open():
             return
 
@@ -1480,7 +1499,7 @@ class ModeApp(App):
                     self._open_file["focus"] = "list"
             elif focus == "list":
                 if key in ("u", "backspace"):
-                    # PathScreen go_up — first entry is ↑ parent when available.
+                    # Go up — first entry is ↑ parent when available.
                     if entries and entries[0][0] == "up":
                         self._open_file["index"] = 0
                         self._open_file_activate()
@@ -1591,10 +1610,12 @@ class ModeApp(App):
             return
         if key == "escape":
             screen = self._ensure_screen()
-            for name in ("clear_chrom_filter", "clear_search", "back"):
+            for name in ("clear_filter", "clear_search", "back"):
                 clearer = getattr(screen, name, None)
                 if callable(clearer) and clearer():
                     return
+            if screen.on_key("escape"):
+                return
             self.on_escape()
             return
         if key == "tab":
@@ -1602,7 +1623,14 @@ class ModeApp(App):
             toggle = getattr(screen, "toggle_panel", None)
             if callable(toggle) and toggle():
                 return
-            self._cycle_focus()
+            self._cycle_focus(1)
+            return
+        if key == "shift+tab":
+            screen = self._ensure_screen()
+            toggle = getattr(screen, "toggle_panel", None)
+            if callable(toggle) and toggle():
+                return
+            self._cycle_focus(-1)
             return
 
         # Text input focus: typing keys stay in the field; send shortcuts bubble.
@@ -1654,7 +1682,7 @@ class ModeApp(App):
             if self._copy_screen_selection():
                 return
 
-        # Focused list/chrom: navigation first, then screen bindings for letters.
+        # Focused list/scroll view: navigation first, then screen bindings for letters.
         if self._focus is not None and hasattr(self._focus, "on_key"):
             if self._focus.on_key(key):  # type: ignore[operator]
                 return
@@ -1774,7 +1802,7 @@ class ModeApp(App):
             self._paint_pick(draw, w, h)
         if getattr(self, "_busy", None):
             self._paint_busy(draw, w, h)
-            self._hits = []  # BusyModal: no click-through
+            self._hits = []  # Busy modal: no click-through
         self._blitter.upload(img.tobytes("raw", "RGBA"), img.size)
         view = self._context.get_current_texture().create_view()
         self._blitter.draw(view)
@@ -1814,7 +1842,7 @@ class ModeApp(App):
 
     def _paint_boot(self, draw: ImageDraw.ImageDraw, w: int, h: int) -> None:
         t = self.theme
-        title = self.TITLE or "MDGA"
+        title = self.TITLE or "textual-wgpu"
         label = self._boot_label or "Starting…"
         frac = self._boot_frac
         cx = max(24, (w - 280) // 2)
@@ -1974,7 +2002,7 @@ class ModeApp(App):
         self._hits = hits
 
     def _paint_open_file(self, draw: ImageDraw.ImageDraw, w: int, h: int) -> None:
-        """OpenFileScreen analogue: title · path · directory list · Add/Cancel."""
+        """File-picker modal: title · path · directory list · Add/Cancel."""
         assert self._open_file is not None
         t = self.theme
         focus = self._open_file.get("focus") or "list"
@@ -2125,7 +2153,7 @@ class ModeApp(App):
         self._hits = [(frame, lambda _x, _y: None)]
 
     def _paint_text(self, draw: ImageDraw.ImageDraw, w: int, h: int) -> None:
-        """Multiline EditScreen-style modal."""
+        """Multiline editor modal."""
         assert self._text is not None
         t = self.theme
         veil(draw, w, h)
@@ -2178,7 +2206,7 @@ class ModeApp(App):
         self._hits = [(frame, lambda _x, _y: None), (body, _body), (ok, _ok), (cancel, _cancel)]
 
     def _paint_busy(self, draw: ImageDraw.ImageDraw, w: int, h: int) -> None:
-        """BusyModal analogue: dim veil + card + elapsed; input blocked by ModeApp."""
+        """Busy modal: dim veil + card + elapsed; input blocked by ModeApp."""
         from .fonts import cell_width
 
         t = self.theme
@@ -2296,60 +2324,10 @@ class ModeApp(App):
         self._hits = hits
 
 
-_DEMO_HELP = """\
-# textual-wgpu
-
-F10-style Help screen using lib widgets:
-
-- `ModeApp` hosts F1–Fn screens
-- `Markdown` + `VerticalScroll` for the body
-- Theme is app-owned (`Theme.from_mapping` / `Theme.system`)
-
-## Keys
-
-| Key | Action |
-|-----|--------|
-| ↑↓ / PgUp/PgDn | Scroll |
-| F1–F10 | Switch mode |
-| Q | Quit modal |
-"""
-
-
 def main(theme: Theme | None = None) -> None:
-    from .widgets import KeyBar, Markdown, ModeBar, Panel, StatusBar, VerticalScroll
+    from .demo import main as demo_main
 
-    labels = [
-        ("genome", "Genome"),
-        ("data", "Data"),
-        ("tree", "Tree"),
-        ("pgs", "PGS"),
-        ("gwas", "GWAS"),
-        ("reference", "Reference"),
-        ("chat", "Chat"),
-        ("jobs", "Jobs"),
-        ("samples", "Samples"),
-        ("help", "Help"),
-    ]
-
-    class DemoHelp(Screen):
-        def compose(self):
-            yield ModeBar(
-                "help", labels,
-                on_select=lambda i: self.app.set_mode(i) if self.app else None,
-            )
-            yield Panel(
-                VerticalScroll(Markdown(_DEMO_HELP), id="help-scroll"),
-                title="HELP · demo",
-            )
-            yield KeyBar([
-                ("↑↓", "Scroll", None),
-                ("F1–F10", "Modes", None),
-                ("Q", "Quit", lambda: self.app.ask_quit() if self.app else None),
-            ])
-            yield StatusBar("demo · F10 Help path")
-
-    modes = [(k, t, DemoHelp if k == "help" else None) for k, t in labels]
-    ModeApp(modes, theme=theme or Theme.system(), title="textual-wgpu", start="help").run()
+    demo_main(theme=theme)
 
 
 if __name__ == "__main__":

@@ -3,20 +3,20 @@
 from textual_wgpu.shell import MODE_LABELS, ShellApp
 
 
-def test_mode_labels_match_mdga_count():
-    assert len(MODE_LABELS) == 10
-    assert MODE_LABELS[0][0] == "genome"
-    assert MODE_LABELS[5][0] == "reference"
+def test_mode_labels_defined():
+    assert len(MODE_LABELS) == 6
+    assert MODE_LABELS[0][0] == "overview"
+    assert MODE_LABELS[-1][0] == "help"
 
 
 def test_shell_paint_rgba():
     app = ShellApp()
-    app.set_mode(5)
+    app.set_mode(4)
     img = app._paint()
     assert img.size == app.SIZE
     assert img.mode == "RGBA"
-    assert app.mode_key == "reference"
-    assert len(app._hits) >= 10  # mode tabs (+ quit)
+    assert app.mode_key == "themes"
+    assert len(app._hits) >= len(MODE_LABELS)  # mode tabs (+ quit)
 
 
 def test_quit_modal_hits():

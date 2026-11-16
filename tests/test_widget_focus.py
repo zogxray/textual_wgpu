@@ -84,23 +84,23 @@ def test_focusables_include_optionlist_richtext_scrollview():
 
 
 def test_scrollview_focus_sets_focused_flag():
-    """MDGA chroms.focus() path — ScrollView gets _focused via set_focus."""
+    """ScrollView gets _focused via set_focus."""
 
     class Body(Screen):
         def compose(self):
-            yield ScrollView(id="chroms")
+            yield ScrollView(id="main-scroll")
             yield TextArea("", id="prompt")
 
     app = ModeApp([("m", "M", Body)], theme=_theme(), start="m")
     app._pixel_size = (640, 400)
     screen = app._ensure_screen()
     screen.layout(Rect(0, 0, 640, 400))
-    chroms = screen.query_one("#chroms", ScrollView)
+    scroll = screen.query_one("#main-scroll", ScrollView)
     prompt = screen.query_one("#prompt", TextArea)
 
     prompt.focus()
     assert prompt.focused
-    chroms.focus()
-    assert chroms.focused
-    assert app._focus is chroms
+    scroll.focus()
+    assert scroll.focused
+    assert app._focus is scroll
     assert not prompt.focused

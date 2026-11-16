@@ -7,8 +7,6 @@ GPU-rendered runtime (`0.19.0`) implementing Textual's app model (screens, modes
 and headless `Pilot` testing) backed by a Pillow → wgpu blit pipeline with optional
 CRT post-FX (bloom / scanlines).
 
-Lives next to `make-dna-great-again` as a standalone package.
-
 ## API Coverage (vs `textual 8.2.8`)
 
 - **71 / 71** top-level modules (`app`, `screen`, `widget`, `widgets`, `containers`,
@@ -28,30 +26,26 @@ Lives next to `make-dna-great-again` as a standalone package.
   `reactive`)
 - **42 / 42** `textual.events` `Event` classes (and **56 / 56** module symbols)
 
-**Theme:** pass `Theme.from_mapping(...)`, `Theme(...)`, or `Theme.system()` — app-owned.
+**Theme:** use built-in `"textual-dark"` / `"textual-light"`, `Theme.system()`, or pass `Theme.from_mapping(...)` / `Theme(...)`.
 
 ## Install
 
 ```bash
-source ../venv/bin/activate
 pip install -e ".[dev]"
 # optional Textual parity comparison suite:
 pip install -e ".[dev,parity]"
 ```
 
-## Run
+## Run Demo
 
 ```bash
 textual-wgpu-demo
 # or
 python -m textual_wgpu
-
-# from make-dna-great-again:
-python -m ydna --ui wgpu          # ModeApp CRT shell
-python -m ydna --ui textual-wgpu  # real YDnaApp + workspaces via shim
 ```
 
-- **F1–F10** — switch mode
+- **F1–F5** — switch demo modes (Overview, Controls, Data & Tree, Editor & Modals, Themes & FX)
+- **Tab** / **Shift+Tab** — cycle focus across panels
 - **Q** / **Escape** — quit
 
 ## Test (headless Pilot)

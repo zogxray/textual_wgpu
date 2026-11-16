@@ -63,7 +63,7 @@ def test_with_container_compose_dsl():
 
 async def test_phase8_app_modes_themes_mount_and_styles():
     custom = Theme(
-        name="ydna-dark",
+        name="app-dark",
         primary="#32273F",
         accent="#D4AD72",
         background="#1E1923",
@@ -90,7 +90,7 @@ async def test_phase8_app_modes_themes_mount_and_styles():
             resumed.append("b")
 
     class MyApp(App):
-        theme = "ydna-dark"
+        theme = "app-dark"
         BINDINGS = [
             Binding("f1", "mode('a')", "A", priority=True),
             Binding("f2", "mode('b')", "B", priority=True),
@@ -98,7 +98,7 @@ async def test_phase8_app_modes_themes_mount_and_styles():
 
         def on_mount(self) -> None:
             self.register_theme(custom)
-            self.theme = "ydna-dark"
+            self.theme = "app-dark"
             self.add_mode("a", ModeA)
             self.add_mode("b", ModeB)
             self.install_screen(ModeB, "modal_b")
@@ -107,7 +107,7 @@ async def test_phase8_app_modes_themes_mount_and_styles():
     app = MyApp()
     async with app.run_test(size=(800, 600)) as pilot:
         await pilot.pause()
-        assert app.theme.name == "ydna-dark"
+        assert app.theme.name == "app-dark"
         assert app.current_mode == "a"
         assert app.get_css_variables()["mode-1"] == "#445566"
         assert pilot.query_one("#lbl", Static).text == "Mode A"
@@ -138,7 +138,7 @@ async def test_phase9_and_10_events_convention_meta_and_reactive():
 
         def compose(self):
             t = Text("Click ")
-            t.append("HERE", style=Style.from_meta({"ydna_click": "ping(7)"}))
+            t.append("HERE", style=Style.from_meta({"@click": "ping(7)"}))
             yield Static(t, id="meta-st")
             yield Button("Go", id="go")
             yield Input("", id="inp")
@@ -155,7 +155,7 @@ async def test_phase9_and_10_events_convention_meta_and_reactive():
             seen.append(("inp", event.input.id, event.value))
 
         def on_click(self, event: events.Click) -> None:
-            seen.append(("meta", event.meta.get("ydna_click")))
+            seen.append(("meta", event.meta.get("@click")))
 
     app = MainApp()
     watch_hits: list[tuple[int, int]] = []

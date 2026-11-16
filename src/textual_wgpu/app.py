@@ -342,7 +342,7 @@ class App:
         self.request_draw()
 
     def _ensure_busy_tick(self) -> None:
-        """Redraw ~5×/s while busy so elapsed time advances (BusyModal)."""
+        """Redraw ~5×/s while busy so elapsed time advances on the busy modal."""
         if self._busy_tick is not None and self._busy_tick.active:
             return
 

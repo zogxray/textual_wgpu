@@ -1,6 +1,6 @@
 """TCSS-inspired stylesheet engine for textual-wgpu.
 
-Supports (beyond the MDGA subset):
+Supported features:
 - combinators: descendant `` ``, child ``>``, adjacent ``+``, sibling ``~``
 - cascade: specificity + source order + ``!important`` + layered sheets
   (app → screen → extra)

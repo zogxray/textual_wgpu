@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 Hit = tuple[Rect, Callable[[int, int], None]]
 
-_CLICK_KEYS = ("ydna_click", "@click")
+_CLICK_KEYS = ("@click", "action")
 
 
 class RichText(Widget):
@@ -27,9 +27,20 @@ class RichText(Widget):
     LINE_H = 18
     FONT_SIZE = 13
     RENDER_FONT_SIZE = 13
+    CLICK_META_KEYS: tuple[str, ...] = _CLICK_KEYS
 
-    def __init__(self, content: Any = "", *, id: str | None = None) -> None:
+    def __init__(
+        self,
+        content: Any = "",
+        *,
+        id: str | None = None,
+        can_focus: bool | None = None,
+        click_meta_keys: tuple[str, ...] | list[str] | None = None,
+    ) -> None:
         super().__init__(id=id)
+        if can_focus is not None:
+            self.can_focus = bool(can_focus)
+        self._click_meta_keys = tuple(click_meta_keys) if click_meta_keys is not None else None
         self._content = Content(content, kind="auto")
         self.scroll_y = 0
         self.layout_hint_h: int | None = None
@@ -59,7 +70,8 @@ class RichText(Widget):
                 n = len(seg.text)
                 meta = seg.meta or {}
                 action = None
-                for key in _CLICK_KEYS:
+                keys = self._click_meta_keys if self._click_meta_keys is not None else self.CLICK_META_KEYS
+                for key in keys:
                     act = meta.get(key)
                     if isinstance(act, str) and act:
                         action = act
@@ -96,7 +108,8 @@ class RichText(Widget):
             self._rebuild()
             cw = cell_width(self.FONT_SIZE)
             vis = max(1, self.rect.h // self.LINE_H)
-            start = self.scroll_y
+            parent_scroll = getattr(self.parent, "scroll_y", None)
+            start = int(parent_scroll) if isinstance(parent_scroll, int) else self.scroll_y
             for row, col0, col1, _end, action in self._click_spans:
                 if row < start or row >= start + vis + 1:
                     continue

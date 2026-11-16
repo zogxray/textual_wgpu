@@ -15,17 +15,13 @@ from .app import App
 from .blit import FrameBlitter
 from .theme import Theme
 
-# Generic mode labels for the chrome demo (apps can replace later).
+# Generic mode labels for the standalone chrome demo.
 MODE_LABELS = (
-    ("genome", "Genome"),
+    ("overview", "Overview"),
+    ("controls", "Controls"),
     ("data", "Data"),
-    ("tree", "Tree"),
-    ("pgs", "PGS"),
-    ("gwas", "GWAS"),
-    ("reference", "Reference"),
-    ("chat", "Chat"),
-    ("jobs", "Jobs"),
-    ("samples", "Samples"),
+    ("editor", "Editor"),
+    ("themes", "Themes"),
     ("help", "Help"),
 )
 

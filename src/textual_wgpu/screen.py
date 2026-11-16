@@ -416,7 +416,7 @@ class Screen(Widget):
                 if not bare.startswith("action_"):
                     fn = getattr(self, f"action_{bare}", None)
             if callable(fn) and "(" not in action:
-                # Explicit False = did not handle (e.g. clear_chrom_filter when empty).
+                # Explicit False = did not handle (e.g. empty filter clear on Escape).
                 result = fn()
                 if result is False:
                     continue

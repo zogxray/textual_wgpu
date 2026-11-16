@@ -30,23 +30,35 @@ class ModeBar(Widget):
         labels: Sequence[tuple[str, str]],
         *,
         on_select: Callable[[int], None] | None = None,
+        item_formatter: Callable[[int, str, str], tuple[str, tuple[int, int, int, int] | None, tuple[int, int, int, int] | None]] | None = None,
         id: str | None = None,
     ) -> None:
         super().__init__(id=id)
         self.active = active
         self.labels = list(labels)
         self.on_select = on_select
+        self._item_formatter = item_formatter
         band = _chrome_band_h(self.RENDER_FONT_SIZE)
         self.layout_hint_h = band
         self.layout_band_h = band  # CSS height:1 → band, not bare cell_height
         self.layout_hint_rows = 1
 
+    def _format_item(
+        self,
+        index: int,
+        key: str,
+        title: str,
+    ) -> tuple[str, tuple[int, int, int, int] | None, tuple[int, int, int, int] | None]:
+        if self._item_formatter is not None:
+            return self._item_formatter(index, key, title)
+        return f" F{index + 1} {title} ", None, None
+
     def _tab_spans(self) -> list[tuple[int, int, int]]:
         """(index, start_col, width_cols) for hit testing."""
         spans: list[tuple[int, int, int]] = []
         col = 0
-        for i, (_key, title) in enumerate(self.labels):
-            label = f" F{i + 1} {title} "
+        for i, (key, title) in enumerate(self.labels):
+            label, _fg, _bg = self._format_item(i, key, title)
             w = len(label)
             spans.append((i, col, w))
             col += w + 1
@@ -63,9 +75,13 @@ class ModeBar(Widget):
             if i:
                 # Separator must stay boost — never accent (avoids ghost “empty tab”).
                 segs.append(Segment(" ", muted, boost))
-            label = f" F{i + 1} {title} "
+            label, fg_ov, bg_ov = self._format_item(i, key, title)
             if key == self.active:
-                segs.append(Segment(label, t.rgba("background"), t.rgba("accent")))
+                fg = t.rgba("background")
+                bg = bg_ov if bg_ov is not None else (fg_ov if fg_ov is not None else t.rgba("accent"))
+                segs.append(Segment(label, fg, bg, bold=True))
+            elif fg_ov is not None or bg_ov is not None:
+                segs.append(Segment(label, fg_ov or muted, bg_ov or boost, bold=True))
             else:
                 segs.append(Segment(label, muted, boost))
         # Pad so crop/overflow never leaves a bare accent cell looking like a tab.

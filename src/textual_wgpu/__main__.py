@@ -1,4 +1,4 @@
-from .mode_app import main
+from .demo import main
 
 if __name__ == "__main__":
     main()

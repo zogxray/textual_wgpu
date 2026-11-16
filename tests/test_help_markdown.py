@@ -39,7 +39,7 @@ def test_bake_wraps_long_lines_to_columns():
 
 
 def test_help_like_screen_compose_and_paint():
-    labels = [("genome", "Genome"), ("help", "Help")]
+    labels = [("home", "Home"), ("help", "Help")]
 
     class Help(Screen):
         def compose(self):
@@ -53,7 +53,7 @@ def test_help_like_screen_compose_and_paint():
 
     theme = Theme.from_mapping({"background": "#1E1923", "accent": "#D4AD72"})
     app = ModeApp(
-        [("genome", "Genome", None), ("help", "Help", Help)],
+        [("home", "Home", None), ("help", "Help", Help)],
         theme=theme,
         start="help",
     )

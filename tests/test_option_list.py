@@ -29,14 +29,14 @@ def test_option_list_highlight_and_virtual_paint():
         def compose(self):
             from textual_wgpu.widgets import KeyBar, ModeBar
 
-            yield ModeBar("samples", [("samples", "Samples")])
+            yield ModeBar("items", [("items", "Items")])
             ol = OptionList(id="list", on_highlight=lambda o: seen.append(o.id if o else ""))
             yield ol
             yield KeyBar([])
             yield StatusBar("s")
 
     theme = _theme()
-    app = ModeApp([("samples", "Samples", Body)], theme=theme, start="samples")
+    app = ModeApp([("items", "Items", Body)], theme=theme, start="items")
     app._pixel_size = (400, 200)
     screen = app._ensure_screen()
     screen.layout(Rect(0, 0, 400, 200))

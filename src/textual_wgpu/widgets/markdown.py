@@ -153,6 +153,7 @@ class Markdown(Widget):
         width: int,
         height: int,
         scroll: int,
+        scroll_px: int = 0,
         line_h: int = 18,
     ) -> None:
         """VerticalScroll path — blit strips into a sub-rect with scroll offset."""
@@ -177,6 +178,7 @@ class Markdown(Widget):
             pad_x=0,
             pad_y=0,
             scroll_y=scroll,
+            scroll_px=scroll_px,
             fill_bg=False,
         )
 

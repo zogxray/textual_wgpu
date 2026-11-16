@@ -171,7 +171,7 @@ class WgpuDriver(Driver):
                 elif key == "p":
                     key = "ctrl+p"
             if "shift" in mods and not key.startswith("ctrl+"):
-                if key in ("left", "right", "up", "down", "home", "end"):
+                if key in ("left", "right", "up", "down", "home", "end", "tab"):
                     key = f"shift+{key}"
                 elif len(key) == 1 and "a" <= key <= "z":
                     key = f"shift+{key}"

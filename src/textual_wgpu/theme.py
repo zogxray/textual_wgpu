@@ -127,7 +127,7 @@ class Theme:
 
     @classmethod
     def from_mapping(cls, data: dict[str, str], *, name: str = "custom") -> Theme:
-        """Build from an application-provided map (e.g. MDGA theme tokens)."""
+        """Build from an application-provided token map."""
         base = cls.system()
         return cls(
             name=name,

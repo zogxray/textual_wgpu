@@ -59,7 +59,8 @@ class ContentSwitcher(Widget):
         return self
 
     def _apply_visibility(self) -> None:
-        target = self.visible
+        cur_val = self.__dict__.get("current")
+        target = cur_val if isinstance(cur_val, str) else self.visible
         for i, child in enumerate(self._children):
             cid = child.id if child.id is not None else f"_{i}"
             show = target is not None and cid == target
@@ -73,15 +74,23 @@ class ContentSwitcher(Widget):
         self.post_message(self.Changed(self, child_id))
         self.refresh(layout=True)
 
-    def current(self) -> Widget | None:
-        target = self.visible
+    def _active_widget(self) -> Widget | None:
+        cur_attr = getattr(type(self), "current", None)
+        cur_val = self.__dict__.get("current")
+        target = cur_val if isinstance(cur_val, str) else self.visible
+        if cur_val is not None and not isinstance(cur_val, str) and cur_attr is not None:
+            target = self.visible
         for i, child in enumerate(self._children):
             cid = child.id if child.id is not None else f"_{i}"
             if cid == target:
                 return child
         return None
 
+    def current(self) -> Widget | None:
+        return self._active_widget()
+
     def layout_children(self) -> None:
+        self._apply_visibility()
         for child in self._children:
             if (child.styles or {}).get("display") == "none":
                 child.layout(Rect(0, 0, 0, 0))
@@ -91,14 +100,14 @@ class ContentSwitcher(Widget):
     def paint(self, draw: ImageDraw.ImageDraw) -> None:
         if self.rect.w < 2 or self.rect.h < 2:
             return
-        cur = self.current()
+        cur = self._active_widget()
         if cur is not None:
             cur.paint(draw)
 
     def hits(self):
-        cur = self.current()
+        cur = self._active_widget()
         return list(cur.hits()) if cur is not None else []
 
     def on_key(self, key: str) -> bool:
-        cur = self.current()
+        cur = self._active_widget()
         return cur.on_key(key) if cur is not None else False

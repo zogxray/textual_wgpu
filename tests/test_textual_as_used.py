@@ -1,4 +1,4 @@
-"""Every Textual symbol MDGA imports must resolve from textual-wgpu."""
+"""Core Textual symbols resolve from textual-wgpu."""
 
 from __future__ import annotations
 
@@ -42,8 +42,7 @@ def test_version():
     assert __version__ == "0.19.0"
 
 
-def test_mdga_textual_import_surface():
-    # Mirrors make-dna-great-again textual imports (non-wgpu path).
+def test_core_textual_import_surface():
     assert issubclass(ModalScreen, Screen)
     assert issubclass(VerticalGroup, Vertical)
     b = Binding("a,b", "foo", "Foo", show=False, priority=True)
@@ -52,7 +51,6 @@ def test_mdga_textual_import_surface():
     assert ComposeResult is not None
     assert WorkerState.SUCCESS
     assert events.Click is not None
-    # Widgets MDGA composes
     for cls in (
         App, Screen, ModalScreen, Horizontal, Vertical, VerticalGroup,
         VerticalScroll, OptionList, Option, Static, Input, Button, Label,

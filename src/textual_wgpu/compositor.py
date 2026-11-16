@@ -33,11 +33,12 @@ def paint_strips(
     pad_x: int = 4,
     pad_y: int = 2,
     scroll_y: int = 0,
+    scroll_px: int = 0,
     fill_bg: bool = True,
 ) -> None:
     """Blit ``strips`` into ``rect`` on a mono cell grid.
 
-    ``scroll_y`` is a line offset into ``strips``. Empty strips still reserve a row.
+    Supports either line-level ``scroll_y`` or pixel-smooth ``scroll_px``.
     """
     if rect.w < 2 or rect.h < 2:
         return
@@ -57,7 +58,43 @@ def paint_strips(
     max_cols = max(1, (rect.w - 2 * pad_x) // cw)
     max_rows = max(1, (rect.h - 2 * pad_y) // ch)
 
-    start = max(0, int(scroll_y))
+    if scroll_px > 0:
+        start = max(0, int(scroll_px) // ch)
+        sub_y = int(scroll_px) % ch
+    else:
+        start = max(0, int(scroll_y))
+        sub_y = 0
+
+    target_img = getattr(draw, "_image", None)
+    if sub_y > 0 and target_img is not None:
+        from PIL import Image, ImageDraw as _ImageDraw
+
+        layer = Image.new("RGBA", (rect.w, rect.h), (0, 0, 0, 0))
+        ldraw = _ImageDraw.Draw(layer)
+        end = min(len(strips), start + max_rows + 2)
+        y = pad_y - sub_y
+        for i in range(start, end):
+            strip = strips[i]
+            if strip.segments:
+                visible = strip.crop(0, max_cols) if len(strip) > max_cols else strip
+                visible.paint_cells(
+                    ldraw,
+                    pad_x,
+                    y,
+                    cell_w=cw,
+                    cell_h=ch,
+                    font=f,
+                    default_fg=fg,
+                    default_bg=None,
+                    max_cells=max_cols,
+                    font_size=font_size,
+                )
+            y += ch
+            if y >= rect.h:
+                break
+        target_img.alpha_composite(layer, (rect.x, rect.y))
+        return
+
     end = min(len(strips), start + max_rows)
     y = rect.y + pad_y
     for i in range(start, end):

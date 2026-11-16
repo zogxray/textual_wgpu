@@ -33,7 +33,7 @@ def _app_theme():
 
 
 class _ChromeScreen(Screen):
-    """Typical MDGA chrome: ModeBar + body(1fr) + KeyBar + Status — CSS only."""
+    """Typical app chrome: ModeBar + body(1fr) + KeyBar + Status — CSS only."""
 
     DEFAULT_CSS = """
     #main { height: 1fr; }

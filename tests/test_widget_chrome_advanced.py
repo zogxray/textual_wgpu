@@ -92,7 +92,8 @@ async def test_phase5_compound_widgets():
             yield Sparkline([1, 4, 2, 8, 5], id="sp")
             yield Digits("42.5", id="dg")
             yield MaskedInput("00/00/0000", id="mi")
-            yield MarkdownViewer("# Intro\n\nHello\n\n## Details\n\nWorld\n", id="mv")
+            long_tail = "\n\n".join(f"Paragraph {i}" for i in range(30))
+            yield MarkdownViewer(f"# Intro\n\nHello\n\n## Details\n\n{long_tail}\n", id="mv")
 
         @on(MaskedInput.Changed, "#mi")
         def _mi_chg(self, event) -> None:
@@ -123,7 +124,13 @@ async def test_phase5_compound_widgets():
         mv = pilot.query_one("#mv", MarkdownViewer)
         assert len(mv.table_of_contents.root.children) == 1
         assert len(mv.table_of_contents.root.children[0].children) == 1
+        assert mv.table_of_contents.root.children[0].is_expanded is True
         assert mv.goto_anchor("details") is True
+        # Smooth sub-line pixel scroll via wheel & scroll_pixels
+        sc = mv._scroll
+        sc.scroll_to(y=0)
+        sc.scroll_pixels(5.0)
+        assert 0.0 < sc.scroll_py < sc.LINE_H
         mv.update("# Only One\n\nBody")
         assert len(mv.table_of_contents.root.children) == 1
         assert len(mv.table_of_contents.root.children[0].children) == 0
