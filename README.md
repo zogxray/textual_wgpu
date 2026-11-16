@@ -1,31 +1,42 @@
 # textual-wgpu
 
-Textual-inspired UI runtime on **wgpu**.
+Textual-compatible UI runtime on **wgpu**.
 
-Not a Textual drop-in yet. Goal: same thin app model (screens, bindings,
-compose) with a real GPU backend — panels, images, charts, and a 3D viewport
-without terminal cell hacks.
+GPU-rendered runtime (`0.19.0`) implementing Textual's app model (screens, modes,
+`with Container():` compose DSL, bindings, reactive state, CSS, events, workers,
+and headless `Pilot` testing) backed by a Pillow → wgpu blit pipeline with optional
+CRT post-FX (bloom / scanlines).
 
-Lives next to `make-dna-great-again` as a separate repo on purpose. MDGA should
-keep using Textual until this API is useful enough to try one screen.
+Lives next to `make-dna-great-again` as a standalone package.
 
-## Status
+## API Coverage (vs `textual 8.2.8`)
 
-Milestone 1: rough app chrome on GPU —
+- **71 / 71** top-level modules (`app`, `screen`, `widget`, `widgets`, `containers`,
+  `events`, `reactive`, `on`, `message`, `binding`, `actions`, `css`, `dom`,
+  `driver`, `pilot`, `worker`, `validation`, `suggester`, `fuzzy`, `command`,
+  `timer`, `notifications`, `color`, `document`, `canvas`, …)
+- **42 / 42** widgets (`Button`, `Checkbox`, `Collapsible`, `ContentSwitcher`,
+  `DataTable`, `Digits`, `DirectoryTree`, `Footer`, `Header`, `HelpPanel`, `Input`,
+  `KeyPanel`, `Label`, `Link`, `ListItem`, `ListView`, `LoadingIndicator`, `Log`,
+  `Markdown`, `MarkdownViewer`, `MaskedInput`, `OptionList`, `Placeholder`, `Pretty`,
+  `ProgressBar`, `RadioButton`, `RadioSet`, `RichLog`, `Rule`, `Select`,
+  `SelectionList`, `Sparkline`, `Static`, `Switch`, `Tab`, `TabPane`,
+  `TabbedContent`, `Tabs`, `TextArea`, `Tooltip`, `Tree`, `Welcome`)
+- **15 / 15** `textual.containers` exports (`Container`, `Vertical`, `VerticalGroup`,
+  `Horizontal`, `HorizontalGroup`, `Grid`, `ItemGrid`, `Center`, `Middle`,
+  `CenterMiddle`, `Right`, `ScrollableContainer`, `VerticalScroll`, `HorizontalScroll`,
+  `reactive`)
+- **42 / 42** `textual.events` `Event` classes (and **56 / 56** module symbols)
 
-`ModeBar` (F1–F10) · placeholder `body` · `KeyBar` · `status`
+**Theme:** pass `Theme.from_mapping(...)`, `Theme(...)`, or `Theme.system()` — app-owned.
 
-Painted with Pillow → uploaded as a wgpu texture (crude, fine for POC).
-
-**Theme:** the library does not own brand colors. Pass ``Theme`` from the app
-(``Theme.from_mapping(...)``) or use ``Theme.system()`` (host light/dark).
-Same idea as Textual: app/host style → runtime paints.
-
-## Install (library)
+## Install
 
 ```bash
 source ../venv/bin/activate
-pip install -e /path/to/textual-wgpu
+pip install -e ".[dev]"
+# optional Textual parity comparison suite:
+pip install -e ".[dev,parity]"
 ```
 
 ## Run
@@ -35,31 +46,22 @@ textual-wgpu-demo
 # or
 python -m textual_wgpu
 
-# from make-dna-great-again (experimental branch)
-python -m ydna --ui wgpu
+# from make-dna-great-again:
+python -m ydna --ui wgpu          # ModeApp CRT shell
+python -m ydna --ui textual-wgpu  # real YDnaApp + workspaces via shim
 ```
 
-- **F1–F10** — switch mode (body title only)  
-- **Q** / Escape — quit  
+- **F1–F10** — switch mode
+- **Q** / **Escape** — quit
 
-## Layout
+## Test (headless Pilot)
 
-```text
-src/textual_wgpu/
-  app.py      # window, bindings, draw hook
-  blit.py     # RGBA → fullscreen GPU blit
-  shell.py    # ModeBar + body + KeyBar + status
-  demo.py     # milestone-0 clear-screen
+```python
+async with app.run_test() as pilot:
+    await pilot.press("ctrl+p")
+    await pilot.action("quit")
 ```
 
-## Next (not done)
-
-1. Clickable ModeBar  
-2. One real mode body (e.g. F6 panels, still rough)  
-3. `Viewport3D` inside body  
-
-## Non-goals (for now)
-
-- Full Textual CSS / widget compatibility  
-- Shipping inside the MDGA package  
-- React / DOM stacks  
+```bash
+pytest -q
+```

@@ -4,7 +4,7 @@ from textual_wgpu import App, ShellApp, __version__
 
 
 def test_version():
-    assert __version__ == "0.1.0"
+    assert __version__ == "0.19.0"
 
 
 def test_app_bind_roundtrip():
