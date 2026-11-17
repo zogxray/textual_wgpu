@@ -7,6 +7,7 @@ members = [
     "crates/tw-ffi",
     "apps/tw-viewer",
 ]
+exclude = ["crates/tw-native"]
 
 [workspace.package]
 version = "0.1.0"

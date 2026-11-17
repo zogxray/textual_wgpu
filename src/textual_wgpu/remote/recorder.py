@@ -82,21 +82,28 @@ class DrawRecorder:
         self,
         styles: StyleInterner | None = None,
         known_blobs: set[bytes] | None = None,
+        *,
+        raw_blob_mode: bool = False,
+        measure_fn: Any = None,
     ) -> None:
         self.styles = styles or StyleInterner()
         self.known_blobs: set[bytes] = known_blobs if known_blobs is not None else set()
+        self.raw_blob_mode = bool(raw_blob_mode)
+        self._measure_fn = measure_fn
         self._prev_hashes: dict[str, tuple[tuple[int, int, int, int], bytes]] = {}
         self._current_id: str | None = None
         self._current_rect: tuple[int, int, int, int] = (0, 0, 0, 0)
         self._buf = bytearray()
         self._frame_layers: list[str] = []
+        self._frame_raw_layers: list[bytes] = []
         self._dirty_layers: list[tuple[str, tuple[int, int, int, int], bytes]] = []
         self._pending_blobs: list[tuple[bytes, int, int, bytes]] = []
-        self._scratch_img = Image.new("RGBA", (1, 1))
-        self._scratch_draw = ImageDraw.Draw(self._scratch_img)
+        self._scratch_img: Any = None
+        self._scratch_draw: Any = None
 
     def begin_frame(self) -> None:
         self._frame_layers = []
+        self._frame_raw_layers = []
         self._dirty_layers = []
         self._pending_blobs = []
 
@@ -113,12 +120,14 @@ class DrawRecorder:
         lid = self._current_id
         rect = self._current_rect
         raw = bytes(self._buf)
-        digest = hashlib.blake2b(raw, digest_size=8).digest()
         self._frame_layers.append(lid)
-        prev = self._prev_hashes.get(lid)
-        if prev != (rect, digest):
-            self._prev_hashes[lid] = (rect, digest)
-            self._dirty_layers.append((lid, rect, raw))
+        self._frame_raw_layers.append(raw)
+        if not self.raw_blob_mode:
+            digest = hashlib.blake2b(raw, digest_size=8).digest()
+            prev = self._prev_hashes.get(lid)
+            if prev != (rect, digest):
+                self._prev_hashes[lid] = (rect, digest)
+                self._dirty_layers.append((lid, rect, raw))
         self._current_id = None
         self._buf = bytearray()
 
@@ -143,11 +152,12 @@ class DrawRecorder:
             list(self._pending_blobs),
         )
 
-    def reset_retained(self) -> None:
+    def reset_retained(self, *, keep_blobs: bool = False) -> None:
         self._prev_hashes.clear()
         self.styles._map.clear()
         self.styles._pending.clear()
-        self.known_blobs.clear()
+        if not keep_blobs:
+            self.known_blobs.clear()
 
     # ── ImageDraw duck-typed methods ───────────────────────────────────
 
@@ -204,6 +214,14 @@ class DrawRecorder:
         self._buf.extend(raw[:0xFFFF])
 
     def textbbox(self, xy: Any, text: str, font: Any = None) -> tuple[int, int, int, int]:
+        x, y = int(xy[0]), int(xy[1])
+        if callable(self._measure_fn):
+            kind, size = font_tag(font)
+            tw, th = self._measure_fn(kind, size, str(text))
+            return (x, y, x + int(tw), y + int(th))
+        if self._scratch_draw is None:
+            self._scratch_img = Image.new("RGBA", (1, 1))
+            self._scratch_draw = ImageDraw.Draw(self._scratch_img)
         return self._scratch_draw.textbbox(xy, text, font=font)
 
     def push_clip(self, x0: int, y0: int, x1: int, y1: int) -> None:
@@ -250,9 +268,12 @@ class DrawRecorder:
             rgba = _load_scaled_image(path_str, tw, th)
             if rgba is None:
                 return
-            bio = io.BytesIO()
-            rgba.save(bio, format="PNG", compress_level=3)
-            self._pending_blobs.append((hash16, tw, th, bio.getvalue()))
+            if self.raw_blob_mode:
+                self._pending_blobs.append((hash16, tw, th, rgba.tobytes("raw", "RGBA")))
+            else:
+                bio = io.BytesIO()
+                rgba.save(bio, format="PNG", compress_level=3)
+                self._pending_blobs.append((hash16, tw, th, bio.getvalue()))
             self.known_blobs.add(hash16)
         self._buf.extend(IMG_BLIT_STRUCT.pack(
             OP_IMG_BLIT,

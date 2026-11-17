@@ -12,6 +12,7 @@ build/
 *.so
 .DS_Store
 rust/target/
+rust/crates/tw-native/target/
 android/.gradle/
 android/build/
 android/app/build/

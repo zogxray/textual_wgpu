@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tw_client::{spawn_command_session_cbs, ClientCallbacks};
-use tw_proto::{VID_CODEC_H264, VID_CODEC_HEVC};
+use tw_proto::{AppEntry, VID_CODEC_H264, VID_CODEC_HEVC};
 
 fn find_python() -> String {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -23,9 +23,19 @@ fn rust_client_drives_python_demo_over_stdio() {
     let py = find_python();
     let nalus: Arc<Mutex<Vec<(u8, usize)>>> = Arc::new(Mutex::new(Vec::new()));
     let nalus_cb = Arc::clone(&nalus);
+    let app_list: Arc<Mutex<Vec<AppEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let app_list_cb = Arc::clone(&app_list);
+    let launch_stat: Arc<Mutex<Option<(bool, String, String)>>> = Arc::new(Mutex::new(None));
+    let launch_stat_cb = Arc::clone(&launch_stat);
     let cbs = ClientCallbacks {
         on_video_nalu: Arc::new(move |_sid, cflag, _pts, _kf, data| {
             nalus_cb.lock().unwrap().push((cflag, data.len()));
+        }),
+        on_app_list: Arc::new(move |apps| {
+            *app_list_cb.lock().unwrap() = apps.to_vec();
+        }),
+        on_launch_status: Arc::new(move |ok, aid, msg| {
+            *launch_stat_cb.lock().unwrap() = Some((ok, aid.to_string(), msg.to_string()));
         }),
         ..Default::default()
     };
@@ -101,4 +111,28 @@ fn rust_client_drives_python_demo_over_stdio() {
         assert!(Instant::now() < deadline_audio, "timed out waiting for F7 AUDIO_PCM in Rust client");
         std::thread::sleep(Duration::from_millis(25));
     }
+
+    // Verify LIST_APPS -> APP_LIST and LAUNCH_APP -> LAUNCH_STATUS over stdio
+    client.list_apps();
+    let deadline_apps = Instant::now() + Duration::from_secs(4);
+    loop {
+        if !app_list.lock().unwrap().is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline_apps, "timed out waiting for APP_LIST");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(app_list.lock().unwrap().iter().any(|a| a.id == "demo:media"));
+
+    client.launch_app("demo:overview", "");
+    let deadline_launch = Instant::now() + Duration::from_secs(4);
+    loop {
+        if launch_stat.lock().unwrap().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline_launch, "timed out waiting for LAUNCH_STATUS");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let st_res = launch_stat.lock().unwrap().clone().unwrap();
+    assert!(st_res.0 && st_res.1 == "demo:overview");
 }

@@ -44,7 +44,7 @@ async def run_stdio_server(app: Any, *, size: tuple[int, int] = (1100, 720)) -> 
     drv = RemoteServerDriver(app, tx, size=size)
     await drv.start()
     try:
-        while app._running:
+        while drv.app._running:
             await asyncio.sleep(0.05)
     finally:
         await drv.stop()
@@ -87,7 +87,7 @@ async def _serve_stream_session(
             drv = RemoteServerDriver(app, tx, size=size, detach_on_eof=True)
             drv_holder[0] = drv
             await drv.start()
-            while app._running and not tx._closed:
+            while drv.app._running and not tx._closed:
                 await asyncio.sleep(0.02)
         else:
             if drv._rx_task is not None and not drv._rx_task.done():
@@ -102,7 +102,7 @@ async def _serve_stream_session(
             await drv._send_hello()
             await drv.emit_frame()
             drv._rx_task = asyncio.create_task(drv._rx_loop())
-            while app._running and not tx._closed:
+            while drv.app._running and not tx._closed:
                 await asyncio.sleep(0.02)
 
 
@@ -193,6 +193,11 @@ def build_parser() -> argparse.ArgumentParser:
     s_atcp = sub.add_parser("attach-tcp", help="Attach local GPU window to a TCP session")
     s_atcp.add_argument("host", nargs="?", default="127.0.0.1")
     s_atcp.add_argument("port", nargs="?", type=int, default=7420)
+
+    sub.add_parser("nodes", help="List saved Network OS nodes (Workstation, Phone, Cloud)")
+
+    s_node = sub.add_parser("attach-node", help="Connect to a saved node by ID from nodes.json")
+    s_node.add_argument("node_id", help="Node ID (e.g. workstation, phone, cloud)")
     return p
 
 
@@ -270,6 +275,31 @@ def main(argv: list[str] | None = None) -> int:
             remote_cmd = ["python3", "-m", "textual_wgpu.remote.cli", "serve-stdio"]
 
         viewer = RemoteViewer(connector=lambda: spawn_ssh_transport(args.host, remote_cmd))
+        viewer.run_windowed()
+        return 0
+    if args.cmd == "nodes":
+        from .directory import NodeRegistry
+
+        reg = NodeRegistry()
+        for n in reg.list_nodes():
+            print(f"{n.id:<14} [{n.role:<11}] {n.name:<24} {n.endpoint_label()}")
+        return 0
+    if args.cmd == "attach-node":  # pragma: no cover
+        from .directory import NodeRegistry
+
+        reg = NodeRegistry()
+        node = reg.get(args.node_id)
+        if node is None:
+            print(f"Unknown node {args.node_id!r}. Run 'textual-wgpu nodes' to list saved nodes.", file=sys.stderr)
+            return 2
+        if node.transport == "tcp":
+            viewer = RemoteViewer(connector=lambda: spawn_tcp_transport(node.host, node.port))
+        elif node.transport == "local":
+            cmd = [sys.executable, "-m", "textual_wgpu.remote.cli", "serve-stdio"]
+            viewer = RemoteViewer(connector=lambda: spawn_subprocess_transport(cmd))
+        else:
+            target = f"{node.user}@{node.host}" if node.user else node.host
+            viewer = RemoteViewer(connector=lambda: spawn_ssh_transport(target, [node.remote_cmd]))
         viewer.run_windowed()
         return 0
     return 1

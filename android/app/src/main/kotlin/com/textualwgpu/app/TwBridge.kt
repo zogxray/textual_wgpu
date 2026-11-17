@@ -10,6 +10,8 @@ interface TwCallback {
     fun onAudioStop()
     fun onVideoNalu(surfId: Int, codecFlag: Int, ptsUs: Long, isKeyframe: Boolean, data: ByteArray)
     fun onOpenClientFile(accept: String)
+    fun onAppList(ids: Array<String>, names: Array<String>, descriptions: Array<String>, kinds: Array<String>)
+    fun onLaunchStatus(ok: Boolean, appId: String, message: String)
 }
 
 object TwBridge {
@@ -77,5 +79,7 @@ object TwBridge {
         uvPixStride: Int,
     )
     external fun nativeSendClientFile(ptr: Long, name: String, data: ByteArray)
+    external fun nativeListApps(ptr: Long)
+    external fun nativeLaunchApp(ptr: Long, appId: String, args: String)
     external fun nativeDisconnect(ptr: Long)
 }

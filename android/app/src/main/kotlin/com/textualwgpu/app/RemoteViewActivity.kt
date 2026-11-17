@@ -34,6 +34,7 @@ import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -178,6 +179,11 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
                 TwBridge.nativeRenderFrame(sessionPtr)
             }
         }
+        addChip("Apps") {
+            if (sessionPtr != 0L) {
+                TwBridge.nativeListApps(sessionPtr)
+            }
+        }
         root.addView(barScroll)
         setContentView(root)
         surfaceView.requestFocus()
@@ -188,6 +194,10 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
         val reversePort = intent.getIntExtra("reverse_port", 0)
         if (mode == "preview") {
             sessionPtr = TwBridge.nativeConnectOfflinePreview(vw, vh, this)
+        } else if (mode == "tcp") {
+            val h = intent.getStringExtra("host") ?: "127.0.0.1"
+            val p = intent.getIntExtra("port", 7420)
+            sessionPtr = TwBridge.nativeConnectTcp(h, p, vw, vh, this)
         } else if (mode == "local_python") {
             statusTv.text = "Starting local Python Demo…"
             Thread {
@@ -478,6 +488,41 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
                 onStatus("File picker error: ${t.message}")
             }
         }
+    }
+
+    override fun onAppList(
+        ids: Array<String>,
+        names: Array<String>,
+        descriptions: Array<String>,
+        kinds: Array<String>,
+    ) {
+        mainHandler.post {
+            if (isDestroyed || sessionPtr == 0L) return@post
+            if (ids.isEmpty()) {
+                onStatus("No apps advertised by peer")
+                return@post
+            }
+            val labels = Array(ids.size) { i ->
+                val desc = descriptions.getOrNull(i).orEmpty()
+                val kind = kinds.getOrNull(i).orEmpty()
+                if (desc.isNotEmpty()) "${names[i]} [$kind]\n$desc" else "${names[i]} [$kind]"
+            }
+            AlertDialog.Builder(this)
+                .setTitle("Peer Apps · Launch Without Shell")
+                .setItems(labels) { _, which ->
+                    val aid = ids.getOrNull(which) ?: return@setItems
+                    if (sessionPtr != 0L) {
+                        TwBridge.nativeLaunchApp(sessionPtr, aid, "")
+                        onStatus("Launching $aid…")
+                    }
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+        }
+    }
+
+    override fun onLaunchStatus(ok: Boolean, appId: String, message: String) {
+        onStatus(if (ok) "Launched $appId: $message" else "Launch $appId failed: $message")
     }
 
     private fun queryFileName(uri: Uri): String? {

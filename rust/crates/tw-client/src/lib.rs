@@ -6,9 +6,10 @@ use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tw_proto::{
-    decode_audio_pcm, decode_vid_nalu, encode_caps, encode_client_file, encode_input_pointer,
-    encode_input_wheel, encode_resize, unpack_header, Frame, FrameReassembler, Op, Priority,
-    PriorityMux, HEADER_SIZE, VID_CODEC_MASK, VID_FLAG_KEYFRAME,
+    decode_app_list, decode_audio_pcm, decode_launch_status, decode_vid_nalu, encode_caps,
+    encode_client_file, encode_input_pointer, encode_input_wheel, encode_launch_app, encode_resize,
+    unpack_header, AppEntry, Frame, FrameReassembler, Op, Priority, PriorityMux, HEADER_SIZE,
+    VID_CODEC_MASK, VID_FLAG_KEYFRAME,
 };
 use tw_render::SceneState;
 
@@ -62,6 +63,18 @@ impl ClientHandle {
         ));
     }
 
+    pub fn list_apps(&self) {
+        let _ = self.tx.send(Frame::new(Op::ListApps, Vec::new(), Priority::P0Control));
+    }
+
+    pub fn launch_app(&self, app_id: &str, args: &str) {
+        let _ = self.tx.send(Frame::new(
+            Op::LaunchApp,
+            encode_launch_app(app_id, args),
+            Priority::P0Control,
+        ));
+    }
+
     pub fn quit(&self) {
         self.send_key("q");
     }
@@ -76,6 +89,8 @@ pub struct ClientCallbacks {
     pub on_audio_stop: Arc<dyn Fn() + Send + Sync>,
     pub on_video_nalu: Arc<dyn Fn(u32, u8, u64, bool, &[u8]) + Send + Sync>,
     pub on_open_client_file: Arc<dyn Fn(&str) + Send + Sync>,
+    pub on_app_list: Arc<dyn Fn(&[AppEntry]) + Send + Sync>,
+    pub on_launch_status: Arc<dyn Fn(bool, &str, &str) + Send + Sync>,
 }
 
 impl Default for ClientCallbacks {
@@ -88,8 +103,107 @@ impl Default for ClientCallbacks {
             on_audio_stop: Arc::new(|| {}),
             on_video_nalu: Arc::new(|_, _, _, _, _| {}),
             on_open_client_file: Arc::new(|_| {}),
+            on_app_list: Arc::new(|_| {}),
+            on_launch_status: Arc::new(|_, _, _| {}),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct SavedNode {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub transport: String,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub remote_cmd: String,
+}
+
+fn extract_json_str(obj: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let kpos = obj.find(&pat)?;
+    let rest = &obj[kpos + pat.len()..];
+    let cpos = rest.find(':')?;
+    let val = rest[cpos + 1..].trim_start();
+    if let Some(after_q) = val.strip_prefix('"') {
+        let end = after_q.find('"')?;
+        Some(after_q[..end].to_string())
+    } else {
+        let end = val.find([',', '}']).unwrap_or(val.len());
+        Some(val[..end].trim().to_string())
+    }
+}
+
+pub fn load_saved_nodes() -> Vec<SavedNode> {
+    let mut out = Vec::new();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = std::path::PathBuf::from(home).join(".config/textual-wgpu/nodes.json");
+    let Ok(txt) = std::fs::read_to_string(path) else {
+        return vec![
+            SavedNode {
+                id: "local".into(),
+                name: "This Device".into(),
+                role: "workstation".into(),
+                transport: "local".into(),
+                host: "127.0.0.1".into(),
+                port: 7420,
+                user: "local".into(),
+                remote_cmd: "python3 -m textual_wgpu".into(),
+            },
+            SavedNode {
+                id: "workstation".into(),
+                name: "Workstation GPU".into(),
+                role: "workstation".into(),
+                transport: "ssh".into(),
+                host: "192.168.1.10".into(),
+                port: 22,
+                user: "user".into(),
+                remote_cmd: "TEXTUAL_WGPU_REMOTE=stdio python3 -m textual_wgpu".into(),
+            },
+            SavedNode {
+                id: "phone".into(),
+                name: "Phone (Reverse / LAN)".into(),
+                role: "phone".into(),
+                transport: "tcp".into(),
+                host: "127.0.0.1".into(),
+                port: 7420,
+                user: "android".into(),
+                remote_cmd: "python3 -m textual_wgpu".into(),
+            },
+            SavedNode {
+                id: "cloud".into(),
+                name: "Cloud Compute Node".into(),
+                role: "cloud".into(),
+                transport: "ssh".into(),
+                host: "cloud.example.net".into(),
+                port: 22,
+                user: "ubuntu".into(),
+                remote_cmd: "TEXTUAL_WGPU_REMOTE=stdio python3 -m textual_wgpu".into(),
+            },
+        ];
+    };
+    for chunk in txt.split('{').skip(1) {
+        let Some(end) = chunk.find('}') else { continue };
+        let obj = &chunk[..end];
+        let Some(id) = extract_json_str(obj, "id") else { continue };
+        if id.is_empty() {
+            continue;
+        }
+        out.push(SavedNode {
+            id: id.clone(),
+            name: extract_json_str(obj, "name").unwrap_or(id),
+            role: extract_json_str(obj, "role").unwrap_or_else(|| "workstation".into()),
+            transport: extract_json_str(obj, "transport").unwrap_or_else(|| "ssh".into()),
+            host: extract_json_str(obj, "host").unwrap_or_else(|| "127.0.0.1".into()),
+            port: extract_json_str(obj, "port").and_then(|s| s.parse().ok()).unwrap_or(22),
+            user: extract_json_str(obj, "user").unwrap_or_else(|| "user".into()),
+            remote_cmd: extract_json_str(obj, "remote_cmd")
+                .unwrap_or_else(|| "TEXTUAL_WGPU_REMOTE=stdio python3 -m textual_wgpu".into()),
+        });
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +330,16 @@ fn dispatch_incoming_frame(
         Op::OpenClientFile => {
             let accept = String::from_utf8_lossy(&frame.payload).into_owned();
             (cbs.on_open_client_file)(&accept);
+        }
+        Op::AppList => {
+            if let Ok(apps) = decode_app_list(&frame.payload) {
+                (cbs.on_app_list)(&apps);
+            }
+        }
+        Op::LaunchStatus => {
+            if let Ok((ok, app_id, msg)) = decode_launch_status(&frame.payload) {
+                (cbs.on_launch_status)(ok, &app_id, &msg);
+            }
         }
         Op::VidNalu => {
             if let Ok((pts, flags, _mat, raw)) = decode_vid_nalu(&frame.payload) {

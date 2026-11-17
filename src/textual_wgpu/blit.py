@@ -403,3 +403,265 @@ class PlaneCompositor:
         pass_.draw(3)
         pass_.end()
         self.device.queue.submit([encoder.finish()])
+
+
+def load_tw_native() -> Any | None:
+    """Return the compiled PyO3 ``tw_native`` module if available and not disabled."""
+    import os
+
+    if os.environ.get("TEXTUAL_WGPU_NO_NATIVE", "").strip().lower() in ("1", "true", "yes"):
+        return None
+    try:
+        from . import tw_native
+
+        return tw_native
+    except Exception:  # noqa: BLE001
+        return None
+
+
+class GpuDrawOpRenderer:
+    """Pure-GPU ``DrawOp`` renderer powered by PyO3 ``tw_native`` + ``PlaneCompositor``."""
+
+    def __init__(self, device: Any, texture_format: str, native_mod: Any | None = None) -> None:
+        import wgpu
+
+        self._wgpu = wgpu
+        self.native = native_mod or load_tw_native()
+        if self.native is None:
+            raise RuntimeError("tw_native PyO3 extension is not available")
+        self.device = device
+        self.texture_format = texture_format
+        self.compiler = self.native.GpuUiCompiler()
+        self.compositor = PlaneCompositor(device, texture_format)
+        self._sampler = device.create_sampler(mag_filter="linear", min_filter="linear")
+        self._atlas_size = int(self.native.ATLAS_SIZE)
+
+        self._sync_fonts()
+        shader = device.create_shader_module(code=self.native.QUAD_SHADER)
+        bgl = device.create_bind_group_layout(
+            entries=[
+                {"binding": 0, "visibility": wgpu.ShaderStage.FRAGMENT, "sampler": {"type": "filtering"}},
+                {
+                    "binding": 1,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "float", "view_dimension": "2d", "multisampled": False},
+                },
+                {
+                    "binding": 2,
+                    "visibility": wgpu.ShaderStage.FRAGMENT,
+                    "texture": {"sample_type": "float", "view_dimension": "2d", "multisampled": False},
+                },
+                {
+                    "binding": 3,
+                    "visibility": wgpu.ShaderStage.VERTEX,
+                    "buffer": {"type": "uniform", "has_dynamic_offset": False},
+                },
+            ]
+        )
+        pl_layout = device.create_pipeline_layout(bind_group_layouts=[bgl])
+        vertex_layout = {
+            "array_stride": 64,
+            "step_mode": "instance",
+            "attributes": [
+                {"format": "float32x4", "offset": 0, "shader_location": 0},
+                {"format": "float32x4", "offset": 16, "shader_location": 1},
+                {"format": "float32x4", "offset": 32, "shader_location": 2},
+                {"format": "uint32", "offset": 48, "shader_location": 3},
+            ],
+        }
+        self._ui_pipeline = device.create_render_pipeline(
+            layout=pl_layout,
+            vertex={"module": shader, "entry_point": "vs_main", "buffers": [vertex_layout]},
+            fragment={
+                "module": shader,
+                "entry_point": "fs_main",
+                "targets": [
+                    {
+                        "format": "rgba8unorm",
+                        "blend": {
+                            "color": {"operation": "add", "src_factor": "src_alpha", "dst_factor": "one_minus_src_alpha"},
+                            "alpha": {"operation": "add", "src_factor": "one", "dst_factor": "one_minus_src_alpha"},
+                        },
+                    }
+                ],
+            },
+            primitive={"topology": "triangle-list"},
+        )
+        self._clear_pipeline = device.create_render_pipeline(
+            layout=pl_layout,
+            vertex={"module": shader, "entry_point": "vs_main", "buffers": [vertex_layout]},
+            fragment={
+                "module": shader,
+                "entry_point": "fs_main",
+                "targets": [
+                    {
+                        "format": "rgba8unorm",
+                        "blend": {
+                            "color": {"operation": "add", "src_factor": "one", "dst_factor": "zero"},
+                            "alpha": {"operation": "add", "src_factor": "one", "dst_factor": "zero"},
+                        },
+                    }
+                ],
+            },
+            primitive={"topology": "triangle-list"},
+        )
+        self._ui_uni_buf = device.create_buffer(
+            size=16,
+            usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
+        )
+        self._glyph_tex = device.create_texture(
+            size=(self._atlas_size, self._atlas_size, 1),
+            format="r8unorm",
+            usage=wgpu.TextureUsage.COPY_DST | wgpu.TextureUsage.TEXTURE_BINDING,
+        )
+        self._glyph_view = self._glyph_tex.create_view()
+        self._dummy_blob_tex = self.compositor._make_rgba_tex((1, 1))
+        self._ui_bind_group = self._make_ui_bg(self._dummy_blob_tex.create_view())
+        self._blob_cache: dict[bytes, tuple[Any, Any]] = {}
+        self._instance_cap = 2048
+        self._instance_buf = device.create_buffer(
+            size=self._instance_cap * 64,
+            usage=wgpu.BufferUsage.VERTEX | wgpu.BufferUsage.COPY_DST,
+        )
+
+    def _sync_fonts(self) -> None:
+        from pathlib import Path
+
+        from . import fonts as tw_fonts
+
+        paths = tw_fonts.active_font_paths()
+        for kind, loader in ((tw_fonts.FONT_MONO, self.compiler.load_font_mono), (tw_fonts.FONT_SANS, self.compiler.load_font_sans)):
+            p = paths.get(kind)
+            if p:
+                try:
+                    loader(Path(p).read_bytes())
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _make_ui_bg(self, blob_view: Any) -> Any:
+        return self.device.create_bind_group(
+            layout=self._ui_pipeline.get_bind_group_layout(0),
+            entries=[
+                {"binding": 0, "resource": self._sampler},
+                {"binding": 1, "resource": self._glyph_view},
+                {"binding": 2, "resource": blob_view},
+                {"binding": 3, "resource": {"buffer": self._ui_uni_buf, "offset": 0, "size": 16}},
+            ],
+        )
+
+    def set_fx(self, *, bloom: float = 0.0, scanlines: float = 0.0) -> None:
+        self.compositor.set_fx(bloom=bloom, scanlines=scanlines)
+
+    def render_frame(
+        self,
+        target_view: Any,
+        width: int,
+        height: int,
+        bg_rgba: tuple[int, int, int, int],
+        recorder: Any,
+        *,
+        plane_info: tuple[bytes, tuple[int, int], tuple[int, int, int, int]] | None = None,
+    ) -> None:
+        w = max(1, int(width))
+        h = max(1, int(height))
+        if self.compositor._ui_tex is None or self.compositor._ui_size != (w, h):
+            self.compositor._ui_tex = self.compositor._make_rgba_tex((w, h))
+            self.compositor._ui_view = self.compositor._ui_tex.create_view()
+            self.compositor._ui_size = (w, h)
+            self.compositor._rebuild_bind_group()
+            self.compositor._write_uniforms()
+
+        new_styles = recorder.styles.drain_new()
+        if new_styles:
+            self.compiler.set_styles(new_styles)
+        for h16, bw, bh, raw_rgba in recorder._pending_blobs:
+            if h16 not in self._blob_cache:
+                tex = self.compositor._make_rgba_tex((bw, bh))
+                self.device.queue.write_texture(
+                    {"texture": tex},
+                    raw_rgba,
+                    {"bytes_per_row": bw * 4, "rows_per_image": bh},
+                    (bw, bh, 1),
+                )
+                bg = self._make_ui_bg(tex.create_view())
+                self._blob_cache[h16] = (tex, bg)
+                self.compiler.set_blob_dims(h16, bw, bh)
+
+        inst_bytes, batches, uploads = self.compiler.compile_layers(w, h, recorder._frame_raw_layers)
+        for ax, ay, aw, ah, cov in uploads:
+            self.device.queue.write_texture(
+                {"texture": self._glyph_tex, "origin": (ax, ay, 0)},
+                cov,
+                {"bytes_per_row": aw, "rows_per_image": ah},
+                (aw, ah, 1),
+            )
+
+        self.device.queue.write_buffer(self._ui_uni_buf, 0, struct.pack("ffff", float(w), float(h), 0.0, 0.0))
+        inst_count = len(inst_bytes) // 64
+        if inst_count > 0:
+            if inst_count > self._instance_cap:
+                self._instance_cap = max(inst_count * 2, 2048)
+                self._instance_buf = self.device.create_buffer(
+                    size=self._instance_cap * 64,
+                    usage=self._wgpu.BufferUsage.VERTEX | self._wgpu.BufferUsage.COPY_DST,
+                )
+            self.device.queue.write_buffer(self._instance_buf, 0, inst_bytes)
+
+        if plane_info is not None:
+            p_rgba, p_size, p_rect = plane_info
+            self.compositor.upload_plane(p_rgba, p_size, p_rect)
+        else:
+            self.compositor.clear_plane()
+
+        encoder = self.device.create_command_encoder()
+        pass_ = encoder.begin_render_pass(
+            color_attachments=[
+                {
+                    "view": self.compositor._ui_view,
+                    "clear_value": (bg_rgba[0] / 255.0, bg_rgba[1] / 255.0, bg_rgba[2] / 255.0, bg_rgba[3] / 255.0),
+                    "load_op": "clear",
+                    "store_op": "store",
+                }
+            ]
+        )
+        if inst_count > 0:
+            pass_.set_vertex_buffer(0, self._instance_buf)
+            for start, count, sx, sy, sw, sh, kind_id, h16 in batches:
+                sx_c = min(sx, max(0, w - 1))
+                sy_c = min(sy, max(0, h - 1))
+                sw_c = min(sw, max(0, w - sx_c))
+                sh_c = min(sh, max(0, h - sy_c))
+                if sw_c <= 0 or sh_c <= 0 or count <= 0:
+                    continue
+                pass_.set_scissor_rect(sx_c, sy_c, sw_c, sh_c)
+                if kind_id == 0:
+                    pass_.set_pipeline(self._ui_pipeline)
+                    pass_.set_bind_group(0, self._ui_bind_group)
+                elif kind_id == 1:
+                    pass_.set_pipeline(self._clear_pipeline)
+                    pass_.set_bind_group(0, self._ui_bind_group)
+                else:
+                    entry = self._blob_cache.get(h16)
+                    if entry is None:
+                        continue
+                    pass_.set_pipeline(self._ui_pipeline)
+                    pass_.set_bind_group(0, entry[1])
+                pass_.draw(6, count, 0, start)
+        pass_.end()
+
+        # Composite UI + optional Video/3D plane + optional CRT FX onto swapchain target_view
+        comp_pass = encoder.begin_render_pass(
+            color_attachments=[
+                {
+                    "view": target_view,
+                    "clear_value": (0.0, 0.0, 0.0, 1.0),
+                    "load_op": "clear",
+                    "store_op": "store",
+                }
+            ]
+        )
+        comp_pass.set_pipeline(self.compositor._pipeline)
+        comp_pass.set_bind_group(0, self.compositor._bind_group)
+        comp_pass.draw(3)
+        comp_pass.end()
+        self.device.queue.submit([encoder.finish()])

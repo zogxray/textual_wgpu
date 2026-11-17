@@ -3,7 +3,10 @@ use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use tw_client::{spawn_command_session_cbs, spawn_tcp_session_cbs, ClientCallbacks, ClientHandle};
+use tw_client::{
+    load_saved_nodes, spawn_command_session_cbs, spawn_tcp_session_cbs, ClientCallbacks,
+    ClientHandle,
+};
 use tw_proto::{POINTER_DOWN, POINTER_MOVE, POINTER_UP, VID_CODEC_AV1, VID_CODEC_HEVC};
 use tw_render::{GpuCompositor, SceneState};
 use winit::application::ApplicationHandler;
@@ -388,6 +391,12 @@ impl Drop for FfmpegDecoder {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(|s| s.as_str()) == Some("--nodes") {
+        for n in load_saved_nodes() {
+            println!("{:<14} [{:<11}] {:<24} {}:{}", n.id, n.role, n.name, n.host, n.port);
+        }
+        return;
+    }
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("event loop");
     let proxy = event_loop.create_proxy();
     let proxy_cb = proxy.clone();
@@ -452,9 +461,49 @@ fn main() {
                 }
             });
         }),
+        ..Default::default()
     };
 
-    let (client, _join) = if args.first().map(|s| s.as_str()) == Some("--tcp") {
+    let (client, _join) = if args.first().map(|s| s.as_str()) == Some("--node") && args.len() >= 2 {
+        let nid = &args[1];
+        let nodes = load_saved_nodes();
+        let node = nodes
+            .into_iter()
+            .find(|n| n.id == *nid || n.name.eq_ignore_ascii_case(nid))
+            .unwrap_or_else(|| panic!("Saved node not found: {nid}"));
+        if node.transport == "tcp" {
+            spawn_tcp_session_cbs(node.host, node.port, cbs).expect("spawn node tcp")
+        } else if node.transport == "local" {
+            spawn_command_session_cbs(
+                "python3".into(),
+                vec!["-m".into(), "textual_wgpu".into()],
+                vec![("TEXTUAL_WGPU_REMOTE".into(), "stdio".into())],
+                cbs,
+            )
+            .expect("spawn node local")
+        } else {
+            let target = if node.user.is_empty() {
+                node.host.clone()
+            } else {
+                format!("{}@{}", node.user, node.host)
+            };
+            spawn_command_session_cbs(
+                "ssh".into(),
+                vec![
+                    "-T".into(),
+                    "-o".into(),
+                    "Compression=no".into(),
+                    "-p".into(),
+                    node.port.to_string(),
+                    target,
+                    node.remote_cmd,
+                ],
+                vec![],
+                cbs,
+            )
+            .expect("spawn node ssh")
+        }
+    } else if args.first().map(|s| s.as_str()) == Some("--tcp") {
         let target = args.get(1).map(|s| s.as_str()).unwrap_or("127.0.0.1:7420");
         let (host, port) = if let Some((h, p)) = target.rsplit_once(':') {
             (h.to_string(), p.parse::<u16>().unwrap_or(7420))

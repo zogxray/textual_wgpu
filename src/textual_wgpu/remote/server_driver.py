@@ -24,11 +24,14 @@ from .protocol import (
     decode_client_file,
     decode_input_pointer,
     decode_input_wheel,
+    decode_launch_app,
     decode_resize,
+    encode_app_list,
     encode_audio_pcm,
     encode_buf_write,
     encode_frame_commit,
     encode_hello,
+    encode_launch_status,
     encode_layer_patch,
     encode_plane_rect,
     encode_put_blob,
@@ -114,6 +117,7 @@ class RemoteServerDriver(Driver):
         self._vid_encoders: dict[int, Any] = {}
         self._client_file_cb: Any = None
         self.prefer_hw_video = True
+        self.apps_path: Any = None
 
     async def start(self) -> None:
         app = self.app
@@ -638,3 +642,136 @@ class RemoteServerDriver(Driver):
                 Frame(op=Op.PONG, payload=frame.payload, prio=Priority.P0_CONTROL),
                 compress=False,
             )
+        elif op == Op.LIST_APPS:
+            from .directory import discover_local_apps
+
+            apps = [a.as_wire_tuple() for a in discover_local_apps(apps_path=self.apps_path)]
+            await self.transport.send_now(
+                Frame(op=Op.APP_LIST, payload=encode_app_list(apps), prio=Priority.P0_CONTROL),
+            )
+        elif op == Op.LAUNCH_APP:
+            app_id, args = decode_launch_app(frame.payload)
+            await self._launch_app(app_id, args)
+
+    async def _swap_app(self, new_app: Any) -> None:
+        old_app = self.app
+        try:
+            old_app._running = False
+        except Exception:  # noqa: BLE001
+            pass
+        for enc in self._vid_encoders.values():
+            try:
+                enc.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._vid_encoders.clear()
+        self._last_plane_rect.clear()
+        self._surf_ids.clear()
+        if hasattr(self, "_last_vid_seq"):
+            self._last_vid_seq.clear()
+        self.recorder.reset_retained(keep_blobs=True)
+
+        self.app = new_app
+        new_app._driver = self
+        new_app._loop = asyncio.get_running_loop()
+        new_app._running = True
+        if hasattr(new_app, "_pixel_size"):
+            new_app._pixel_size = self.size
+        if hasattr(new_app, "_layout_size"):
+            new_app._layout_size = (0, 0)
+        if hasattr(new_app, "on_mount"):
+            res = new_app.on_mount()
+            if inspect.isawaitable(res):
+                await res
+        if hasattr(new_app, "_ensure_screen"):
+            new_app._booting = False
+            new_app._ensure_screen()
+        elif hasattr(new_app, "after_first_draw"):
+            new_app.after_first_draw()
+        if hasattr(new_app, "on_resize"):
+            new_app.on_resize(*self.size)
+
+        from ..events import Ready
+        from ..widget import dispatch_event
+
+        dispatch_event(new_app, Ready(), "on_ready")
+        if new_app.screen is not None:
+            dispatch_event(new_app.screen, Ready(), "on_ready")
+        await self._send_hello()
+        await self.emit_frame()
+
+    async def _launch_app(self, app_id: str, args: str) -> None:
+        from .directory import instantiate_python_app, resolve_app_entry
+
+        entry = resolve_app_entry(app_id, apps_path=self.apps_path)
+        if entry is None:
+            await self.transport.send_now(
+                Frame(
+                    op=Op.LAUNCH_STATUS,
+                    payload=encode_launch_status(False, app_id, f"Unknown app: {app_id}"),
+                    prio=Priority.P0_CONTROL,
+                ),
+            )
+            return
+        if entry.kind == "mode":
+            if hasattr(self.app, "switch_mode") and self.app.switch_mode(entry.target):
+                self.app.request_draw()
+                await self.transport.send_now(
+                    Frame(
+                        op=Op.LAUNCH_STATUS,
+                        payload=encode_launch_status(True, app_id, f"Switched to {entry.name}"),
+                        prio=Priority.P0_CONTROL,
+                    ),
+                )
+                return
+            # Otherwise fall through to launching demo app directly in that mode
+            try:
+                from ..demo import build_demo_app
+
+                new_app = build_demo_app(start=entry.target)
+                await self._swap_app(new_app)
+                await self.transport.send_now(
+                    Frame(
+                        op=Op.LAUNCH_STATUS,
+                        payload=encode_launch_status(True, app_id, f"Launched {entry.name}"),
+                        prio=Priority.P0_CONTROL,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                await self.transport.send_now(
+                    Frame(
+                        op=Op.LAUNCH_STATUS,
+                        payload=encode_launch_status(False, app_id, str(exc)),
+                        prio=Priority.P0_CONTROL,
+                    ),
+                )
+            return
+
+        if entry.kind == "python":
+            try:
+                new_app = instantiate_python_app(entry.target, args)
+                await self._swap_app(new_app)
+                await self.transport.send_now(
+                    Frame(
+                        op=Op.LAUNCH_STATUS,
+                        payload=encode_launch_status(True, app_id, f"Launched {entry.name}"),
+                        prio=Priority.P0_CONTROL,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                await self.transport.send_now(
+                    Frame(
+                        op=Op.LAUNCH_STATUS,
+                        payload=encode_launch_status(False, app_id, f"Launch failed: {exc}"),
+                        prio=Priority.P0_CONTROL,
+                    ),
+                )
+            return
+
+        await self.transport.send_now(
+            Frame(
+                op=Op.LAUNCH_STATUS,
+                payload=encode_launch_status(False, app_id, f"Unsupported app kind: {entry.kind}"),
+                prio=Priority.P0_CONTROL,
+            ),
+        )

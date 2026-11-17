@@ -118,6 +118,8 @@ class ModeApp(App):
         self._tooltip = Tooltip(id="-tooltip")
         self._tooltip.app = self
         self._blitter: FrameBlitter | None = None
+        self._gpu_renderer: Any = None
+        self._gpu_recorder: Any = None
         self._pixel_size = self.SIZE
         self._root: Screen | None = None
         self._hits: list[tuple[Rect, Callable[[int, int], None]]] = []
@@ -230,6 +232,13 @@ class ModeApp(App):
                 except Exception as exc:  # noqa: BLE001
                     print(f"on_screen_resume error: {exc}", flush=True)
             self.request_draw()
+
+    def switch_mode(self, mode_key: str) -> bool:
+        for idx, (k, _title) in enumerate(self._labels):
+            if k == mode_key:
+                self.set_mode(idx)
+                return True
+        return False
 
     def set_focus(self, widget: object | None, scroll_visible: bool = True) -> None:
         super().set_focus(widget, scroll_visible=scroll_visible)
@@ -1837,13 +1846,31 @@ class ModeApp(App):
 
     def on_mount(self) -> None:
         if self._device is not None and self._format is not None:
-            self._blitter = FrameBlitter(self._device, self._format)
+            from .blit import GpuDrawOpRenderer, load_tw_native
+
+            nat = load_tw_native()
+            if nat is not None:
+                try:
+                    from .remote.recorder import DrawRecorder
+
+                    self._gpu_renderer = GpuDrawOpRenderer(self._device, self._format, native_mod=nat)
+                    self._gpu_recorder = DrawRecorder(
+                        raw_blob_mode=True,
+                        measure_fn=self._gpu_renderer.compiler.measure_text,
+                    )
+                except Exception:  # noqa: BLE001
+                    self._gpu_renderer = None
+                    self._gpu_recorder = None
+            if self._gpu_renderer is None:
+                self._blitter = FrameBlitter(self._device, self._format)
             fx = getattr(self, "_post_fx", None)
             if fx:
-                self._blitter.set_fx(
-                    bloom=float(fx.get("bloom", 0.0)),
-                    scanlines=float(fx.get("scanlines", 0.0)),
-                )
+                target = self._gpu_renderer if self._gpu_renderer is not None else self._blitter
+                if target is not None:
+                    target.set_fx(
+                        bloom=float(fx.get("bloom", 0.0)),
+                        scanlines=float(fx.get("scanlines", 0.0)),
+                    )
             self._booting = True
             self._boot_frac = 0.12
             self._boot_label = "Starting…"
@@ -1863,24 +1890,61 @@ class ModeApp(App):
         self._boot_frac = 1.0
         self._booting = False
 
+    def _collect_local_plane(self, root: Any) -> tuple[bytes, tuple[int, int], tuple[int, int, int, int]] | None:
+        from .widgets.video import Video
+        from .widgets.viewport3d import Viewport3D
+
+        for w in root._walk(root):
+            if (getattr(w, "styles", None) or {}).get("display") == "none":
+                continue
+            r = getattr(w, "rect", None)
+            if r is None or r.w < 4 or r.h < 4:
+                continue
+            if isinstance(w, Viewport3D):
+                if w._dirty_render or w._buf_size != (r.w, r.h) or not w._rgba_buf:
+                    bw, bh, raw = w.render_offscreen(r.w, r.h)
+                else:
+                    bw, bh = w._buf_size
+                    raw = w._rgba_buf
+                if raw:
+                    return (raw, (bw, bh), (r.x, r.y, r.x1, r.y1))
+            elif isinstance(w, Video):
+                if w._rgba_buf and w._buf_size[0] > 0:
+                    return (w._rgba_buf, w._buf_size, (r.x, r.y, r.x1, r.y1))
+        return None
+
     def draw(self) -> None:
-        if self._blitter is None or self._context is None:
+        if (self._blitter is None and self._gpu_renderer is None) or self._context is None:
             return
         w, h = self._pixel_size
         if w <= 0 or h <= 0:
             w, h = self.SIZE
-        if self._frame is None or self._frame.size != (w, h):
-            self._frame = Image.new("RGBA", (w, h))
-        img = self._frame
-        draw = ImageDraw.Draw(img)
-        draw.rectangle([0, 0, w, h], fill=self.theme.rgba("background"))
+        use_gpu = self._gpu_renderer is not None and self._gpu_recorder is not None
+        if use_gpu:
+            rec = self._gpu_recorder
+            rec.begin_frame()
+            draw: Any = rec
+        else:
+            if self._frame is None or self._frame.size != (w, h):
+                self._frame = Image.new("RGBA", (w, h))
+            img = self._frame
+            draw = ImageDraw.Draw(img)
+            draw.rectangle([0, 0, w, h], fill=self.theme.rgba("background"))
 
         if self._booting:
+            if use_gpu:
+                rec.begin_layer("boot", (0, 0, w, h))
             self._paint_boot(draw, w, h)
+            if use_gpu:
+                rec.end_layer()
+                rec.finish_frame()
             self._hits = []
-            self._blitter.upload(img.tobytes("raw", "RGBA"), img.size)
             view = self._context.get_current_texture().create_view()
-            self._blitter.draw(view)
+            if use_gpu:
+                self._gpu_renderer.render_frame(view, w, h, self.theme.rgba("background"), rec)
+            else:
+                self._blitter.upload(img.tobytes("raw", "RGBA"), img.size)
+                self._blitter.draw(view)
             return
 
         root = self._ensure_screen()
@@ -1899,14 +1963,22 @@ class ModeApp(App):
                         entry.screen.layout(Rect(0, 0, w, h))
                     except Exception:  # noqa: BLE001
                         pass
+        if use_gpu:
+            rec.begin_layer("root", (0, 0, w, h))
         root.paint(draw)
+        if use_gpu:
+            rec.end_layer()
         self._hits = list(root.hits())
         # Overlay push_screen stack (topmost last).
-        for entry in self._screen_stack:
+        for idx, entry in enumerate(self._screen_stack):
             scr = entry.screen
             if scr.rect.w <= 0 or scr.rect.h <= 0:
                 scr.layout(Rect(0, 0, w, h))
+            if use_gpu:
+                rec.begin_layer(f"stack:{idx}", (0, 0, w, h))
             scr.paint(draw)
+            if use_gpu:
+                rec.end_layer()
             try:
                 self._hits = list(scr.hits())
             except Exception:  # noqa: BLE001
@@ -1914,7 +1986,11 @@ class ModeApp(App):
         # Toast overlay (ModeApp.notify → Toast widget).
         if self._toast.visible:
             self._toast.app = self
+            if use_gpu:
+                rec.begin_layer("overlay:toast", (0, 0, w, h))
             self._toast.paint_at(draw, Rect(0, 0, w, h))
+            if use_gpu:
+                rec.end_layer()
             self._notify = self._toast.message
         elif self._notify:
             # Legacy fields cleared once toast expires.
@@ -1922,29 +1998,41 @@ class ModeApp(App):
             self._notify_until = None
         if self._tooltip.visible:
             self._tooltip.app = self
+            if use_gpu:
+                rec.begin_layer("overlay:tooltip", (0, 0, w, h))
             self._tooltip.paint(draw)
-        if self.quit_modal:
-            self._paint_quit_modal(draw, w, h)
-        if self._confirm is not None:
-            self._paint_confirm(draw, w, h)
-        if self._form is not None:
-            self._paint_form(draw, w, h)
-        if self._open_file is not None:
-            self._paint_open_file(draw, w, h)
-        if self._overlay is not None:
-            self._paint_overlay(draw, w, h)
-        if self._prompt is not None:
-            self._paint_prompt(draw, w, h)
-        if self._text is not None:
-            self._paint_text(draw, w, h)
-        if self._pick is not None:
-            self._paint_pick(draw, w, h)
-        if getattr(self, "_busy", None):
-            self._paint_busy(draw, w, h)
-            self._hits = []  # Busy modal: no click-through
-        self._blitter.upload(img.tobytes("raw", "RGBA"), img.size)
+            if use_gpu:
+                rec.end_layer()
+        for attr, painter, clear_hits in (
+            ("quit_modal", "_paint_quit_modal", False),
+            ("_confirm", "_paint_confirm", False),
+            ("_form", "_paint_form", False),
+            ("_open_file", "_paint_open_file", False),
+            ("_overlay", "_paint_overlay", False),
+            ("_prompt", "_paint_prompt", False),
+            ("_text", "_paint_text", False),
+            ("_pick", "_paint_pick", False),
+            ("_busy", "_paint_busy", True),
+        ):
+            if getattr(self, attr, None):
+                if use_gpu:
+                    rec.begin_layer(f"modal:{attr}", (0, 0, w, h))
+                getattr(self, painter)(draw, w, h)
+                if use_gpu:
+                    rec.end_layer()
+                if clear_hits:
+                    self._hits = []  # Busy modal: no click-through
+
         view = self._context.get_current_texture().create_view()
-        self._blitter.draw(view)
+        if use_gpu:
+            rec.finish_frame()
+            plane = self._collect_local_plane(root)
+            self._gpu_renderer.render_frame(
+                view, w, h, self.theme.rgba("background"), rec, plane_info=plane,
+            )
+        else:
+            self._blitter.upload(img.tobytes("raw", "RGBA"), img.size)
+            self._blitter.draw(view)
 
     def _paint_progress_bar(
         self,

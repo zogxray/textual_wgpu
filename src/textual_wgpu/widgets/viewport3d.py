@@ -227,7 +227,13 @@ class Viewport3D(Widget):
             t = self.theme
             bg = t.rgba("surface")
             ac = t.rgba("accent")[:3]
-            raw = render_mesh_rgba(w, h, yaw=self.yaw, pitch=self.pitch, zoom=self.zoom, bg=bg, accent=ac)
+            from ..blit import load_tw_native
+
+            nat = load_tw_native()
+            if nat is not None:
+                raw = nat.render_mesh_rgba(w, h, float(self.yaw), float(self.pitch), float(self.zoom), tuple(bg), tuple(ac))
+            else:
+                raw = render_mesh_rgba(w, h, yaw=self.yaw, pitch=self.pitch, zoom=self.zoom, bg=bg, accent=ac)
         with self._lock:
             self._rgba_buf = raw
             self._buf_size = (w, h)

@@ -91,6 +91,10 @@ class Op(IntEnum):
     CLIP_PASTE = 0x15
     OPEN_CLIENT_FILE = 0x16
     CLIENT_FILE_DATA = 0x17
+    LIST_APPS = 0x18
+    APP_LIST = 0x19
+    LAUNCH_APP = 0x1A
+    LAUNCH_STATUS = 0x1B
     PING = 0x1E
     PONG = 0x1F
 
@@ -386,3 +390,62 @@ def decode_client_file(data: bytes) -> tuple[str, bytes]:
     (nlen,) = struct.unpack_from("<H", data, 0)
     off = 2
     return data[off : off + nlen].decode("utf-8", errors="replace"), data[off + nlen :]
+
+
+def _pack_str(s: str, max_bytes: int = 4095) -> bytes:
+    b = s.encode("utf-8")[:max_bytes]
+    return struct.pack("<H", len(b)) + b
+
+
+def _unpack_str(data: bytes, off: int) -> tuple[str, int]:
+    (slen,) = struct.unpack_from("<H", data, off)
+    off += 2
+    return data[off : off + slen].decode("utf-8", errors="replace"), off + slen
+
+
+def encode_app_list(apps: list[tuple[str, str, str, str]]) -> bytes:
+    out = bytearray(struct.pack("<H", len(apps)))
+    for app_id, name, desc, kind in apps:
+        out.extend(_pack_str(app_id, 511))
+        out.extend(_pack_str(name, 511))
+        out.extend(_pack_str(desc, 1023))
+        out.extend(_pack_str(kind, 127))
+    return bytes(out)
+
+
+def decode_app_list(data: bytes) -> list[tuple[str, str, str, str]]:
+    if len(data) < 2:
+        return []
+    (count,) = struct.unpack_from("<H", data, 0)
+    off = 2
+    out: list[tuple[str, str, str, str]] = []
+    for _ in range(count):
+        app_id, off = _unpack_str(data, off)
+        name, off = _unpack_str(data, off)
+        desc, off = _unpack_str(data, off)
+        kind, off = _unpack_str(data, off)
+        out.append((app_id, name, desc, kind))
+    return out
+
+
+def encode_launch_app(app_id: str, args: str = "") -> bytes:
+    return _pack_str(app_id, 511) + _pack_str(args, 2047)
+
+
+def decode_launch_app(data: bytes) -> tuple[str, str]:
+    app_id, off = _unpack_str(data, 0)
+    args, _ = _unpack_str(data, off) if off + 2 <= len(data) else ("", off)
+    return app_id, args
+
+
+def encode_launch_status(ok: bool, app_id: str, message: str = "") -> bytes:
+    return struct.pack("<B", 1 if ok else 0) + _pack_str(app_id, 511) + _pack_str(message, 1023)
+
+
+def decode_launch_status(data: bytes) -> tuple[bool, str, str]:
+    if not data:
+        return False, "", ""
+    ok = bool(data[0])
+    app_id, off = _unpack_str(data, 1)
+    msg, _ = _unpack_str(data, off) if off + 2 <= len(data) else ("", off)
+    return ok, app_id, msg

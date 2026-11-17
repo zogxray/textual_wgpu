@@ -1,8 +1,13 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 
+pub mod gpu_ui;
+
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 use bytemuck::{Pod, Zeroable};
+use gpu_ui::{
+    compile_layers, BatchKind, GlyphAtlas, QuadInstance, ATLAS_SIZE, QUAD_SHADER,
+};
 use tw_proto::{
     decode_buf_write, decode_draw_ops, decode_frame_commit, decode_fx, decode_hello,
     decode_layer_patch, decode_plane_rect, decode_put_blob, decode_style_defs, decode_vid_nalu,
@@ -867,6 +872,13 @@ struct UniformData {
     view_rect: [f32; 4],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct UiUniformData {
+    viewport: [f32; 2],
+    _pad: [f32; 2],
+}
+
 pub struct GpuCompositor {
     sampler: wgpu::Sampler,
     pipeline: wgpu::RenderPipeline,
@@ -881,6 +893,19 @@ pub struct GpuCompositor {
     fx: (f32, f32),
     has_plane: f32,
     plane_rect_px: [i16; 4],
+
+    // Pure-GPU DrawOp instanced renderer state
+    ui_pipeline: wgpu::RenderPipeline,
+    clear_pipeline: wgpu::RenderPipeline,
+    ui_uni_buf: wgpu::Buffer,
+    glyph_tex: wgpu::Texture,
+    glyph_view: wgpu::TextureView,
+    _dummy_blob_tex: wgpu::Texture,
+    ui_bind_group: wgpu::BindGroup,
+    blob_cache: HashMap<[u8; 16], (wgpu::Texture, wgpu::BindGroup)>,
+    instance_buf: wgpu::Buffer,
+    instance_cap: usize,
+    atlas: GlyphAtlas,
 }
 
 impl GpuCompositor {
@@ -925,11 +950,152 @@ impl GpuCompositor {
             multiview: None,
             cache: None,
         });
-        let ui_tex = make_tex(device, 1, 1);
+        let ui_tex = make_ui_tex(device, 1, 1);
         let ui_view = ui_tex.create_view(&Default::default());
         let plane_tex = make_tex(device, 1, 1);
         let plane_view = plane_tex.create_view(&Default::default());
         let bind_group = make_bg(device, &pipeline, &sampler, &ui_view, &plane_view, &uni_buf);
+
+        // Pure-GPU DrawOp instanced pipelines
+        let quad_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("tw-quad-shader"),
+            source: wgpu::ShaderSource::Wgsl(QUAD_SHADER.into()),
+        });
+        let ui_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("tw-ui-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let ui_pl_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("tw-ui-pl-layout"),
+            bind_group_layouts: &[&ui_bgl],
+            push_constant_ranges: &[],
+        });
+        let inst_attrs = [
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 0, shader_location: 0 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 16, shader_location: 1 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 32, shader_location: 2 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint32, offset: 48, shader_location: 3 },
+        ];
+        let inst_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<QuadInstance>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &inst_attrs,
+        };
+        let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("tw-ui-pipeline"),
+            layout: Some(&ui_pl_layout),
+            vertex: wgpu::VertexState {
+                module: &quad_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: std::slice::from_ref(&inst_layout),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &quad_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let clear_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("tw-clear-pipeline"),
+            layout: Some(&ui_pl_layout),
+            vertex: wgpu::VertexState {
+                module: &quad_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: std::slice::from_ref(&inst_layout),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &quad_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let ui_uni_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tw-ui-uni"),
+            size: std::mem::size_of::<UiUniformData>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let glyph_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("tw-glyph-atlas"),
+            size: wgpu::Extent3d { width: ATLAS_SIZE, height: ATLAS_SIZE, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let glyph_view = glyph_tex.create_view(&Default::default());
+        let dummy_blob_tex = make_tex(device, 1, 1);
+        let dummy_blob_view = dummy_blob_tex.create_view(&Default::default());
+        let ui_bind_group = make_ui_bg(device, &ui_pipeline, &sampler, &glyph_view, &dummy_blob_view, &ui_uni_buf);
+        let instance_cap = 2048;
+        let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tw-ui-instances"),
+            size: (instance_cap * std::mem::size_of::<QuadInstance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             sampler,
             pipeline,
@@ -944,6 +1110,17 @@ impl GpuCompositor {
             fx: (0.0, 0.0),
             has_plane: 0.0,
             plane_rect_px: [0, 0, 1, 1],
+            ui_pipeline,
+            clear_pipeline,
+            ui_uni_buf,
+            glyph_tex,
+            glyph_view,
+            _dummy_blob_tex: dummy_blob_tex,
+            ui_bind_group,
+            blob_cache: HashMap::new(),
+            instance_buf,
+            instance_cap,
+            atlas: GlyphAtlas::default(),
         }
     }
 
@@ -970,22 +1147,78 @@ impl GpuCompositor {
     ) {
         let (w, h) = (server_size.0.max(1), server_size.1.max(1));
         if self.ui_size != (w, h) {
-            self.ui_tex = make_tex(device, w, h);
+            self.ui_tex = make_ui_tex(device, w, h);
             self.ui_view = self.ui_tex.create_view(&Default::default());
             self.ui_size = (w, h);
             self.bind_group = make_bg(device, &self.pipeline, &self.sampler, &self.ui_view, &self.plane_view, &self.uni_buf);
         }
-        let ui_img = state.render_ui(w, h);
-        queue.write_texture(
-            self.ui_tex.as_image_copy(),
-            &ui_img.data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(w * 4),
-                rows_per_image: Some(h),
-            },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+
+        // Upload any newly seen @image blobs to GPU textures once (cached by hash16).
+        let mut blobs_dims: HashMap<[u8; 16], (u32, u32)> = HashMap::with_capacity(state.blobs.len());
+        for (h16, img) in &state.blobs {
+            blobs_dims.insert(*h16, (img.width, img.height));
+            if !self.blob_cache.contains_key(h16) {
+                let tex = make_tex(device, img.width, img.height);
+                queue.write_texture(
+                    tex.as_image_copy(),
+                    &img.data,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(img.width * 4),
+                        rows_per_image: Some(img.height),
+                    },
+                    wgpu::Extent3d { width: img.width, height: img.height, depth_or_array_layers: 1 },
+                );
+                let tv = tex.create_view(&Default::default());
+                let bg = make_ui_bg(device, &self.ui_pipeline, &self.sampler, &self.glyph_view, &tv, &self.ui_uni_buf);
+                self.blob_cache.insert(*h16, (tex, bg));
+            }
+        }
+
+        // Compile retained DrawOps into GPU instanced quads + incremental glyph atlas uploads.
+        let compiled = compile_layers(
+            w,
+            h,
+            &state.styles,
+            &blobs_dims,
+            state.font_mono.as_ref(),
+            state.font_sans.as_ref(),
+            &mut self.atlas,
+            state.order.iter().filter_map(|lid| state.layers.get(lid).map(|(_, ops)| ops.as_slice())),
         );
+        for up in self.atlas.drain_uploads() {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.glyph_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: up.x, y: up.y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &up.data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(up.w),
+                    rows_per_image: Some(up.h),
+                },
+                wgpu::Extent3d { width: up.w, height: up.h, depth_or_array_layers: 1 },
+            );
+        }
+
+        let ui_uni = UiUniformData { viewport: [w as f32, h as f32], _pad: [0.0; 2] };
+        queue.write_buffer(&self.ui_uni_buf, 0, bytemuck::bytes_of(&ui_uni));
+
+        if !compiled.instances.is_empty() {
+            if compiled.instances.len() > self.instance_cap {
+                self.instance_cap = (compiled.instances.len() * 2).max(2048);
+                self.instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("tw-ui-instances"),
+                    size: (self.instance_cap * std::mem::size_of::<QuadInstance>()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            queue.write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&compiled.instances));
+        }
 
         let mut uploaded_plane = false;
         for pl in state.planes.values() {
@@ -1032,7 +1265,60 @@ impl GpuCompositor {
         };
         queue.write_buffer(&self.uni_buf, 0, bytemuck::bytes_of(&uni));
 
+        let bg = state.bg_rgba;
         let mut encoder = device.create_command_encoder(&Default::default());
+        // Pass 1: Pure-GPU instanced quads + glyph atlas + scissor clips into ui_view
+        {
+            let mut ui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("tw-gpu-ui-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.ui_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: bg[0] as f64 / 255.0,
+                            g: bg[1] as f64 / 255.0,
+                            b: bg[2] as f64 / 255.0,
+                            a: bg[3] as f64 / 255.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            if !compiled.instances.is_empty() {
+                ui_pass.set_vertex_buffer(0, self.instance_buf.slice(..));
+                for batch in &compiled.batches {
+                    let sx = batch.scissor[0].min(w.saturating_sub(1));
+                    let sy = batch.scissor[1].min(h.saturating_sub(1));
+                    let sw = batch.scissor[2].min(w.saturating_sub(sx));
+                    let sh = batch.scissor[3].min(h.saturating_sub(sy));
+                    if sw == 0 || sh == 0 || batch.count == 0 {
+                        continue;
+                    }
+                    ui_pass.set_scissor_rect(sx, sy, sw, sh);
+                    match &batch.kind {
+                        BatchKind::Ui => {
+                            ui_pass.set_pipeline(&self.ui_pipeline);
+                            ui_pass.set_bind_group(0, &self.ui_bind_group, &[]);
+                        }
+                        BatchKind::Clear => {
+                            ui_pass.set_pipeline(&self.clear_pipeline);
+                            ui_pass.set_bind_group(0, &self.ui_bind_group, &[]);
+                        }
+                        BatchKind::Image(h16) => {
+                            let Some((_, blob_bg)) = self.blob_cache.get(h16) else { continue };
+                            ui_pass.set_pipeline(&self.ui_pipeline);
+                            ui_pass.set_bind_group(0, blob_bg, &[]);
+                        }
+                    }
+                    ui_pass.draw(0..6, batch.start..batch.start + batch.count);
+                }
+            }
+        }
+        // Pass 2: Plane + UI composite + viewport transform + CRT post-FX onto swapchain
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("tw-comp-pass"),
@@ -1054,6 +1340,39 @@ impl GpuCompositor {
         }
         queue.submit(Some(encoder.finish()));
     }
+}
+
+fn make_ui_tex(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("tw-ui-tex"),
+        size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    })
+}
+
+fn make_ui_bg(
+    device: &wgpu::Device,
+    pipeline: &wgpu::RenderPipeline,
+    sampler: &wgpu::Sampler,
+    glyph_view: &wgpu::TextureView,
+    blob_view: &wgpu::TextureView,
+    uni_buf: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("tw-ui-bg"),
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Sampler(sampler) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(glyph_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(blob_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: uni_buf.as_entire_binding() },
+        ],
+    })
 }
 
 fn make_tex(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
@@ -1109,5 +1428,68 @@ mod tests {
         assert!((vt.zoom - 2.0).abs() < 1e-4);
         let vr = vt.view_rect((1080, 2400), (1100, 720));
         assert!((vr[2] - vr[0]) < 0.6);
+    }
+
+    #[test]
+    fn compile_layers_batches_quads_glyphs_and_clips() {
+        let mut st = SceneState::default();
+        st.styles.insert(
+            1,
+            StyleDef {
+                style_id: 1,
+                fg: 0xFFFFFFFF,
+                bg: 0,
+                flags: 0,
+                font_id: 0,
+                size: 14,
+            },
+        );
+        let ops = vec![
+            DrawOp::Rect {
+                flags: RECT_FLAG_FILL | RECT_FLAG_OUTLINE,
+                x0: 10,
+                y0: 10,
+                x1: 200,
+                y1: 100,
+                fill: 0x203040FF,
+                outline: 0xD4AD72FF,
+                width: 2,
+            },
+            DrawOp::ClipPush { x0: 20, y0: 20, x1: 120, y1: 80 },
+            DrawOp::Text { x: 24, y: 24, style_id: 1, text: "GPU Hello!".into() },
+            DrawOp::Line { x0: 20, y0: 60, x1: 120, y1: 60, fill: 0x6CB2EBFF, width: 2 },
+            DrawOp::ClipPop,
+            DrawOp::ClearRect { x0: 210, y0: 10, x1: 300, y1: 100 },
+        ];
+        let mut atlas = GlyphAtlas::default();
+        let compiled = compile_layers(
+            640,
+            360,
+            &st.styles,
+            &HashMap::new(),
+            st.font_mono.as_ref(),
+            st.font_sans.as_ref(),
+            &mut atlas,
+            std::iter::once(ops.as_slice()),
+        );
+        assert!(compiled.instances.len() >= 7);
+        assert!(compiled.batches.iter().any(|b| b.scissor == [20, 20, 100, 60] && b.kind == BatchKind::Ui));
+        assert!(compiled.batches.iter().any(|b| b.kind == BatchKind::Clear));
+        if st.font_mono.is_some() {
+            let uploads = atlas.drain_uploads();
+            assert!(!uploads.is_empty());
+            // Second frame with identical text emits zero new glyph uploads
+            let _ = compile_layers(
+                640,
+                360,
+                &st.styles,
+                &HashMap::new(),
+                st.font_mono.as_ref(),
+                st.font_sans.as_ref(),
+                &mut atlas,
+                std::iter::once(ops.as_slice()),
+            );
+            assert!(atlas.drain_uploads().is_empty());
+        }
     }
 }

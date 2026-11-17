@@ -83,6 +83,10 @@ mod android_jni {
         let cb_v = Arc::clone(&cb_ref);
         let vm_f = Arc::clone(&vm);
         let cb_f = Arc::clone(&cb_ref);
+        let vm_al = Arc::clone(&vm);
+        let cb_al = Arc::clone(&cb_ref);
+        let vm_ls = Arc::clone(&vm);
+        let cb_ls = Arc::clone(&cb_ref);
 
         ClientCallbacks {
             on_commit: Arc::new(move || call_void(&vm_r, &cb_r, "onRedraw")),
@@ -127,6 +131,60 @@ mod android_jni {
             }),
             on_open_client_file: Arc::new(move |accept| {
                 call_str(&vm_f, &cb_f, "onOpenClientFile", accept);
+            }),
+            on_app_list: Arc::new(move |apps| {
+                if let Ok(mut env) = vm_al.attach_current_thread() {
+                    let Ok(str_cls) = env.find_class("java/lang/String") else { return };
+                    let Ok(empty) = env.new_string("") else { return };
+                    let n = apps.len() as i32;
+                    let (Ok(ids), Ok(names), Ok(descs), Ok(kinds)) = (
+                        env.new_object_array(n, &str_cls, &empty),
+                        env.new_object_array(n, &str_cls, &empty),
+                        env.new_object_array(n, &str_cls, &empty),
+                        env.new_object_array(n, &str_cls, &empty),
+                    ) else {
+                        return;
+                    };
+                    for (i, a) in apps.iter().enumerate() {
+                        if let (Ok(ji), Ok(jn), Ok(jd), Ok(jk)) = (
+                            env.new_string(&a.id),
+                            env.new_string(&a.name),
+                            env.new_string(&a.description),
+                            env.new_string(&a.kind),
+                        ) {
+                            let _ = env.set_object_array_element(&ids, i as i32, ji);
+                            let _ = env.set_object_array_element(&names, i as i32, jn);
+                            let _ = env.set_object_array_element(&descs, i as i32, jd);
+                            let _ = env.set_object_array_element(&kinds, i as i32, jk);
+                        }
+                    }
+                    if let Err(e) = env.call_method(
+                        cb_al.as_obj(),
+                        "onAppList",
+                        "([Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;)V",
+                        &[(&ids).into(), (&names).into(), (&descs).into(), (&kinds).into()],
+                    ) {
+                        let _ = env.exception_clear();
+                        call_str(&vm_al, &cb_al, "onStatus", &format!("AppList JNI err: {e}"));
+                    }
+                }
+            }),
+            on_launch_status: Arc::new(move |ok, app_id, msg| {
+                if let Ok(mut env) = vm_ls.attach_current_thread() {
+                    if let (Ok(jid), Ok(jmsg)) = (env.new_string(app_id), env.new_string(msg)) {
+                        if env
+                            .call_method(
+                                cb_ls.as_obj(),
+                                "onLaunchStatus",
+                                "(ZLjava/lang/String;Ljava/lang/String;)V",
+                                &[(if ok { 1u8 } else { 0u8 }).into(), (&jid).into(), (&jmsg).into()],
+                            )
+                            .is_err()
+                        {
+                            let _ = env.exception_clear();
+                        }
+                    }
+                }
             }),
         }
     }
@@ -700,6 +758,40 @@ mod android_jni {
         let Ok(bytes) = env.convert_byte_array(&data) else { return };
         if let Some(c) = &sess.client {
             c.send_client_file(&fname, &bytes);
+        }
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_textualwgpu_app_TwBridge_nativeListApps(
+        _env: JNIEnv,
+        _cls: JClass,
+        ptr: jlong,
+    ) {
+        if ptr == 0 {
+            return;
+        }
+        let sess = unsafe { &*(ptr as *mut RemoteSession) };
+        if let Some(c) = &sess.client {
+            c.list_apps();
+        }
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_textualwgpu_app_TwBridge_nativeLaunchApp(
+        mut env: JNIEnv,
+        _cls: JClass,
+        ptr: jlong,
+        app_id: JString,
+        args: JString,
+    ) {
+        if ptr == 0 {
+            return;
+        }
+        let sess = unsafe { &*(ptr as *mut RemoteSession) };
+        let aid = jstr(&mut env, &app_id);
+        let arg_s = jstr(&mut env, &args);
+        if let Some(c) = &sess.client {
+            c.launch_app(&aid, &arg_s);
         }
     }
 

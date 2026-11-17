@@ -18,12 +18,15 @@ from .protocol import (
     Frame,
     Op,
     Priority,
+    decode_app_list,
     decode_audio_pcm,
+    decode_launch_status,
     decode_put_blob,
     encode_caps,
     encode_client_file,
     encode_input_pointer,
     encode_input_wheel,
+    encode_launch_app,
     encode_resize,
 )
 from .recorder import RemoteSceneState, apply_remote_frame
@@ -54,6 +57,8 @@ class RemoteViewer:
         self._proc: Any = None
         self._audio_proc: Any = None
         self._aloop: asyncio.AbstractEventLoop | None = None
+        self.peer_apps: list[tuple[str, str, str, str]] = []
+        self.last_launch_status: tuple[bool, str, str] | None = None
 
     def _blob_path(self, hash16: bytes) -> Path:
         return self.cache_dir / f"{hash16.hex()}.png"
@@ -86,6 +91,12 @@ class RemoteViewer:
             accept = frame.payload.decode("utf-8", errors="replace")
             self._handle_client_file_request(accept)
             return False
+        elif frame.op == Op.APP_LIST:
+            self.peer_apps = decode_app_list(frame.payload)
+            return False
+        elif frame.op == Op.LAUNCH_STATUS:
+            self.last_launch_status = decode_launch_status(frame.payload)
+            return False
         elif frame.op == Op.HELLO:
             commit = apply_remote_frame(self.state, frame)
             if self.state.width_scale != 1.0:
@@ -113,6 +124,16 @@ class RemoteViewer:
     def render_image(self) -> Image.Image:
         self._frame_img = self.state.render(self.size)
         return self._frame_img
+
+    async def request_apps(self) -> None:
+        if self.transport is not None:
+            await self.transport.send_now(Frame(op=Op.LIST_APPS, payload=b"", prio=Priority.P0_CONTROL))
+
+    async def launch_app(self, app_id: str, args: str = "") -> None:
+        if self.transport is not None:
+            await self.transport.send_now(
+                Frame(op=Op.LAUNCH_APP, payload=encode_launch_app(app_id, args), prio=Priority.P0_CONTROL),
+            )
 
     def _stop_local_audio(self) -> None:
         if self._audio_proc is not None:

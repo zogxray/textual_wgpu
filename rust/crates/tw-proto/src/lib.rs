@@ -90,6 +90,10 @@ pub enum Op {
     ClipPaste = 0x15,
     OpenClientFile = 0x16,
     ClientFileData = 0x17,
+    ListApps = 0x18,
+    AppList = 0x19,
+    LaunchApp = 0x1A,
+    LaunchStatus = 0x1B,
     Ping = 0x1E,
     Pong = 0x1F,
 
@@ -123,6 +127,10 @@ impl Op {
             0x15 => Ok(Self::ClipPaste),
             0x16 => Ok(Self::OpenClientFile),
             0x17 => Ok(Self::ClientFileData),
+            0x18 => Ok(Self::ListApps),
+            0x19 => Ok(Self::AppList),
+            0x1A => Ok(Self::LaunchApp),
+            0x1B => Ok(Self::LaunchStatus),
             0x1E => Ok(Self::Ping),
             0x1F => Ok(Self::Pong),
             0x20 => Ok(Self::StyleDef),
@@ -597,6 +605,102 @@ pub fn encode_client_file(name: &str, data: &[u8]) -> Vec<u8> {
     out
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppEntry {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub kind: String,
+}
+
+fn push_str16(out: &mut Vec<u8>, s: &str, max_bytes: usize) {
+    let b = s.as_bytes();
+    let n = b.len().min(max_bytes).min(65535);
+    out.extend_from_slice(&(n as u16).to_le_bytes());
+    out.extend_from_slice(&b[..n]);
+}
+
+fn read_str16(data: &[u8], off: usize) -> Result<(String, usize), ProtoError> {
+    if off + 2 > data.len() {
+        return Err(ProtoError::Truncated);
+    }
+    let n = ru16(data, off) as usize;
+    let start = off + 2;
+    if start + n > data.len() {
+        return Err(ProtoError::Truncated);
+    }
+    Ok((String::from_utf8_lossy(&data[start..start + n]).into_owned(), start + n))
+}
+
+pub fn encode_app_list(apps: &[AppEntry]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + apps.len() * 32);
+    out.extend_from_slice(&(apps.len().min(65535) as u16).to_le_bytes());
+    for a in apps.iter().take(65535) {
+        push_str16(&mut out, &a.id, 511);
+        push_str16(&mut out, &a.name, 511);
+        push_str16(&mut out, &a.description, 1023);
+        push_str16(&mut out, &a.kind, 127);
+    }
+    out
+}
+
+pub fn decode_app_list(data: &[u8]) -> Result<Vec<AppEntry>, ProtoError> {
+    if data.len() < 2 {
+        return Err(ProtoError::Truncated);
+    }
+    let count = ru16(data, 0) as usize;
+    let mut off = 2;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (id, o1) = read_str16(data, off)?;
+        let (name, o2) = read_str16(data, o1)?;
+        let (description, o3) = read_str16(data, o2)?;
+        let (kind, o4) = read_str16(data, o3)?;
+        off = o4;
+        out.push(AppEntry { id, name, description, kind });
+    }
+    Ok(out)
+}
+
+pub fn encode_launch_app(app_id: &str, args: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + app_id.len() + args.len());
+    push_str16(&mut out, app_id, 511);
+    push_str16(&mut out, args, 2047);
+    out
+}
+
+pub fn decode_launch_app(data: &[u8]) -> Result<(String, String), ProtoError> {
+    let (id, off) = read_str16(data, 0)?;
+    let args = if off + 2 <= data.len() {
+        read_str16(data, off)?.0
+    } else {
+        String::new()
+    };
+    Ok((id, args))
+}
+
+pub fn encode_launch_status(ok: bool, app_id: &str, msg: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(5 + app_id.len() + msg.len());
+    out.push(if ok { 1 } else { 0 });
+    push_str16(&mut out, app_id, 511);
+    push_str16(&mut out, msg, 1023);
+    out
+}
+
+pub fn decode_launch_status(data: &[u8]) -> Result<(bool, String, String), ProtoError> {
+    if data.is_empty() {
+        return Err(ProtoError::Truncated);
+    }
+    let ok = data[0] != 0;
+    let (id, off) = read_str16(data, 1)?;
+    let msg = if off + 2 <= data.len() {
+        read_str16(data, off)?.0
+    } else {
+        String::new()
+    };
+    Ok((ok, id, msg))
+}
+
 pub fn encode_caps(has_gpu: bool, vram_mb: u32, codecs: &str) -> Vec<u8> {
     let cb = codecs.as_bytes();
     let clen = cb.len().min(65535);
@@ -801,5 +905,32 @@ mod tests {
         assert!(matches!(decoded[0], DrawOp::Rect { x0: 10, fill: 0x112233FF, .. }));
         assert!(matches!(decoded[1], DrawOp::ClearRect { x0: 12, y1: 78, .. }));
         assert!(matches!(&decoded[2], DrawOp::Text { style_id: 5, text, .. } if text == "hi"));
+    }
+
+    #[test]
+    fn app_directory_roundtrip() {
+        let apps = vec![
+            AppEntry {
+                id: "demo".into(),
+                name: "Demo".into(),
+                description: "All modes".into(),
+                kind: "python".into(),
+            },
+            AppEntry {
+                id: "demo:media".into(),
+                name: "Media".into(),
+                description: "H.265/H.264".into(),
+                kind: "mode".into(),
+            },
+        ];
+        let enc = encode_app_list(&apps);
+        let dec = decode_app_list(&enc).unwrap();
+        assert_eq!(dec, apps);
+
+        let la = encode_launch_app("demo:media", "--hd");
+        assert_eq!(decode_launch_app(&la).unwrap(), ("demo:media".into(), "--hd".into()));
+
+        let ls = encode_launch_status(true, "demo:media", "Switched");
+        assert_eq!(decode_launch_status(&ls).unwrap(), (true, "demo:media".into(), "Switched".into()));
     }
 }

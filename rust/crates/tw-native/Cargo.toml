@@ -1,0 +1,18 @@
+[package]
+name = "tw-native"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace]
+
+[lib]
+name = "tw_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+ab_glyph = "0.2"
+bytemuck = "1"
+pyo3 = { version = "0.24", features = ["extension-module"] }
+tw-proto = { path = "../tw-proto" }
+tw-render = { path = "../tw-render" }

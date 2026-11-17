@@ -60,6 +60,7 @@ DEMO_LABELS: list[tuple[str, str]] = [
     ("themes", "Themes & FX"),
     ("planes", "3D Scene"),
     ("media", "Media"),
+    ("nodes", "Nodes & Apps"),
 ]
 
 _OVERVIEW_MD = """\
@@ -1066,7 +1067,159 @@ class MediaScreen(Screen):
         return super().on_key(key)
 
 
-def build_demo_app(theme: Theme | None = None) -> ModeApp:
+class NodesScreen(Screen):
+    """F8 · Network OS Directory: saved Workstation/Phone/Cloud nodes & zero-shell App Launcher."""
+
+    DEFAULT_CSS = """
+    #main { height: 1fr; }
+    #nodes-box { width: 1fr; }
+    #apps-box { width: 1fr; }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        from .remote.directory import NodeRegistry, discover_local_apps
+
+        self._registry = NodeRegistry()
+        self._apps = discover_local_apps()
+
+    def compose(self):
+        yield _mode_bar(self, "nodes")
+
+        node_opts = [
+            Option(f"[{n.role.upper()}] {n.name} — {n.endpoint_label()}", id=n.id)
+            for n in self._registry.list_nodes()
+        ]
+        node_list = OptionList(*node_opts, id="nodes-list")
+        btn_add_ws = Button("+ Workstation", id="btn-add-ws", on_press=lambda: self._add_node_prompt("workstation"))
+        btn_add_ph = Button("+ Phone", id="btn-add-ph", on_press=lambda: self._add_node_prompt("phone"))
+        btn_add_cl = Button("+ Cloud", id="btn-add-cl", on_press=lambda: self._add_node_prompt("cloud"))
+        node_btns = Horizontal(btn_add_ws, btn_add_ph, btn_add_cl, id="nodes-btns")
+        node_btns.layout_hint_h = 36
+        nodes_inner = Vertical(node_btns, node_list, id="nodes-inner")
+        nodes_box = Panel(nodes_inner, title="SAVED NODES · Workstation / Phone / Cloud", id="nodes-box")
+
+        app_opts = [
+            Option(f"{a.name} [{a.kind}] — {a.description}", id=a.app_id)
+            for a in self._apps
+        ]
+        app_list = OptionList(*app_opts, id="apps-list")
+        btn_refresh = Button("Refresh Apps (R)", id="btn-apps-refresh", on_press=self.refresh_apps)
+        btn_launch = Button("Launch App (Enter)", id="btn-apps-launch", variant="primary", on_press=self.launch_selected_app)
+        app_btns = Horizontal(btn_refresh, btn_launch, id="apps-btns")
+        app_btns.layout_hint_h = 36
+        apps_inner = Vertical(app_btns, app_list, id="apps-inner")
+        apps_box = Panel(apps_inner, title="APP DIRECTORY · Browse & Launch Without Shell Commands", id="apps-box")
+
+        yield Horizontal(nodes_box, apps_box, id="main")
+        yield KeyBar([
+            ("Enter", "Launch App", lambda: self.launch_selected_app()),
+            ("R", "Refresh", lambda: self.refresh_apps()),
+            ("W/P/C", "Add Node", None),
+            ("Tab", "Panel", lambda: _focus_next(self)),
+            ("F1–F8", "Modes", None),
+            ("Q", "Quit", lambda: _quit(self)),
+        ])
+        yield StatusBar("F8 Nodes & Apps · Network OS Directory (Workstation / Phone / Cloud)", id="status")
+
+    def on_screen_mount(self) -> None:
+        self.query_one("#apps-list", OptionList).focus()
+
+    def _reload_node_list(self) -> None:
+        nl = self.query_one("#nodes-list", OptionList)
+        nl.clear_options()
+        for n in self._registry.list_nodes():
+            nl.add_option(Option(f"[{n.role.upper()}] {n.name} — {n.endpoint_label()}", id=n.id))
+
+    def _add_node_prompt(self, role: str) -> None:
+        if self.app is None or not hasattr(self.app, "ask_prompt"):
+            return
+        from .remote.directory import NodeEntry
+
+        default_ep = "ubuntu@cloud.example.net" if role == "cloud" else (
+            "127.0.0.1:7420" if role == "phone" else "user@192.168.1.10"
+        )
+
+        def _save(val: str | None) -> None:
+            if not val or not val.strip():
+                return
+            raw = val.strip()
+            user = "user"
+            host = raw
+            port = 7420 if role == "phone" else 22
+            transport = "tcp" if role == "phone" else "ssh"
+            if "@" in host:
+                user, _, host = host.partition("@")
+            if ":" in host:
+                h, _, ps = host.partition(":")
+                host = h
+                if ps.isdigit():
+                    port = int(ps)
+            nid = f"{role}_{len(self._registry.list_nodes()) + 1}"
+            self._registry.upsert(
+                NodeEntry(
+                    id=nid,
+                    name=f"{role.title()} ({host})",
+                    role=role,
+                    transport=transport,
+                    host=host,
+                    port=port,
+                    user=user,
+                ),
+            )
+            self._reload_node_list()
+            self.query_one("#status", StatusBar).update(f"Saved {role} node: {host}:{port}")
+
+        self.app.ask_prompt(
+            f"Add {role.title()} node (user@host or host:port):",
+            _save,
+            initial=default_ep,
+            title=f"Save {role.title()} Node",
+        )
+
+    def refresh_apps(self) -> None:
+        from .remote.directory import discover_local_apps
+
+        self._apps = discover_local_apps()
+        al = self.query_one("#apps-list", OptionList)
+        al.clear_options()
+        for a in self._apps:
+            al.add_option(Option(f"{a.name} [{a.kind}] — {a.description}", id=a.app_id))
+        self.query_one("#status", StatusBar).update(f"F8 Directory · {len(self._apps)} apps available")
+
+    def launch_selected_app(self) -> None:
+        al = self.query_one("#apps-list", OptionList)
+        idx = al.highlighted
+        if idx is None or idx < 0 or idx >= len(self._apps):
+            return
+        entry = self._apps[idx]
+        if entry.kind == "mode" and self.app is not None and hasattr(self.app, "switch_mode"):
+            self.app.switch_mode(entry.target)
+            return
+        if entry.kind == "python":
+            self.query_one("#status", StatusBar).update(f"Ready: {entry.name} ({entry.app_id})")
+            return
+
+    def on_key(self, key: str) -> bool:
+        if key == "r":
+            self.refresh_apps()
+            return True
+        if key == "enter":
+            self.launch_selected_app()
+            return True
+        if key == "w":
+            self._add_node_prompt("workstation")
+            return True
+        if key == "p":
+            self._add_node_prompt("phone")
+            return True
+        if key == "c":
+            self._add_node_prompt("cloud")
+            return True
+        return super().on_key(key)
+
+
+def build_demo_app(theme: Theme | None = None, *, start: str = "overview") -> ModeApp:
     """Create the standalone ``textual-wgpu`` demo application."""
     modes: list[tuple[str, str, type[Screen]]] = [
         ("overview", "Overview", OverviewScreen),
@@ -1076,12 +1229,13 @@ def build_demo_app(theme: Theme | None = None) -> ModeApp:
         ("themes", "Themes & FX", ThemesFxScreen),
         ("planes", "3D Scene", PlanesScreen),
         ("media", "Media", MediaScreen),
+        ("nodes", "Nodes & Apps", NodesScreen),
     ]
     return ModeApp(
         modes,
         theme=theme or BUILTIN_THEMES["textual-dark"],
         title="textual-wgpu · demo",
-        start="overview",
+        start=start,
     )
 
 

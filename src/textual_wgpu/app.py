@@ -1837,15 +1837,26 @@ class App:
             if self._device is not None and self._context is not None:
                 self.clear()
             return
-        from PIL import Image, ImageDraw
-
-        from .blit import FrameBlitter
+        from .blit import FrameBlitter, GpuDrawOpRenderer, load_tw_native
         from .geometry import Rect
 
-        blitter = getattr(self, "_app_blitter", None)
-        if blitter is None:
-            blitter = FrameBlitter(self._device, self._format or "bgra8unorm")
-            self._app_blitter = blitter
+        gpu_r = getattr(self, "_app_gpu_renderer", None)
+        gpu_rec = getattr(self, "_app_gpu_recorder", None)
+        if gpu_r is None and not getattr(self, "_app_gpu_checked", False):
+            self._app_gpu_checked = True
+            nat = load_tw_native()
+            if nat is not None:
+                try:
+                    from .remote.recorder import DrawRecorder
+
+                    gpu_r = GpuDrawOpRenderer(self._device, self._format or "bgra8unorm", native_mod=nat)
+                    gpu_rec = DrawRecorder(raw_blob_mode=True, measure_fn=gpu_r.compiler.measure_text)
+                    self._app_gpu_renderer = gpu_r
+                    self._app_gpu_recorder = gpu_rec
+                except Exception:  # noqa: BLE001
+                    gpu_r = None
+                    gpu_rec = None
+
         w, h = getattr(self, "_pixel_size", None) or self.SIZE
         if hasattr(self._canvas, "get_physical_size"):
             try:
@@ -1854,11 +1865,38 @@ class App:
                     w, h = int(pw), int(ph)
             except Exception:  # noqa: BLE001
                 pass
-        img = Image.new("RGBA", (w, h), self.theme.rgba("background"))
-        draw = ImageDraw.Draw(img)
         if self._layout_size != (w, h):
             scr.layout(Rect(0, 0, w, h))
             self._layout_size = (w, h)
+
+        view = self._context.get_current_texture().create_view()
+        if gpu_r is not None and gpu_rec is not None:
+            gpu_rec.begin_frame()
+            gpu_rec.begin_layer("root", (0, 0, w, h))
+            scr.paint(gpu_rec)
+            gpu_rec.end_layer()
+            for idx, entry in enumerate(self._screen_stack):
+                if entry.screen is not scr:
+                    entry.screen.layout(Rect(0, 0, w, h))
+                    gpu_rec.begin_layer(f"stack:{idx}", (0, 0, w, h))
+                    entry.screen.paint(gpu_rec)
+                    gpu_rec.end_layer()
+            if self._toast is not None and self._toast.visible:
+                gpu_rec.begin_layer("overlay:toast", (0, 0, w, h))
+                self._toast.paint_at(gpu_rec, Rect(0, 0, w, h))
+                gpu_rec.end_layer()
+            gpu_rec.finish_frame()
+            gpu_r.render_frame(view, w, h, self.theme.rgba("background"), gpu_rec)
+            return
+
+        from PIL import Image, ImageDraw
+
+        blitter = getattr(self, "_app_blitter", None)
+        if blitter is None:
+            blitter = FrameBlitter(self._device, self._format or "bgra8unorm")
+            self._app_blitter = blitter
+        img = Image.new("RGBA", (w, h), self.theme.rgba("background"))
+        draw = ImageDraw.Draw(img)
         scr.paint(draw)
         for entry in self._screen_stack:
             if entry.screen is not scr:
@@ -1867,7 +1905,6 @@ class App:
         if self._toast is not None and self._toast.visible:
             self._toast.paint_at(draw, Rect(0, 0, w, h))
         blitter.upload(img.tobytes("raw", "RGBA"), img.size)
-        view = self._context.get_current_texture().create_view()
         blitter.draw(view)
 
     def _wgpu_surface(self) -> Any:

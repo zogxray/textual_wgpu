@@ -12,7 +12,10 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import org.json.JSONArray
+import org.json.JSONObject
 
 class MainActivity : AppCompatActivity() {
 
@@ -251,6 +254,157 @@ class MainActivity : AppCompatActivity() {
             LinearLayout.LayoutParams.WRAP_CONTENT,
         ).apply { topMargin = px(10) }
         col.addView(previewBtn, plp)
+
+        val nodesTitle = TextView(this).apply {
+            text = "Saved Network OS Nodes (Workstation · Phone · Cloud)"
+            textSize = 13f
+            setTextColor(Color.parseColor("#D4AD72"))
+            setPadding(0, px(18), 0, px(6))
+        }
+        col.addView(nodesTitle)
+
+        val nodesBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+        col.addView(nodesBox)
+
+        fun defaultNodesJson(): JSONArray {
+            return JSONArray().apply {
+                put(JSONObject().apply {
+                    put("id", "workstation"); put("role", "Workstation"); put("name", "Workstation GPU")
+                    put("transport", "ssh"); put("host", "192.168.1.10"); put("port", 22)
+                    put("user", "user"); put("cmd", defaultDemoCmd)
+                })
+                put(JSONObject().apply {
+                    put("id", "phone"); put("role", "Phone"); put("name", "Local Phone Python")
+                    put("transport", "local_python"); put("host", "127.0.0.1"); put("port", 7420)
+                    put("user", "android"); put("cmd", "")
+                })
+                put(JSONObject().apply {
+                    put("id", "cloud"); put("role", "Cloud"); put("name", "Cloud Compute Node")
+                    put("transport", "ssh"); put("host", "cloud.example.net"); put("port", 22)
+                    put("user", "ubuntu"); put("cmd", defaultDemoCmd)
+                })
+            }
+        }
+
+        fun loadNodes(): JSONArray {
+            val raw = prefs.getString("saved_nodes_json", null) ?: return defaultNodesJson()
+            return try {
+                val arr = JSONArray(raw)
+                if (arr.length() > 0) arr else defaultNodesJson()
+            } catch (_: Throwable) {
+                defaultNodesJson()
+            }
+        }
+
+        fun refreshNodes() {
+            nodesBox.removeAllViews()
+            val arr = loadNodes()
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val role = obj.optString("role", "Workstation")
+                val name = obj.optString("name", role)
+                val transport = obj.optString("transport", "ssh")
+                val host = obj.optString("host", "127.0.0.1")
+                val port = obj.optInt("port", 22)
+                val user = obj.optString("user", "user")
+                val cmd = obj.optString("cmd", defaultDemoCmd)
+                val label = if (transport == "local_python") {
+                    "[$role] $name · local://127.0.0.1:7420"
+                } else {
+                    "[$role] $name · $transport://$user@$host:$port"
+                }
+                val btn = Button(this).apply {
+                    text = label
+                    textSize = 12f
+                    isAllCaps = false
+                    gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                    setTextColor(Color.parseColor("#F5F0E8"))
+                    setBackgroundColor(Color.parseColor("#24202D"))
+                    setPadding(px(12), px(8), px(12), px(8))
+                    setOnClickListener {
+                        if (transport == "local_python") {
+                            localDemoBtn.performClick()
+                        } else {
+                            hostEt.setText(host)
+                            portEt.setText(port.toString())
+                            userEt.setText(user)
+                            if (cmd.isNotEmpty()) cmdEt.setText(cmd)
+                            if (transport == "tcp") {
+                                startActivity(
+                                    Intent(this@MainActivity, RemoteViewActivity::class.java).apply {
+                                        putExtra("mode", "tcp")
+                                        putExtra("host", host)
+                                        putExtra("port", port)
+                                        putExtra("virt_w", if (virtCb.isChecked) 1100 else 0)
+                                        putExtra("virt_h", if (virtCb.isChecked) 720 else 0)
+                                        putExtra("show_keys", keysCb.isChecked)
+                                        putExtra("fullscreen", fullCb.isChecked)
+                                    },
+                                )
+                            } else {
+                                connectBtn.performClick()
+                            }
+                        }
+                    }
+                    setOnLongClickListener {
+                        val next = JSONArray()
+                        for (j in 0 until arr.length()) {
+                            if (j != i) next.put(arr.get(j))
+                        }
+                        prefs.edit().putString("saved_nodes_json", next.toString()).apply()
+                        refreshNodes()
+                        true
+                    }
+                }
+                val nlp = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = px(6) }
+                nodesBox.addView(btn, nlp)
+            }
+        }
+        refreshNodes()
+
+        val saveNodeBtn = Button(this).apply {
+            text = "+ Save Current Host as Node (Workstation / Phone / Cloud)"
+            textSize = 12f
+            isAllCaps = false
+            setTextColor(Color.parseColor("#D4AD72"))
+            setBackgroundColor(Color.parseColor("#1F1B26"))
+            setOnClickListener {
+                val roles = arrayOf("Workstation", "Phone", "Cloud")
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Select Node Role")
+                    .setItems(roles) { _, which ->
+                        val role = roles[which]
+                        val h = hostEt.text.toString().trim().ifEmpty { "127.0.0.1" }
+                        val p = portEt.text.toString().trim().toIntOrNull() ?: 22
+                        val u = userEt.text.toString().trim()
+                        val c = cmdEt.text.toString().trim()
+                        val arr = loadNodes()
+                        arr.put(JSONObject().apply {
+                            put("id", "${role.lowercase()}_${arr.length() + 1}")
+                            put("role", role)
+                            put("name", "$role ($h)")
+                            put("transport", "ssh")
+                            put("host", h)
+                            put("port", p)
+                            put("user", u)
+                            put("cmd", c)
+                        })
+                        prefs.edit().putString("saved_nodes_json", arr.toString()).apply()
+                        refreshNodes()
+                    }
+                    .show()
+            }
+        }
+        val snlp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = px(8) }
+        col.addView(saveNodeBtn, snlp)
 
         setContentView(root)
     }
