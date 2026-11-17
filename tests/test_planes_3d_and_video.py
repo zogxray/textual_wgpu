@@ -257,3 +257,56 @@ async def test_client_file_upload_and_media_screen_file_loading(monkeypatch, tmp
     finally:
         await drv.stop()
         viewer.transport.close()
+
+
+def test_media_screen_loads_real_mp4_and_mp3_files(tmp_path: Path):
+    import shutil
+    import subprocess
+    from textual_wgpu.demo import build_demo_app
+    from textual_wgpu.geometry import Rect
+
+    ff = shutil.which("ffmpeg")
+    if not ff:
+        return
+    mp4 = tmp_path / "sample.mp4"
+    mp3 = tmp_path / "sample.mp3"
+    r1 = subprocess.run(
+        [
+            ff, "-y", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc=size=320x180:rate=24:duration=0.5",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=0.5",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            str(mp4),
+        ],
+        capture_output=True,
+    )
+    r2 = subprocess.run(
+        [ff, "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=523:duration=0.4", str(mp3)],
+        capture_output=True,
+    )
+    if r1.returncode != 0 or r2.returncode != 0:
+        return
+
+    app = build_demo_app(start="media")
+    app._pixel_size = (960, 600)
+    scr = app._ensure_screen()
+    scr.layout(Rect(0, 0, 960, 600))
+
+    scr.load_media_file(mp3)
+    assert scr._audio_pcm is not None and len(scr._audio_pcm) > 1000
+    assert scr._audio_playing is True
+
+    scr.load_media_file(mp4)
+    assert scr._file_streamer is not None
+    try:
+        import time
+
+        aus = []
+        for _ in range(30):
+            aus.extend(scr._file_streamer.pop_aus())
+            if aus:
+                break
+            time.sleep(0.03)
+        assert len(aus) >= 1
+    finally:
+        scr._file_streamer.close()

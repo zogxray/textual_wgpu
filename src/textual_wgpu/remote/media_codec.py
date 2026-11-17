@@ -449,6 +449,15 @@ def compute_pcm_envelope(pcm: bytes, *, buckets: int = 48) -> list[float]:
     return out
 
 
+def _android_media_helper() -> Any | None:
+    try:
+        from com.textualwgpu.app import LocalMediaHelper  # type: ignore[import-not-found]
+
+        return LocalMediaHelper
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def decode_audio_file_pcm(
     path: Path | str,
     *,
@@ -470,7 +479,15 @@ def decode_audio_file_pcm(
 
     ff = shutil.which("ffmpeg")
     if not ff:
-        raise RuntimeError("ffmpeg required to decode non-WAV audio")
+        helper = _android_media_helper()
+        if helper is not None:
+            blob = bytes(helper.decodeAudioPcm(str(p)) or b"")
+            if len(blob) > 8:
+                sr, ch = struct.unpack_from("<II", blob, 0)
+                pcm = blob[8:]
+                dur = (len(pcm) // (2 * max(1, ch))) / max(1, sr)
+                return pcm, int(sr), int(ch), compute_pcm_envelope(pcm), dur
+        raise RuntimeError("ffmpeg or Android MediaCodec required to decode audio")
     res = subprocess.run(
         [
             ff, "-y", "-loglevel", "error",
@@ -508,15 +525,23 @@ class FileVideoStreamer:
         src_codec = str(meta.get("codec") or "")
         src_w = int(meta.get("width") or 0)
         src_h = int(meta.get("height") or 0)
-        ff = shutil.which("ffmpeg")
-        if not ff:
-            raise RuntimeError("ffmpeg required for video file playback")
-
         self._aus: deque[tuple[bytes, bool]] = deque(maxlen=256)
         self._rgba_frames: deque[tuple[int, int, bytes]] = deque(maxlen=64)
         self._lock = threading.Lock()
         self._closed = False
         self._procs: list[subprocess.Popen] = []
+        self._android_sess: Any = None
+
+        ff = shutil.which("ffmpeg")
+        if not ff:
+            helper = _android_media_helper()
+            if helper is None:
+                raise RuntimeError("ffmpeg or Android MediaExtractor required for video file playback")
+            sess = helper.openVideo(str(self.path))
+            self._android_sess = sess
+            self.codec_flag = int(sess.codecFlag())
+            threading.Thread(target=self._read_android_loop, args=(sess,), daemon=True).start()
+            return
 
         # 1) Annex-B NALU stream for remote hardware decode (passthrough if already matching codec!)
         passthrough = (
@@ -529,7 +554,7 @@ class FileVideoStreamer:
             self.codec_flag = VID_CODEC_HEVC if src_codec == "hevc" else VID_CODEC_H264
             bsf = "hevc_mp4toannexb" if src_codec == "hevc" else "h264_mp4toannexb"
             cmd_nalu = [
-                ff, "-y", "-loglevel", "error", "-re",
+                ff, "-y", "-loglevel", "error", "-stream_loop", "-1", "-re",
                 "-i", str(self.path),
                 "-an", "-c:v", "copy", "-bsf:v", bsf,
                 "-f", src_codec, "pipe:1",
@@ -541,12 +566,12 @@ class FileVideoStreamer:
             enc_name, self.codec_flag = found
             fmt = codec_flag_to_fmt(self.codec_flag)
             vf = f"scale='min({max_w},iw)':'min({max_h},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2"
-            cmd_nalu = [ff, "-y", "-loglevel", "error", "-re", "-i", str(self.path), "-an"]
+            cmd_nalu = [ff, "-y", "-loglevel", "error", "-stream_loop", "-1", "-re", "-i", str(self.path), "-an"]
             if enc_name.endswith("_vaapi"):
                 cmd_nalu = [
                     ff, "-y", "-loglevel", "error",
                     "-vaapi_device", "/dev/dri/renderD128",
-                    "-re", "-i", str(self.path), "-an",
+                    "-stream_loop", "-1", "-re", "-i", str(self.path), "-an",
                     "-vf", f"{vf},format=nv12,hwupload",
                 ]
             else:
@@ -560,7 +585,7 @@ class FileVideoStreamer:
 
         # 2) Local PAM RGBA stream (lightweight preview for local WgpuDriver)
         cmd_pam = [
-            ff, "-y", "-loglevel", "error", "-re",
+            ff, "-y", "-loglevel", "error", "-stream_loop", "-1", "-re",
             "-i", str(self.path), "-an",
             "-vf", "scale='min(640,iw)':'min(400,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
             "-f", "image2pipe", "-vcodec", "pam", "-pix_fmt", "rgba", "pipe:1",
@@ -568,6 +593,22 @@ class FileVideoStreamer:
         p_pam = subprocess.Popen(cmd_pam, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self._procs.append(p_pam)
         threading.Thread(target=self._read_pam_loop, args=(p_pam,), daemon=True).start()
+
+    def _read_android_loop(self, sess: Any) -> None:
+        try:
+            while not self._closed:
+                pkt = sess.nextFrame()
+                if pkt is None:
+                    continue
+                raw = bytes(pkt)
+                if len(raw) <= 9:
+                    continue
+                is_kf = bool(raw[0])
+                au = raw[9:]
+                with self._lock:
+                    self._aus.append((au, is_kf))
+        except Exception:  # noqa: BLE001
+            pass
 
     def _read_nalu_loop(self, proc: subprocess.Popen) -> None:
         out = proc.stdout
@@ -643,6 +684,12 @@ class FileVideoStreamer:
 
     def close(self) -> None:
         self._closed = True
+        if self._android_sess is not None:
+            try:
+                self._android_sess.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._android_sess = None
         for p in self._procs:
             try:
                 p.terminate()

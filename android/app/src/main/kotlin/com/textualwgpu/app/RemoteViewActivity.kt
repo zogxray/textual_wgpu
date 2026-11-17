@@ -66,6 +66,7 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
             Thread {
                 try {
                     val name = queryFileName(uri) ?: "client_media.bin"
+                    onStatus("Loading $name…")
                     val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
                     if (bytes != null && bytes.isNotEmpty() && sessionPtr != 0L) {
                         TwBridge.nativeSendClientFile(sessionPtr, name, bytes)

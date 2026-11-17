@@ -821,8 +821,8 @@ class MediaScreen(Screen):
         btn_vid = Button("Pause Video", id="btn-video", on_press=self.toggle_video)
         audio_btns = Horizontal(btn_audio, btn_vid, id="media-btns")
         audio_btns.layout_hint_h = 36
-        btn_srv = Button("Server File (O)", id="btn-srv-file", on_press=self.pick_server_file)
-        btn_cli = Button("Client File (U)", id="btn-cli-file", on_press=self.pick_client_file)
+        btn_srv = Button("Open Local (O)", id="btn-srv-file", on_press=self.pick_server_file)
+        btn_cli = Button("Open Viewer File (U)", id="btn-cli-file", on_press=self.pick_client_file)
         file_btns = Horizontal(btn_srv, btn_cli, id="media-file-btns")
         file_btns.layout_hint_h = 36
         digits = Digits("00.0s", id="audio-clock")
@@ -830,18 +830,18 @@ class MediaScreen(Screen):
         spark = Sparkline(self._audio_env, id="audio-spark")
         spark.layout_hint_h = 26
         audio_inner = Vertical(audio_btns, file_btns, digits, bar, spark, id="audio-inner")
-        audio_box = Panel(audio_inner, title="AUDIO & FILES · A play · O server · U client", id="audio-box")
+        audio_box = Panel(audio_inner, title="AUDIO & FILES · O local · U viewer (Downloads)", id="audio-box")
 
         right = Vertical(vid_box, audio_box, id="media-right")
         yield Horizontal(photo_box, right, id="main")
         yield KeyBar([
             ("1/2/3", "Photo", None),
-            ("O", "Server File", lambda: self.pick_server_file()),
-            ("U", "Client File", lambda: self.pick_client_file()),
+            ("O", "Local File", lambda: self.pick_server_file()),
+            ("U", "Viewer File", lambda: self.pick_client_file()),
             ("V/Space", "Video", lambda: self.toggle_video()),
             ("A", "Audio", lambda: self.toggle_audio()),
             ("Tab", "Panel", lambda: _focus_next(self)),
-            ("F1–F7", "Modes", None),
+            ("F1–F8", "Modes", None),
             ("Q", "Quit", lambda: _quit(self)),
         ])
         yield StatusBar("F7 Media · H.265/H.264 video + native PNG + WAV/MP3 + server/client files", id="status")
@@ -876,18 +876,28 @@ class MediaScreen(Screen):
         self.query_one("#status", StatusBar).update(f"F7 Media · photo={kind}")
 
     def pick_server_file(self) -> None:
-        if self.app is None or not hasattr(self.app, "ask_open_file"):
+        import os
+
+        if self.app is None:
+            return
+        # On Android sandbox (Chaquopy), open the native Android Downloads/Files picker directly.
+        if "ANDROID_ROOT" in os.environ and hasattr(self.app, "request_client_file"):
+            self.pick_client_file()
+            return
+        if not hasattr(self.app, "ask_open_file"):
             return
         suffixes = (
             ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif",
             ".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v",
-            ".wav", ".mp3", ".ogg", ".flac", ".m4a",
+            ".wav", ".mp3", ".ogg", ".flac", ".m4a", ".aac",
         )
+        dl = Path.home() / "Downloads"
+        start_dir = dl if dl.is_dir() else Path.home()
         self.app.ask_open_file(
-            Path.home(),
+            start_dir,
             lambda p: self.load_media_file(p) if p is not None else None,
-            title="Select media file (Server)",
-            subtitle="Photo (.png .jpg .webp) · Video (.mp4 .mkv .webm) · Audio (.wav .mp3 .ogg)",
+            title="Open Media File (Photo / Video / Audio)",
+            subtitle="Photo (.png .jpg .webp) · Video (.mp4 .mkv .webm) · Audio (.mp3 .wav .ogg .m4a)",
             suffixes=suffixes,
             ok_label="Open",
         )
