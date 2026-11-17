@@ -500,7 +500,7 @@ class RemoteServerDriver(Driver):
         self._draw_pending = False
         self._frame_counter += 1
         dt_ms = (time.monotonic() - t0) * 1000.0
-        if dt_ms >= 20.0 or (self._frame_counter % 120) == 1:
+        if dt_ms >= 25.0 or self._frame_counter <= 3:
             rlog("PERF", f"emit_frame #{self._frame_counter}: dirty={len(snap['dirty'])} bytes={bytes_queued} dt={dt_ms:.1f}ms")
         return bytes_queued
 

@@ -310,7 +310,7 @@ class StreamVideoDecoder:
             raise RuntimeError("ffmpeg not found")
         cmd = [
             ff, "-y", "-loglevel", "error",
-            "-fflags", "nobuffer", "-flags", "low_delay", "-flush_packets", "1",
+            "-flags", "low_delay", "-flush_packets", "1",
             "-probesize", "32", "-analyzeduration", "0", "-threads", "1",
             "-f", self._fmt, "-i", "pipe:0",
             "-f", "image2pipe", "-vcodec", "pam", "-pix_fmt", "rgba",
@@ -779,17 +779,20 @@ class LocalCameraStreamer:
 
         try:
             while not self._closed:
-                pkt = helper.popCameraFrame()
-                if pkt is None:
-                    time.sleep(0.015)
-                    continue
-                raw = bytes(pkt)
-                if len(raw) <= 1:
-                    continue
-                is_kf = bool(raw[0])
-                au = raw[1:]
-                with self._lock:
-                    self._aus.append((au, is_kf))
+                got = False
+                while not self._closed:
+                    pkt = helper.popCameraFrame()
+                    if pkt is None:
+                        break
+                    raw = bytes(pkt)
+                    if len(raw) > 1:
+                        is_kf = bool(raw[0])
+                        au = raw[1:]
+                        with self._lock:
+                            self._aus.append((au, is_kf))
+                        got = True
+                if not got:
+                    time.sleep(0.012)
         except Exception:  # noqa: BLE001
             pass
 

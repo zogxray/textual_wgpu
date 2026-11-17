@@ -1,12 +1,18 @@
 package com.textualwgpu.app
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
+import android.net.Uri
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
 import android.widget.Button
@@ -116,6 +122,29 @@ class MainActivity : AppCompatActivity() {
 
         setContentView(root)
         refreshNodesList()
+        requestDevicePermissionsIfNeeded()
+    }
+
+    private fun requestDevicePermissionsIfNeeded() {
+        val perms = if (Build.VERSION.SDK_INT >= 33) {
+            listOf(
+                Manifest.permission.READ_MEDIA_IMAGES,
+                Manifest.permission.READ_MEDIA_VIDEO,
+                Manifest.permission.READ_MEDIA_AUDIO,
+                Manifest.permission.CAMERA,
+                Manifest.permission.RECORD_AUDIO,
+            )
+        } else {
+            listOf(
+                Manifest.permission.READ_EXTERNAL_STORAGE,
+                Manifest.permission.CAMERA,
+                Manifest.permission.RECORD_AUDIO,
+            )
+        }
+        val missing = perms.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isNotEmpty()) {
+            requestPermissions(missing.toTypedArray(), 4100)
+        }
     }
 
     override fun onResume() {
@@ -553,6 +582,26 @@ class MainActivity : AppCompatActivity() {
             hint = "Custom remote SSH command (leave blank for auto)"
             setText(prefs.getString("custom_cmd", "") ?: "")
             box.addView(this)
+        }
+        if (Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) {
+            val allFilesBtn = Button(this).apply {
+                text = "Allow Full Phone Files Access (Downloads)"
+                isAllCaps = false
+                setOnClickListener {
+                    try {
+                        startActivity(
+                            Intent(
+                                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                Uri.parse("package:$packageName"),
+                            ),
+                        )
+                    } catch (_: Throwable) {
+                        startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                    }
+                }
+                box.addView(this)
+            }
+            allFilesBtn.isEnabled = true
         }
         val logsBtn = Button(this).apply {
             text = "View Debug & Perf Logs"

@@ -682,13 +682,19 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
 
     private fun requestMediaPermissionsIfNeeded() {
         val perms = if (Build.VERSION.SDK_INT >= 33) {
-            arrayOf(
+            listOf(
                 Manifest.permission.READ_MEDIA_IMAGES,
                 Manifest.permission.READ_MEDIA_VIDEO,
                 Manifest.permission.READ_MEDIA_AUDIO,
+                Manifest.permission.CAMERA,
+                Manifest.permission.RECORD_AUDIO,
             )
         } else {
-            arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+            listOf(
+                Manifest.permission.READ_EXTERNAL_STORAGE,
+                Manifest.permission.CAMERA,
+                Manifest.permission.RECORD_AUDIO,
+            )
         }
         val missing = perms.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (missing.isNotEmpty()) {

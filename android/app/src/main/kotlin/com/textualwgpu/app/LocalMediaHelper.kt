@@ -9,6 +9,7 @@ import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureRequest
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaCodec
@@ -70,16 +71,39 @@ object LocalMediaHelper {
                 FsItem(true, "Movies", "Movies", 0L),
                 FsItem(true, "Music", "Music", 0L),
                 FsItem(true, "DCIM", "DCIM", 0L),
-                FsItem(false, "[System File Picker…]", "__picker__", 0L),
             )
         }
         val byName = LinkedHashMap<String, FsItem>()
-        // 1) Query MediaStore for matching relative path (works cleanly on Android 10-15 scoped storage)
+        // 1) Check public directory directly (full listing when storage/all-files permission granted)
+        try {
+            val publicType = when (reqPath) {
+                "Download" -> Environment.DIRECTORY_DOWNLOADS
+                "Pictures" -> Environment.DIRECTORY_PICTURES
+                "Movies" -> Environment.DIRECTORY_MOVIES
+                "Music" -> Environment.DIRECTORY_MUSIC
+                "DCIM" -> Environment.DIRECTORY_DCIM
+                else -> reqPath
+            }
+            val dir = if (reqPath.startsWith("/")) {
+                File(reqPath)
+            } else {
+                Environment.getExternalStoragePublicDirectory(publicType)
+            }
+            val files = dir?.listFiles()
+            if (files != null) {
+                for (f in files.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))) {
+                    if (f.name.startsWith(".")) continue
+                    byName[f.name] = FsItem(f.isDirectory, f.name, f.absolutePath, if (f.isDirectory) 0L else f.length())
+                }
+            }
+        } catch (_: Throwable) {
+        }
+        // 2) Query MediaStore (works on Android 10-15 scoped storage even without MANAGE_EXTERNAL_STORAGE)
         val collections = listOf(
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
             MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
-            MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+            MediaStore.Files.getContentUri("external"),
         )
         val proj = arrayOf(
             MediaStore.MediaColumns._ID,
@@ -87,8 +111,9 @@ object LocalMediaHelper {
             MediaStore.MediaColumns.SIZE,
             MediaStore.MediaColumns.RELATIVE_PATH,
         )
+        val relPrefix = if (reqPath.startsWith("/")) reqPath.substringAfterLast('/') else reqPath
         val sel = "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?"
-        val selArgs = arrayOf("$reqPath%")
+        val selArgs = arrayOf("$relPrefix%")
         for (colUri in collections) {
             try {
                 ctx.contentResolver.query(
@@ -104,7 +129,7 @@ object LocalMediaHelper {
                     while (cur.moveToNext()) {
                         val id = if (idIdx >= 0) cur.getLong(idIdx) else continue
                         val name = if (nameIdx >= 0) cur.getString(nameIdx).orEmpty() else continue
-                        if (name.isBlank() || byName.containsKey(name)) continue
+                        if (name.isBlank() || name.startsWith(".") || byName.containsKey(name)) continue
                         val sz = if (sizeIdx >= 0) cur.getLong(sizeIdx) else 0L
                         val itemUri = ContentUris.withAppendedId(colUri, id).toString()
                         byName[name] = FsItem(false, name, itemUri, sz)
@@ -113,23 +138,8 @@ object LocalMediaHelper {
             } catch (_: Throwable) {
             }
         }
-        // 2) Also check public external directory directly if accessible
-        try {
-            val dir = File(Environment.getExternalStorageDirectory(), reqPath)
-            val files = dir.listFiles()
-            if (files != null) {
-                for (f in files.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))) {
-                    if (f.name.startsWith(".")) continue
-                    if (!byName.containsKey(f.name)) {
-                        byName[f.name] = FsItem(f.isDirectory, f.name, f.absolutePath, if (f.isDirectory) 0L else f.length())
-                    }
-                }
-            }
-        } catch (_: Throwable) {
-        }
-        val out = byName.values.toMutableList()
-        out.add(FsItem(false, "[System File Picker…]", "__picker__", 0L))
-        return out
+        TwLog.log("TwFs", "listMediaFolder('$reqPath') -> ${byName.size} items")
+        return byName.values.toList()
     }
 
     @JvmStatic
@@ -432,11 +442,13 @@ object LocalMediaHelper {
             }
 
             val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 640, 480).apply {
+            val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 640, 360).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-                setInteger(MediaFormat.KEY_BIT_RATE, 1_000_000)
+                setInteger(MediaFormat.KEY_BIT_RATE, 700_000)
                 setInteger(MediaFormat.KEY_FRAME_RATE, 24)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                setInteger(MediaFormat.KEY_PRIORITY, 0)
+                setInteger(MediaFormat.KEY_OPERATING_RATE, 30)
             }
             enc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             val surf = enc.createInputSurface()
@@ -502,8 +514,16 @@ object LocalMediaHelper {
                         }
                         camDevice = camera
                         try {
+                            val chars = mgr.getCameraCharacteristics(camId)
+                            val ranges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                            val bestRange = ranges
+                                ?.filter { it.upper in 24..30 }
+                                ?.maxWithOrNull(compareBy({ it.lower }, { it.upper }))
                             val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                                 addTarget(surf)
+                                if (bestRange != null) {
+                                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, bestRange)
+                                }
                             }
                             @Suppress("DEPRECATION")
                             camera.createCaptureSession(
@@ -517,7 +537,7 @@ object LocalMediaHelper {
                                         camSession = session
                                         try {
                                             session.setRepeatingRequest(req.build(), null, handler)
-                                            TwLog.log("TwCam", "Camera2 started id=$camId (640x480 H.264)")
+                                            TwLog.log("TwCam", "Camera2 started id=$camId (640x360 H.264 fps=$bestRange)")
                                         } catch (t: Throwable) {
                                             TwLog.err("TwCam", "setRepeatingRequest failed", t)
                                         }

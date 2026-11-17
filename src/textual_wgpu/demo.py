@@ -1217,8 +1217,18 @@ class MediaScreen(Screen):
                         fw, fh, rgba = frame
                         vid.push_rgba_frame(fw, fh, rgba)
             else:
-                self._video_phase += 0.12
-                vid.push_rgba_frame(240, 144, _render_demo_video_frame(240, 144, self._video_phase))
+                import os
+
+                if "ANDROID_ROOT" in os.environ:
+                    # Throttle raw RGBA placeholder on mobile Python so UI/Camera/Mic stay 100% responsive
+                    cnt = getattr(self, "_synth_skip", 0) + 1
+                    self._synth_skip = cnt
+                    if cnt % 5 == 0:
+                        self._video_phase += 0.30
+                        vid.push_rgba_frame(160, 96, _render_demo_video_frame(160, 96, self._video_phase))
+                else:
+                    self._video_phase += 0.12
+                    vid.push_rgba_frame(240, 144, _render_demo_video_frame(240, 144, self._video_phase))
         if self._audio_playing:
             self._audio_elapsed += 0.05
             if self._audio_elapsed >= self._audio_dur:

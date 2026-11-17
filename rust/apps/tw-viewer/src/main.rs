@@ -327,7 +327,7 @@ impl FfmpegDecoder {
         let mut proc = Command::new("ffmpeg")
             .args([
                 "-y", "-loglevel", "error",
-                "-fflags", "nobuffer", "-flags", "low_delay", "-flush_packets", "1",
+                "-flags", "low_delay", "-flush_packets", "1",
                 "-probesize", "32", "-analyzeduration", "0", "-threads", "1",
                 "-f", fmt, "-i", "pipe:0",
                 "-f", "image2pipe", "-vcodec", "pam", "-pix_fmt", "rgba", "pipe:1",

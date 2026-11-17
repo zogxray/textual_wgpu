@@ -806,12 +806,12 @@ class ModeApp(App):
                         out.append(("android_dir", fpath, f"▸ {name}/"))
                     else:
                         ext = Path(name).suffix.lower()
-                        if fpath == "__picker__" or not suf or ext in suf:
+                        if not suf or ext in suf:
                             sz = int(it.size)
                             kb = f" ({max(1, sz // 1024)} KB)" if sz > 0 else ""
                             out.append(("android_file", fpath, f"  {name}{kb}"))
         except Exception:  # noqa: BLE001
-            out.append(("android_file", "__picker__", "  [System File Picker…]"))
+            out.append(("info", "", "  (No readable files in folder)"))
         self._open_file["entries"] = out
         self._open_file["index"] = 0
         self._open_file["scroll"] = 0
