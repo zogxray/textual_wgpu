@@ -1492,4 +1492,68 @@ mod tests {
             assert!(atlas.drain_uploads().is_empty());
         }
     }
+
+    #[test]
+    fn gpu_compositor_renders_on_headless_adapter_if_present() {
+        let instance = wgpu::Instance::default();
+        let Some(adapter) = pollster_block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
+            return;
+        };
+        let Ok((device, queue)) = pollster_block_on(adapter.request_device(&Default::default(), None)) else {
+            return;
+        };
+        let mut comp = GpuCompositor::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let mut st = SceneState::default();
+        st.styles.insert(
+            1,
+            StyleDef { style_id: 1, fg: 0xFFFFFFFF, bg: 0, flags: 0, font_id: 0, size: 14 },
+        );
+        st.layers.insert(
+            "root".into(),
+            (
+                [0, 0, 320, 180],
+                vec![
+                    DrawOp::Rect {
+                        flags: RECT_FLAG_FILL | RECT_FLAG_OUTLINE,
+                        x0: 8, y0: 8, x1: 310, y1: 170,
+                        fill: 0x203040FF, outline: 0xD4AD72FF, width: 2,
+                    },
+                    DrawOp::Text { x: 16, y: 16, style_id: 1, text: "Pure GPU!".into() },
+                    DrawOp::ClearRect { x0: 20, y0: 40, x1: 140, y1: 120 },
+                ],
+            ),
+        );
+        st.order = vec!["root".into()];
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test-target"),
+            size: wgpu::Extent3d { width: 320, height: 180, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
+        comp.render_state(&device, &queue, &view, &st, (320, 180));
+        device.poll(wgpu::Maintain::Wait);
+    }
+
+    fn pollster_block_on<F: std::future::Future>(fut: F) -> F::Output {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn noop(_: *const ()) {}
+        fn clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTABLE)
+        }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        let mut pinned = Box::pin(fut);
+        loop {
+            match pinned.as_mut().poll(&mut cx) {
+                Poll::Ready(val) => return val,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
 }

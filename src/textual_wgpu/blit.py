@@ -479,8 +479,8 @@ class GpuDrawOpRenderer:
                     {
                         "format": "rgba8unorm",
                         "blend": {
-                            "color": {"operation": "add", "src_factor": "src_alpha", "dst_factor": "one_minus_src_alpha"},
-                            "alpha": {"operation": "add", "src_factor": "one", "dst_factor": "one_minus_src_alpha"},
+                            "color": {"operation": "add", "src_factor": "src-alpha", "dst_factor": "one-minus-src-alpha"},
+                            "alpha": {"operation": "add", "src_factor": "one", "dst_factor": "one-minus-src-alpha"},
                         },
                     }
                 ],

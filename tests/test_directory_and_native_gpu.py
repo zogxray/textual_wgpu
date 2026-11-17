@@ -220,13 +220,11 @@ def test_tw_native_gpu_compiler_and_optional_offscreen_render():
     mesh = nat.render_mesh_rgba(64, 48, 0.5, 0.3, 1.0, (20, 20, 24, 255), (108, 178, 235))
     assert len(mesh) == 64 * 48 * 4
 
-    # Try real headless wgpu GPU render if an adapter is present
-    try:
-        import wgpu
+    # Verify real headless wgpu GPU render when an adapter is available
+    import wgpu
 
-        adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
-        if adapter is None:
-            return
+    adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
+    if adapter is not None:
         device = adapter.request_device_sync()
         tex = device.create_texture(
             size=(800, 500, 1),
@@ -235,9 +233,8 @@ def test_tw_native_gpu_compiler_and_optional_offscreen_render():
         )
         renderer = GpuDrawOpRenderer(device, "rgba8unorm", native_mod=nat)
         renderer.render_frame(tex.create_view(), 800, 500, app.theme.rgba("background"), rec)
-        raw = device.queue.read_texture({"texture": tex}, {"bytes_per_row": 800 * 4, "rows_per_image": 500}, (800, 500, 1))
+        raw = device.queue.read_texture(
+            {"texture": tex}, {"bytes_per_row": 800 * 4, "rows_per_image": 500}, (800, 500, 1),
+        )
         assert len(raw) == 800 * 500 * 4
-        # Ensure non-uniform pixels were drawn onto the GPU render target
         assert len(set(bytes(raw[: 800 * 40 * 4]))) > 8
-    except Exception:  # noqa: BLE001
-        pass
