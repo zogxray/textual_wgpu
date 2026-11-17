@@ -700,10 +700,16 @@ class ModeApp(App):
         if self._open_file.get("source_mode") == "devices":
             import os
             import socket
+            import sys
 
             host_lbl = socket.gethostname() or "This Device"
             entries: list[tuple[str, str, str]] = []
-            if "ANDROID_ROOT" in os.environ:
+            is_android = (
+                "ANDROID_ROOT" in os.environ
+                or hasattr(sys, "getandroidapilevel")
+                or Path("/system/build.prop").exists()
+            )
+            if is_android:
                 entries.append(("android_dir", "", "📱 This Phone (Downloads / Media)/"))
             else:
                 dl = Path.home() / "Downloads"
@@ -790,28 +796,33 @@ class ModeApp(App):
     def _open_file_load_android_dir(self, req_path: str) -> None:
         if self._open_file is None:
             return
+        import json
+
         self._open_file["source_mode"] = "android"
         self._open_file["path_value"] = f"phone://{req_path or 'Media'}"
         out: list[tuple[str, str, str]] = [("android_up", "", "↑ ..  (Back)")]
         suf: set[str] = self._open_file["suffixes"]
         try:
-            from com.textualwgpu.app import LocalMediaHelper, LocalPythonHost  # type: ignore[import-not-found]
+            from com.textualwgpu.app import LocalMediaHelper  # type: ignore[import-not-found]
 
-            ctx = LocalPythonHost.appContext
-            if ctx is not None:
-                for it in LocalMediaHelper.listMediaFolder(ctx, req_path):
-                    name = str(it.name)
-                    fpath = str(it.path)
-                    if it.isDir:
-                        out.append(("android_dir", fpath, f"▸ {name}/"))
-                    else:
-                        ext = Path(name).suffix.lower()
-                        if not suf or ext in suf:
-                            sz = int(it.size)
-                            kb = f" ({max(1, sz // 1024)} KB)" if sz > 0 else ""
-                            out.append(("android_file", fpath, f"  {name}{kb}"))
-        except Exception:  # noqa: BLE001
-            out.append(("info", "", "  (No readable files in folder)"))
+            items = json.loads(str(LocalMediaHelper.listMediaJson(req_path) or "[]"))
+            for it in items:
+                name = str(it.get("n") or "")
+                fpath = str(it.get("p") or "")
+                if not name:
+                    continue
+                if bool(it.get("d")):
+                    out.append(("android_dir", fpath, f"▸ {name}/"))
+                else:
+                    ext = Path(name).suffix.lower()
+                    if not suf or ext in suf:
+                        sz = int(it.get("s") or 0)
+                        kb = f" ({max(1, sz // 1024)} KB)" if sz > 0 else ""
+                        out.append(("android_file", fpath, f"  {name}{kb}"))
+        except Exception as exc:  # noqa: BLE001
+            out.append(("info", "", f"  (Error: {exc})"))
+        if len(out) == 1:
+            out.append(("info", "", "  (Empty folder)"))
         self._open_file["entries"] = out
         self._open_file["index"] = 0
         self._open_file["scroll"] = 0
@@ -977,20 +988,16 @@ class ModeApp(App):
             peer_cb = self._open_file.get("peer_file_callback")
             self._open_file = None
             self._end_modal()
-            if path_s == "__picker__":
-                if hasattr(self, "request_client_file") and callable(peer_cb):
-                    self.request_client_file(peer_cb, accept="*/*")
-                return
             try:
-                from com.textualwgpu.app import LocalMediaHelper, LocalPythonHost  # type: ignore[import-not-found]
+                from com.textualwgpu.app import LocalMediaHelper  # type: ignore[import-not-found]
+                from .remote.protocol import decode_client_file
 
-                ctx = LocalPythonHost.appContext
-                if ctx is not None and callable(peer_cb):
-                    res = LocalMediaHelper.readMediaFile(ctx, path_s)
-                    if res is not None:
-                        peer_cb(str(res.first), bytes(res.second))
-            except Exception:  # noqa: BLE001
-                pass
+                packed = LocalMediaHelper.readMediaPack(path_s)
+                if packed is not None and callable(peer_cb):
+                    name, raw = decode_client_file(bytes(packed))
+                    peer_cb(name, raw)
+            except Exception as exc:  # noqa: BLE001
+                self.notify(f"Open failed: {exc}")
             return
         if entry_kind in ("dir", "up"):
             folder = Path(path_s)

@@ -1252,11 +1252,8 @@ class MediaScreen(Screen):
         if key == "3":
             self.set_photo("plasma")
             return True
-        if key == "o":
-            self.pick_server_file()
-            return True
-        if key == "u":
-            self.pick_client_file()
+        if key in ("o", "u"):
+            self.open_media_file()
             return True
         if key == "c":
             self.toggle_camera()

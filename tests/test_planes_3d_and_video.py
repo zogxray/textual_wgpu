@@ -221,6 +221,13 @@ async def test_client_file_upload_and_media_screen_file_loading(monkeypatch, tmp
         assert app.mode_key == "media"
 
         # Press O -> unified FilePickerModal opens with Local + Connected Device roots!
+        png_buf = io.BytesIO()
+        PilImage.new("RGBA", (64, 48), (12, 180, 240, 255)).save(png_buf, format="PNG")
+        peer_file_path = tmp_path / "sample_upload.png"
+        peer_file_path.write_bytes(png_buf.getvalue())
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+        (tmp_path / "Downloads").mkdir(exist_ok=True)
+
         await viewer.send_key("o")
         for _ in range(20):
             if getattr(app, "_open_file", None) is not None:
@@ -241,34 +248,20 @@ async def test_client_file_upload_and_media_screen_file_loading(monkeypatch, tmp
             if any(e[0] == "peer_dir" and e[1] != "" for e in (getattr(app, "_open_file", None) or {}).get("entries", [])):
                 break
         assert any(e[0] == "peer_dir" for e in app._open_file["entries"])
-        app._open_file_cancel()
 
-        # Also test direct client file upload flow (U / system picker)
-        await viewer.send_key("u")
+        # Select the peer file via FS_GET -> CLIENT_FILE_DATA -> MediaScreen loads photo!
+        app._open_file["entries"] = [("peer_file", str(peer_file_path), "  sample_upload.png")]
+        app._open_file["index"] = 0
+        app._open_file_activate()
         for _ in range(25):
             f = await asyncio.wait_for(viewer.transport.recv(), timeout=2.0)
             assert f is not None
             viewer.handle_frame(f)
-            if opened_prompts:
-                break
-        assert opened_prompts == ["*/*"]
-
-        buf = io.BytesIO()
-        PilImage.new("RGBA", (64, 48), (12, 180, 240, 255)).save(buf, format="PNG")
-        await viewer.transport.send_now(
-            Frame(
-                op=Op.CLIENT_FILE_DATA,
-                payload=encode_client_file("sample_upload.png", buf.getvalue()),
-                prio=Priority.P3_BULK,
-            ),
-            compress=False,
-        )
-        for _ in range(30):
             if getattr(app.screen, "_custom_photo", None) is not None:
                 break
-            await asyncio.sleep(0.02)
         custom = getattr(app.screen, "_custom_photo", None)
         assert custom is not None and custom.name == "client_sample_upload.png"
+        assert opened_prompts == []  # Never triggered OS system picker (zenity/OpenDocument)
     finally:
         await drv.stop()
         viewer.transport.close()

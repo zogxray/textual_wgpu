@@ -62,6 +62,45 @@ object LocalMediaHelper {
 
     data class FsItem(val isDir: Boolean, val name: String, val path: String, val size: Long)
 
+    @Volatile
+    private var appCtx: Context? = null
+
+    @JvmStatic
+    fun setAppContext(ctx: Context) {
+        appCtx = ctx.applicationContext
+    }
+
+    @JvmStatic
+    fun listMediaJson(reqPath: String): String {
+        val ctx = appCtx ?: LocalPythonHost.appContext ?: return "[]"
+        val items = listMediaFolder(ctx, reqPath)
+        val arr = org.json.JSONArray()
+        for (it in items) {
+            arr.put(
+                org.json.JSONObject().apply {
+                    put("d", it.isDir)
+                    put("n", it.name)
+                    put("p", it.path)
+                    put("s", it.size)
+                },
+            )
+        }
+        return arr.toString()
+    }
+
+    @JvmStatic
+    fun readMediaPack(pathOrUri: String): ByteArray? {
+        val ctx = appCtx ?: LocalPythonHost.appContext ?: return null
+        val res = readMediaFile(ctx, pathOrUri) ?: return null
+        val nb = res.first.toByteArray(Charsets.UTF_8)
+        val nlen = nb.size.coerceAtMost(4095)
+        val out = ByteBuffer.allocate(2 + nlen + res.second.size).order(ByteOrder.LITTLE_ENDIAN)
+        out.putShort(nlen.toShort())
+        out.put(nb, 0, nlen)
+        out.put(res.second)
+        return out.array()
+    }
+
     @JvmStatic
     fun listMediaFolder(ctx: Context, reqPath: String): List<FsItem> {
         if (reqPath.isBlank()) {
