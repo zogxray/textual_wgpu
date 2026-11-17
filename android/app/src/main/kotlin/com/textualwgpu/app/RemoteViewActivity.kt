@@ -228,7 +228,7 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
                 intent.getStringExtra("user") ?: "",
                 intent.getStringExtra("pass") ?: "",
                 intent.getStringExtra("key") ?: "",
-                intent.getStringExtra("cmd") ?: "TEXTUAL_WGPU_REMOTE=stdio python3 -m textual_wgpu",
+                intent.getStringExtra("cmd") ?: "",
                 vw,
                 vh,
                 reversePort,

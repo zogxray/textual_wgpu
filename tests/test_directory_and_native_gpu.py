@@ -21,6 +21,7 @@ from textual_wgpu.remote import (
     RemoteViewer,
     discover_local_apps,
 )
+from textual_wgpu.remote.directory import LanPresenceBeacon, record_python_executable
 from textual_wgpu.remote.protocol import (
     decode_app_list,
     decode_launch_app,
@@ -238,3 +239,18 @@ def test_tw_native_gpu_compiler_and_optional_offscreen_render():
         )
         assert len(raw) == 800 * 500 * 4
         assert len(set(bytes(raw[: 800 * 40 * 4]))) > 8
+
+
+def test_python_bin_record_and_lan_presence_beacon(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    p = record_python_executable("/usr/bin/python3-test")
+    assert p is not None and p.is_file()
+    assert p.read_text(encoding="utf-8").strip() == "/usr/bin/python3-test"
+
+    beacon = LanPresenceBeacon(app_title="test-app", tcp_port=7420, ssh_port=22, node_name="node-a", interval_s=0.2)
+    payload = json.loads(beacon.payload_bytes().decode("utf-8"))
+    assert payload["name"] == "node-a"
+    assert payload["tcp_port"] == 7420
+    assert payload["ssh_port"] == 22
+    assert payload["app"] == "test-app"
+    assert payload["running"] is True

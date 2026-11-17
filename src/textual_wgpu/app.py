@@ -2544,6 +2544,13 @@ class App:
         """Windowed entry via ``WgpuDriver`` (or ``RemoteServerDriver`` if ``TEXTUAL_WGPU_REMOTE`` is set)."""
         import os
 
+        try:
+            from .remote.directory import record_python_executable
+
+            record_python_executable()
+        except Exception:  # noqa: BLE001
+            pass
+
         remote_spec = os.environ.get("TEXTUAL_WGPU_REMOTE", "").strip()
         if remote_spec:
             from .remote.cli import run_app_remote

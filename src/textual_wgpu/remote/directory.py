@@ -5,12 +5,18 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import json
+import socket
+import struct
+import sys
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 NODE_ROLES = ("workstation", "phone", "cloud")
+LAN_MCAST_GROUP = "239.255.74.20"
+LAN_DISCOVERY_PORT = 7421
 
 
 @dataclass(slots=True)
@@ -301,3 +307,133 @@ def instantiate_python_app(target: str, args: str = "") -> Any:
         except TypeError:
             return fn()
     return fn()
+
+
+def record_python_executable(exe_path: str | None = None) -> Path | None:
+    """Persist ``sys.executable`` so SSH auto-start finds this Python venv instantly."""
+    exe = exe_path or sys.executable
+    if not exe:
+        return None
+    cache_dir = Path.home() / ".cache" / "textual-wgpu"
+    target = cache_dir / "python_bin"
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        if not target.is_file() or target.read_text(encoding="utf-8").strip() != exe:
+            target.write_text(f"{exe}\n", encoding="utf-8")
+        return target
+    except OSError:
+        return None
+
+
+class LanPresenceBeacon:
+    """Broadcasts a read-only LAN presence beacon (no open UI port required when using SSH)."""
+
+    def __init__(
+        self,
+        *,
+        app_title: str = "textual-wgpu",
+        tcp_port: int = 7420,
+        ssh_port: int = 22,
+        node_name: str | None = None,
+        interval_s: float = 1.2,
+        mcast_group: str = LAN_MCAST_GROUP,
+        disc_port: int = LAN_DISCOVERY_PORT,
+    ) -> None:
+        self.app_title = app_title
+        self.tcp_port = int(tcp_port)
+        self.ssh_port = int(ssh_port)
+        self.node_name = node_name or socket.gethostname() or "node"
+        self.interval_s = max(0.2, float(interval_s))
+        self.mcast_group = mcast_group
+        self.disc_port = int(disc_port)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def payload_bytes(self) -> bytes:
+        return json.dumps(
+            {
+                "v": 1,
+                "name": self.node_name,
+                "ssh_port": self.ssh_port,
+                "tcp_port": self.tcp_port,
+                "app": self.app_title,
+                "running": True,
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        except OSError:
+            pass
+        while not self._stop.is_set():
+            data = self.payload_bytes()
+            for dst in ((self.mcast_group, self.disc_port), ("255.255.255.255", self.disc_port)):
+                try:
+                    sock.sendto(data, dst)
+                except OSError:
+                    pass
+            self._stop.wait(self.interval_s)
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+
+def discover_lan_nodes(
+    *,
+    timeout: float = 0.8,
+    mcast_group: str = LAN_MCAST_GROUP,
+    disc_port: int = LAN_DISCOVERY_PORT,
+) -> list[dict[str, Any]]:
+    """Listen briefly for ``LanPresenceBeacon`` packets on the local network."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("", int(disc_port)))
+        try:
+            mreq = struct.pack("4s4s", socket.inet_aton(mcast_group), socket.inet_aton("0.0.0.0"))
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        except OSError:
+            pass
+        found: dict[tuple[str, int], dict[str, Any]] = {}
+        deadline = time.monotonic() + max(0.05, float(timeout))
+        while time.monotonic() < deadline:
+            sock.settimeout(max(0.02, deadline - time.monotonic()))
+            try:
+                raw, (src_ip, _src_port) = sock.recvfrom(2048)
+            except (socket.timeout, OSError):
+                break
+            try:
+                info = json.loads(raw.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(info, dict):
+                continue
+            tcp_port = int(info.get("tcp_port") or 7420)
+            info["host"] = src_ip
+            found[(src_ip, tcp_port)] = info
+        return list(found.values())
+    except OSError:
+        return []
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass

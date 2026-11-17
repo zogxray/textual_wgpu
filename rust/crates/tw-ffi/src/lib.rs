@@ -256,6 +256,7 @@ mod android_jni {
             key_passphrase: None,
             remote_cmd: jstr(&mut env, &remote_cmd),
             reverse_forward_port: if reverse_port > 0 { Some(reverse_port as u16) } else { None },
+            direct_tcpip_port: Some(7420),
         };
 
         let cbs = build_callbacks(Arc::clone(&vm), Arc::clone(&cb_ref));

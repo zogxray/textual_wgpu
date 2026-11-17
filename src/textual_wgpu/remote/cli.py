@@ -52,10 +52,16 @@ async def run_stdio_server(app: Any, *, size: tuple[int, int] = (1100, 720)) -> 
 
 def run_app_remote(app: Any, spec: str) -> None:
     """Entry point used by ``App.run()`` when ``TEXTUAL_WGPU_REMOTE`` is set."""
+    from .directory import record_python_executable
+
+    record_python_executable()
     s = (spec or "").strip()
     size = getattr(app, "SIZE", (1100, 720))
     if s in ("stdio", "1", "true"):
         asyncio.run(run_stdio_server(app, size=size))
+        return
+    if s == "lan":
+        asyncio.run(serve_tcp_session(app, host="127.0.0.1", port=7420, size=size, advertise=True))
         return
     if s.startswith("unix:"):
         sock = Path(s[5:]).expanduser()
@@ -68,7 +74,7 @@ def run_app_remote(app: Any, spec: str) -> None:
         port = int(port_s) if port_s.isdigit() else 7420
         asyncio.run(serve_tcp_session(app, host=host, port=port, size=size))
         return
-    raise ValueError(f"Unsupported TEXTUAL_WGPU_REMOTE={spec!r} (expected 'stdio', 'unix:<path>', or 'tcp:<host>:<port>')")
+    raise ValueError(f"Unsupported TEXTUAL_WGPU_REMOTE={spec!r} (expected 'stdio', 'lan', 'unix:<path>', or 'tcp:<host>:<port>')")
 
 
 async def _serve_stream_session(
@@ -139,8 +145,12 @@ async def serve_tcp_session(
     port: int = 7420,
     *,
     size: tuple[int, int] = (1100, 720),
+    advertise: bool | None = None,
 ) -> None:
     """Keep ``app`` alive across client reconnects on a TCP port (default ``127.0.0.1:7420``)."""
+    from .directory import LanPresenceBeacon, record_python_executable
+
+    record_python_executable()
     drv_holder: list[RemoteServerDriver | None] = [None]
     active_lock = asyncio.Lock()
 
@@ -148,9 +158,19 @@ async def serve_tcp_session(
         await _serve_stream_session(app, drv_holder, active_lock, reader, writer, size=size)
 
     server = await asyncio.start_server(_handle_client, host=host, port=int(port))
+    should_adv = (not os.environ.get("PYTEST_CURRENT_TEST")) if advertise is None else bool(advertise)
+    beacon: LanPresenceBeacon | None = None
+    if should_adv:
+        beacon = LanPresenceBeacon(
+            app_title=str(getattr(app, "TITLE", "textual-wgpu") or "textual-wgpu"),
+            tcp_port=int(port),
+        )
+        beacon.start()
     try:
         await server.serve_forever()
     finally:
+        if beacon is not None:
+            beacon.stop()
         if drv_holder[0] is not None:
             await drv_holder[0].stop()
         server.close()

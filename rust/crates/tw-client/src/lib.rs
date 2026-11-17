@@ -216,6 +216,27 @@ pub struct SshConfig {
     pub key_passphrase: Option<String>,
     pub remote_cmd: String,
     pub reverse_forward_port: Option<u16>,
+    pub direct_tcpip_port: Option<u16>,
+}
+
+pub fn default_ssh_launch_cmd() -> String {
+    concat!(
+        "sh -c '",
+        "if [ -f \"$HOME/.cache/textual-wgpu/python_bin\" ]; then ",
+        "p=$(cat \"$HOME/.cache/textual-wgpu/python_bin\"); ",
+        "[ -x \"$p\" ] && \"$p\" -c \"import textual_wgpu\" 2>/dev/null && ",
+        "exec env TEXTUAL_WGPU_REMOTE=stdio \"$p\" -m textual_wgpu; fi; ",
+        "for p in python3 \"$HOME/.local/bin/python3\" \"$HOME/.venv/bin/python\" \"$HOME/venv/bin/python\" ",
+        "\"$HOME/.local/share/pipx/venvs/textual-wgpu/bin/python\" ",
+        "\"$HOME\"/*/venv/bin/python \"$HOME\"/*/.venv/bin/python ",
+        "\"$HOME\"/*/*/venv/bin/python \"$HOME\"/*/*/.venv/bin/python ",
+        "\"$HOME\"/*/*/*/venv/bin/python \"$HOME\"/*/*/*/.venv/bin/python; do ",
+        "[ -x \"$p\" ] || command -v \"$p\" >/dev/null 2>&1 || continue; ",
+        "\"$p\" -c \"import textual_wgpu\" 2>/dev/null && ",
+        "exec env TEXTUAL_WGPU_REMOTE=stdio \"$p\" -m textual_wgpu; ",
+        "done; echo \"textual_wgpu not found\" >&2; exit 1'"
+    )
+    .to_string()
 }
 
 struct SshClientHandler {
@@ -551,18 +572,57 @@ pub fn spawn_ssh_session_cbs(
                 }
             }
 
-            let mut channel = match session.channel_open_session().await {
-                Ok(c) => c,
-                Err(e) => {
-                    on_status(&format!("Channel error: {e}"));
+            let mut channel = if let Some(dport) = cfg.direct_tcpip_port.filter(|&p| p > 0) {
+                match session
+                    .channel_open_direct_tcpip("127.0.0.1", dport as u32, "127.0.0.1", 0)
+                    .await
+                {
+                    Ok(c) => {
+                        on_status(&format!("Attached to running server (127.0.0.1:{dport})"));
+                        c
+                    }
+                    Err(_) => {
+                        on_status("Starting remote server…");
+                        let c = match session.channel_open_session().await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                on_status(&format!("Channel error: {e}"));
+                                return;
+                            }
+                        };
+                        let cmd = if cfg.remote_cmd.trim().is_empty() {
+                            default_ssh_launch_cmd()
+                        } else {
+                            cfg.remote_cmd.clone()
+                        };
+                        if let Err(e) = c.exec(true, cmd.as_bytes()).await {
+                            on_status(&format!("Exec failed: {e}"));
+                            return;
+                        }
+                        on_status("Connected");
+                        c
+                    }
+                }
+            } else {
+                let c = match session.channel_open_session().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        on_status(&format!("Channel error: {e}"));
+                        return;
+                    }
+                };
+                let cmd = if cfg.remote_cmd.trim().is_empty() {
+                    default_ssh_launch_cmd()
+                } else {
+                    cfg.remote_cmd.clone()
+                };
+                if let Err(e) = c.exec(true, cmd.as_bytes()).await {
+                    on_status(&format!("Exec failed: {e}"));
                     return;
                 }
+                on_status("Connected");
+                c
             };
-            if let Err(e) = channel.exec(true, cfg.remote_cmd.as_bytes()).await {
-                on_status(&format!("Exec failed: {e}"));
-                return;
-            }
-            on_status("Connected");
 
             let mut mux = PriorityMux::new(4096, 2);
             let mut reasm = FrameReassembler::default();
