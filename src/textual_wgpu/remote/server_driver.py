@@ -146,6 +146,8 @@ class RemoteServerDriver(Driver):
         self._peer_cam_cb: Any = None
         self._peer_mic_cb: Any = None
         self._frame_counter: int = 0
+        self._last_order: list[str] | None = None
+        self._last_bg: Any = None
         self.prefer_hw_video = True
         self.apps_path: Any = None
 
@@ -461,16 +463,19 @@ class RemoteServerDriver(Driver):
         bytes_queued = 0
 
         title = str(getattr(self.app, "TITLE", "textual-wgpu") or "textual-wgpu")
+        ui_changed = False
         if title != self._last_title:
             self._last_title = title
             f = Frame(op=Op.TITLE_SET, payload=title.encode("utf-8"), prio=Priority.P1_UI)
             self.transport.send(f)
             bytes_queued += len(f.payload)
+            ui_changed = True
 
         if snap["styles"]:
             payload = encode_style_defs(snap["styles"])
             self.transport.send(Frame(op=Op.STYLE_DEF, payload=payload, prio=Priority.P1_UI))
             bytes_queued += len(payload)
+            ui_changed = True
 
         for h16, bw, bh, blob in snap["blobs"]:
             payload = encode_put_blob(h16, bw, bh, blob)
@@ -479,22 +484,34 @@ class RemoteServerDriver(Driver):
                 compress=False,
             )
             bytes_queued += len(payload)
+            ui_changed = True
 
         for lid in snap["dropped"]:
             payload = lid.encode("utf-8")
             self.transport.send(Frame(op=Op.LAYER_DROP, payload=payload, prio=Priority.P1_UI))
             bytes_queued += len(payload)
+            ui_changed = True
 
         for lid, rect, ops in snap["dirty"]:
             payload = encode_layer_patch(lid, rect, ops)
             self.transport.send(Frame(op=Op.LAYER_PATCH, payload=payload, prio=Priority.P1_UI))
             bytes_queued += len(payload)
+            ui_changed = True
 
-        bytes_queued += self._emit_planes()
+        plane_bytes = self._emit_planes()
+        bytes_queued += plane_bytes
 
-        commit = encode_frame_commit(snap["order"], pack_rgba(snap["bg"]))
-        self.transport.send(Frame(op=Op.FRAME_COMMIT, payload=commit, prio=Priority.P1_UI))
-        bytes_queued += len(commit)
+        if (
+            ui_changed
+            or snap["order"] != self._last_order
+            or snap["bg"] != self._last_bg
+            or plane_bytes == 0
+        ):
+            self._last_order = list(snap["order"])
+            self._last_bg = snap["bg"]
+            commit = encode_frame_commit(snap["order"], pack_rgba(snap["bg"]))
+            self.transport.send(Frame(op=Op.FRAME_COMMIT, payload=commit, prio=Priority.P1_UI))
+            bytes_queued += len(commit)
 
         await self.transport.flush()
         self._draw_pending = False

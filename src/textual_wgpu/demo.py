@@ -1019,14 +1019,38 @@ class MediaScreen(Screen):
         except Exception:  # noqa: BLE001
             pass
 
+    def _wake_cam_thread(self) -> None:
+        if self.app is None:
+            return
+        loop = getattr(self.app, "_loop", None)
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(self._flush_local_cam)
+
+    def _flush_local_cam(self) -> None:
+        if self._cam_mode != "local" or self._file_streamer is None or not self._video_playing:
+            return
+        try:
+            vid = self.query_one("#media-video", Video)
+        except Exception:  # noqa: BLE001
+            return
+        is_remote = hasattr(getattr(self.app, "_driver", None), "on_audio_play")
+        if is_remote:
+            for au, is_kf in self._file_streamer.pop_aus():
+                vid.push_packet(0, au, keyframe=is_kf, codec_flag=self._file_streamer.codec_flag)
+        else:
+            frame = self._file_streamer.pop_rgba()
+            if frame is not None:
+                fw, fh, rgba = frame
+                vid.push_rgba_frame(fw, fh, rgba)
+
     def _start_camera_source(self, src: str) -> None:
         self._stop_camera()
         if self._file_streamer is not None:
             self._file_streamer.close()
             self._file_streamer = None
         drv = getattr(self.app, "_driver", None) if self.app is not None else None
-        if src in ("peer_front", "peer_back") and hasattr(drv, "on_request_peer_camera"):
-            facing = 2 if src == "peer_back" else 1
+        if src.startswith("peer") and hasattr(drv, "on_request_peer_camera"):
+            facing = 2 if (src in ("peer_back", "peer:2")) else 1
             vid = self.query_one("#media-video", Video)
 
             def _on_peer_nalu(pts_us: int, flags: int, raw: bytes) -> None:
@@ -1045,33 +1069,66 @@ class MediaScreen(Screen):
         try:
             from .remote.media_codec import LocalCameraStreamer
 
-            self._file_streamer = LocalCameraStreamer(facing=1)
+            facing = 2 if src == "local:back" else 1
+            device = src.split(":", 1)[1] if src.startswith("local:/") else None
+            self._file_streamer = LocalCameraStreamer(
+                facing=facing,
+                device=device,
+                on_frame=self._wake_cam_thread,
+            )
             self._cam_mode = "local"
             self._video_playing = True
             self.query_one("#btn-cam", Button).label = "Stop Cam (C)"
             self.query_one("#btn-video", Button).label = "Pause Video (V)"
-            self.query_one("#status", StatusBar).update("F7 Media · streaming local camera")
+            label = device or ("Back Camera" if facing == 2 else "Front Camera")
+            self.query_one("#status", StatusBar).update(f"F7 Media · streaming local camera ({label})")
         except Exception as exc:  # noqa: BLE001
             self.query_one("#status", StatusBar).update(f"F7 Media · camera error: {exc}")
 
     def toggle_camera(self) -> None:
+        import os
+        import socket
+        import sys
+
         if self._cam_mode is not None:
             self._stop_camera()
             self.query_one("#status", StatusBar).update("F7 Media · camera stopped")
             return
+        is_android = (
+            "ANDROID_ROOT" in os.environ
+            or hasattr(sys, "getandroidapilevel")
+            or Path("/system/build.prop").exists()
+        )
         drv = getattr(self.app, "_driver", None) if self.app is not None else None
-        if hasattr(drv, "on_request_peer_camera") and hasattr(self.app, "ask_pick"):
+        has_peer = hasattr(drv, "on_request_peer_camera")
+        options: list[tuple[str, str]] = []
+        if is_android:
+            options.append(("local:front", "📱 This Phone · Front Camera"))
+            options.append(("local:back", "📱 This Phone · Back Camera"))
+            if has_peer:
+                options.append(("peer:1", "💻 Connected Device · Camera"))
+        else:
+            from .remote.media_codec import list_linux_cameras
+
+            host = socket.gethostname() or "Workstation"
+            cams = list_linux_cameras()
+            if cams:
+                for dev_path, cname in cams:
+                    options.append((f"local:{dev_path}", f"💻 {host} · {cname} ({dev_path})"))
+            else:
+                options.append(("local:front", f"💻 {host} · Default Camera"))
+            if has_peer:
+                options.append(("peer:1", "📱 Connected Device · Front Camera"))
+                options.append(("peer:2", "📱 Connected Device · Back Camera"))
+
+        if len(options) > 1 and hasattr(self.app, "ask_pick"):
             self.app.ask_pick(
                 "Select Camera Source",
-                [
-                    ("local", "💻 Local Device Camera"),
-                    ("peer_front", "📱 Connected Device Camera (Front)"),
-                    ("peer_back", "📱 Connected Device Camera (Back)"),
-                ],
+                options,
                 lambda val: self._start_camera_source(val) if val else None,
             )
         else:
-            self._start_camera_source("local")
+            self._start_camera_source(options[0][0])
 
     def _stop_mic(self) -> None:
         if self._mic_mode == "peer":
@@ -1146,17 +1203,28 @@ class MediaScreen(Screen):
             self.query_one("#status", StatusBar).update(f"F7 Media · mic error: {exc}")
 
     def toggle_mic(self) -> None:
+        import os
+        import socket
+        import sys
+
         if self._mic_mode is not None:
             self._stop_mic()
             self.query_one("#status", StatusBar).update("F7 Media · mic stopped (press A to play recording)")
             return
         drv = getattr(self.app, "_driver", None) if self.app is not None else None
+        is_android = (
+            "ANDROID_ROOT" in os.environ
+            or hasattr(sys, "getandroidapilevel")
+            or Path("/system/build.prop").exists()
+        )
+        local_lbl = "📱 This Phone · Microphone" if is_android else f"💻 {socket.gethostname() or 'Workstation'} · Microphone"
+        peer_lbl = "💻 Connected Device · Microphone" if is_android else "📱 Connected Device · Microphone"
         if hasattr(drv, "on_request_peer_mic") and hasattr(self.app, "ask_pick"):
             self.app.ask_pick(
                 "Select Microphone Source",
                 [
-                    ("local", "💻 Local Device Microphone"),
-                    ("peer", "📱 Connected Device Microphone"),
+                    ("local", local_lbl),
+                    ("peer", peer_lbl),
                 ],
                 lambda val: self._start_mic_source(val) if val else None,
             )

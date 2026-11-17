@@ -712,14 +712,52 @@ def pcm_rms_level(pcm: bytes) -> float:
     return min(1.0, math.sqrt(acc / max(1, cnt)) * 3.0)
 
 
-class LocalCameraStreamer:
-    """Captures local camera (/dev/video0 on Linux, Camera2+MediaCodec on Android) to NALUs/RGBA."""
+def list_linux_cameras() -> list[tuple[str, str]]:
+    """Return ``[('/dev/video0', 'Camera Name'), ...]`` for V4L2 capture nodes."""
+    v4l_dir = Path("/sys/class/video4linux")
+    out: list[tuple[str, str]] = []
+    if v4l_dir.is_dir():
+        for node in sorted(v4l_dir.iterdir(), key=lambda p: p.name):
+            if not node.name.startswith("video"):
+                continue
+            dev_path = Path("/dev") / node.name
+            if not dev_path.exists():
+                continue
+            idx_file = node / "index"
+            try:
+                idx = idx_file.read_text(encoding="utf-8").strip() if idx_file.is_file() else "0"
+            except OSError:
+                idx = "0"
+            if idx != "0":
+                continue
+            try:
+                name = (node / "name").read_text(encoding="utf-8").strip() or node.name
+            except OSError:
+                name = node.name
+            out.append((str(dev_path), name))
+    if not out and Path("/dev/video0").exists():
+        out.append(("/dev/video0", "Camera"))
+    return out
 
-    def __init__(self, *, width: int = 640, height: int = 360, fps: int = 24, facing: int = 1) -> None:
+
+class LocalCameraStreamer:
+    """Captures local camera (/dev/video* on Linux, Camera2+MediaCodec on Android) to NALUs/RGBA."""
+
+    def __init__(
+        self,
+        *,
+        width: int = 640,
+        height: int = 360,
+        fps: int = 24,
+        facing: int = 1,
+        device: str | None = None,
+        on_frame: Any = None,
+    ) -> None:
         self.width = int(width)
         self.height = int(height)
         self.fps = int(fps)
         self.facing = int(facing)
+        self._on_frame = on_frame
         self._aus: deque[tuple[bytes, bool]] = deque(maxlen=64)
         self._rgba_frames: deque[tuple[int, int, bytes]] = deque(maxlen=8)
         self._lock = threading.Lock()
@@ -743,9 +781,10 @@ class LocalCameraStreamer:
             threading.Thread(target=self._read_android_loop, args=(helper,), daemon=True).start()
             return
 
-        dev = "/dev/video0"
+        dev = device or (list_linux_cameras()[0][0] if list_linux_cameras() else "/dev/video0")
+        self.device = dev
         if not Path(dev).exists():
-            raise RuntimeError("No /dev/video0 camera device found")
+            raise RuntimeError(f"No {dev} camera device found")
         found = probe_video_encoder(("h264", "hevc"))
         if found is None:
             raise RuntimeError("No working H.264/HEVC encoder for camera")
@@ -775,24 +814,20 @@ class LocalCameraStreamer:
         threading.Thread(target=self._read_pam_loop, args=(p_pam,), daemon=True).start()
 
     def _read_android_loop(self, helper: Any) -> None:
-        import time
-
         try:
             while not self._closed:
-                got = False
-                while not self._closed:
-                    pkt = helper.popCameraFrame()
-                    if pkt is None:
-                        break
-                    raw = bytes(pkt)
-                    if len(raw) > 1:
-                        is_kf = bool(raw[0])
-                        au = raw[1:]
-                        with self._lock:
-                            self._aus.append((au, is_kf))
-                        got = True
-                if not got:
-                    time.sleep(0.012)
+                pkt = helper.takeCameraFrame()
+                if pkt is None:
+                    break
+                raw = bytes(pkt)
+                if len(raw) <= 1:
+                    continue
+                is_kf = bool(raw[0])
+                au = raw[1:]
+                with self._lock:
+                    self._aus.append((au, is_kf))
+                if callable(self._on_frame):
+                    self._on_frame()
         except Exception:  # noqa: BLE001
             pass
 
@@ -810,6 +845,8 @@ class LocalCameraStreamer:
                 if aus:
                     with self._lock:
                         self._aus.extend(aus)
+                    if callable(self._on_frame):
+                        self._on_frame()
         except Exception:  # noqa: BLE001
             pass
 

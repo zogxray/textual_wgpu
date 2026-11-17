@@ -480,8 +480,17 @@ object LocalMediaHelper {
                 return
             }
 
+            val chars = mgr.getCameraCharacteristics(camId)
+            val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val sizes = map?.getOutputSizes(MediaCodec::class.java)
+            val chosen = sizes
+                ?.filter { it.width in 320..800 && it.height in 240..600 && (it.width % 16 == 0) && (it.height % 16 == 0) }
+                ?.minByOrNull { kotlin.math.abs(it.width - 640) + kotlin.math.abs(it.height - 360) }
+            val encW = chosen?.width ?: 640
+            val encH = chosen?.height ?: 480
+
             val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 640, 360).apply {
+            val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, encW, encH).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, 700_000)
                 setInteger(MediaFormat.KEY_FRAME_RATE, 24)
@@ -576,7 +585,7 @@ object LocalMediaHelper {
                                         camSession = session
                                         try {
                                             session.setRepeatingRequest(req.build(), null, handler)
-                                            TwLog.log("TwCam", "Camera2 started id=$camId (640x360 H.264 fps=$bestRange)")
+                                            TwLog.log("TwCam", "Camera2 started id=$camId (${encW}x${encH} H.264 fps=$bestRange)")
                                         } catch (t: Throwable) {
                                             TwLog.err("TwCam", "setRepeatingRequest failed", t)
                                         }
@@ -614,8 +623,21 @@ object LocalMediaHelper {
     fun popCameraFrame(): ByteArray? = camQueue.poll()
 
     @JvmStatic
+    fun takeCameraFrame(): ByteArray? {
+        if (!camActive) return null
+        return try {
+            val pkt = camQueue.take()
+            if (!camActive || pkt.isEmpty()) null else pkt
+        } catch (_: InterruptedException) {
+            null
+        }
+    }
+
+    @JvmStatic
     fun stopCamera() {
         camActive = false
+        camQueue.clear()
+        camQueue.offer(ByteArray(0))
         camDrainThread?.interrupt()
         camDrainThread = null
         try { camSession?.close() } catch (_: Throwable) {}

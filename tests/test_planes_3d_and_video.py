@@ -405,3 +405,33 @@ async def test_remote_camera_and_mic_control_routing(tmp_path: Path):
     finally:
         await drv.stop()
         viewer.transport.close()
+
+
+def test_camera_source_discovery_adapts_to_host_os(monkeypatch):
+    from textual_wgpu.demo import build_demo_app
+    from textual_wgpu.geometry import Rect
+    from textual_wgpu.remote.media_codec import list_linux_cameras
+
+    cams = list_linux_cameras()
+    assert isinstance(cams, list)
+    for dev, name in cams:
+        assert dev.startswith("/dev/video") and name
+
+    app = build_demo_app(start="media")
+    app._pixel_size = (960, 600)
+    scr = app._ensure_screen()
+    scr.layout(Rect(0, 0, 960, 600))
+
+    # Simulate Android host -> toggle_camera offers Phone Front + Back
+    monkeypatch.setenv("ANDROID_ROOT", "/system")
+
+    class _FakeDrv:
+        def on_request_peer_camera(self, *_a):
+            pass
+
+    app._driver = _FakeDrv()
+    scr.toggle_camera()
+    assert app._pick is not None
+    keys = [o[0] for o in app._pick["options"]]
+    assert "local:front" in keys and "local:back" in keys and "peer:1" in keys
+    app._pick = None

@@ -154,11 +154,21 @@ impl RgbaImage {
 }
 
 #[derive(Debug, Clone)]
+pub struct YuvPlaneData {
+    pub width: u32,
+    pub height: u32,
+    pub y: Vec<u8>,
+    pub u: Vec<u8>,
+    pub v: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
 pub struct PlaneData {
     pub rect: [i16; 4],
     pub kind: u8,
     pub flags: u8,
     pub rgba: Vec<u8>,
+    pub yuv: Option<YuvPlaneData>,
     pub size: (u32, u32),
 }
 
@@ -323,6 +333,7 @@ impl SceneState {
                             kind,
                             flags,
                             rgba: Vec::new(),
+                            yuv: None,
                             size: (0, 0),
                         });
                         e.rect = rect;
@@ -366,6 +377,7 @@ impl SceneState {
                         kind: 0,
                         flags,
                         rgba: Vec::new(),
+                        yuv: None,
                         size: (0, 0),
                     });
                     if (flags & 0x04) != 0 && raw.len() >= 4 {
@@ -374,6 +386,7 @@ impl SceneState {
                         let px = &raw[4..];
                         if fw > 0 && fh > 0 && px.len() == (fw * fh * 4) as usize {
                             e.rgba = px.to_vec();
+                            e.yuv = None;
                             e.size = (fw, fh);
                         }
                     } else if (flags & 0x02) != 0 {
@@ -381,6 +394,7 @@ impl SceneState {
                         let ph = (e.rect[3] - e.rect[1]).max(1) as u32;
                         if raw.len() == (pw * ph * 4) as usize {
                             e.rgba = raw.to_vec();
+                            e.yuv = None;
                             e.size = (pw, ph);
                         }
                     }
@@ -401,9 +415,11 @@ impl SceneState {
             kind: 1,
             flags: 0,
             rgba: Vec::new(),
+            yuv: None,
             size: (0, 0),
         });
         e.rgba = rgba;
+        e.yuv = None;
         e.size = (w, h);
     }
 
@@ -421,37 +437,65 @@ impl SceneState {
         v_stride: usize,
         uv_pix_stride: usize,
     ) {
-        if w == 0 || h == 0 {
+        if w < 2 || h < 2 {
             return;
         }
         let wu = w as usize;
         let hu = h as usize;
-        let mut rgba = vec![255u8; wu * hu * 4];
-        for row in 0..hu {
-            let y_row = row * y_stride;
-            let uv_row = row >> 1;
-            let u_base = uv_row * u_stride;
-            let v_base = uv_row * v_stride;
-            for col in 0..wu {
-                let yi = y_row + col;
-                let uv_col = (col >> 1) * uv_pix_stride;
-                let ui = u_base + uv_col;
-                let vi = v_base + uv_col;
-                let yy = (*y.get(yi).unwrap_or(&16) as i32 - 16).max(0);
-                let uu = *u.get(ui).unwrap_or(&128) as i32 - 128;
-                let vv = *v.get(vi).unwrap_or(&128) as i32 - 128;
-                let c = 298 * yy;
-                let r = ((c + 409 * vv + 128) >> 8).clamp(0, 255) as u8;
-                let g = ((c - 100 * uu - 208 * vv + 128) >> 8).clamp(0, 255) as u8;
-                let b = ((c + 516 * uu + 128) >> 8).clamp(0, 255) as u8;
-                let oi = (row * wu + col) * 4;
-                rgba[oi] = r;
-                rgba[oi + 1] = g;
-                rgba[oi + 2] = b;
-                rgba[oi + 3] = 255;
+        let cw = (wu / 2).max(1);
+        let ch = (hu / 2).max(1);
+
+        let mut y_out = vec![16u8; wu * hu];
+        if y_stride == wu && y.len() >= wu * hu {
+            y_out.copy_from_slice(&y[..wu * hu]);
+        } else {
+            for row in 0..hu {
+                let src_off = row * y_stride;
+                if src_off < y.len() {
+                    let avail = (y.len() - src_off).min(wu);
+                    y_out[row * wu..row * wu + avail].copy_from_slice(&y[src_off..src_off + avail]);
+                }
             }
         }
-        self.push_decoded_plane(surf_id, w, h, rgba);
+
+        let mut u_out = vec![128u8; cw * ch];
+        let mut v_out = vec![128u8; cw * ch];
+        if uv_pix_stride == 1 && u_stride == cw && v_stride == cw && u.len() >= cw * ch && v.len() >= cw * ch {
+            u_out.copy_from_slice(&u[..cw * ch]);
+            v_out.copy_from_slice(&v[..cw * ch]);
+        } else {
+            for row in 0..ch {
+                let ub = row * u_stride;
+                let vb = row * v_stride;
+                let dst = row * cw;
+                for col in 0..cw {
+                    let off = col * uv_pix_stride;
+                    if let Some(&val) = u.get(ub + off) {
+                        u_out[dst + col] = val;
+                    }
+                    if let Some(&val) = v.get(vb + off) {
+                        v_out[dst + col] = val;
+                    }
+                }
+            }
+        }
+
+        let e = self.planes.entry(surf_id).or_insert(PlaneData {
+            rect: [0, 0, w as i16, h as i16],
+            kind: 1,
+            flags: 0,
+            rgba: Vec::new(),
+            yuv: None,
+            size: (0, 0),
+        });
+        e.yuv = Some(YuvPlaneData {
+            width: w,
+            height: h,
+            y: y_out,
+            u: u_out,
+            v: v_out,
+        });
+        e.size = (w, h);
     }
 
     pub fn render_ui(&self, width: u32, height: u32) -> RgbaImage {
@@ -713,6 +757,9 @@ struct CompositorUniforms {
 @group(0) @binding(1) var ui_tex: texture_2d<f32>;
 @group(0) @binding(2) var plane_tex: texture_2d<f32>;
 @group(0) @binding(3) var<uniform> uni: CompositorUniforms;
+@group(0) @binding(4) var y_tex: texture_2d<f32>;
+@group(0) @binding(5) var u_tex: texture_2d<f32>;
+@group(0) @binding(6) var v_tex: texture_2d<f32>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
@@ -746,7 +793,20 @@ fn sample_composite(uv: vec2f) -> vec4f {
     let r = uni.plane_rect;
     if (uv.x >= r.x && uv.x <= r.z && uv.y >= r.y && uv.y <= r.w) {
       let puv = vec2f((uv.x - r.x) / max(1e-5, r.z - r.x), (uv.y - r.y) / max(1e-5, r.w - r.y));
-      let pl = textureSample(plane_tex, samp, puv);
+      var pl: vec4f;
+      if (uni.has_plane > 1.5) {
+        let yv = max(0.0, textureSample(y_tex, samp, puv).r - 0.062745);
+        let uu = textureSample(u_tex, samp, puv).r - 0.5;
+        let vv = textureSample(v_tex, samp, puv).r - 0.5;
+        pl = vec4f(
+          clamp(1.164 * yv + 1.596 * vv, 0.0, 1.0),
+          clamp(1.164 * yv - 0.391 * uu - 0.813 * vv, 0.0, 1.0),
+          clamp(1.164 * yv + 2.018 * uu, 0.0, 1.0),
+          1.0,
+        );
+      } else {
+        pl = textureSample(plane_tex, samp, puv);
+      }
       let rgb = mix(pl.rgb, ui.rgb, ui.a);
       return vec4f(rgb, max(pl.a, ui.a));
     }
@@ -889,6 +949,13 @@ pub struct GpuCompositor {
     plane_tex: wgpu::Texture,
     plane_view: wgpu::TextureView,
     plane_size: (u32, u32),
+    y_tex: wgpu::Texture,
+    y_view: wgpu::TextureView,
+    u_tex: wgpu::Texture,
+    u_view: wgpu::TextureView,
+    v_tex: wgpu::Texture,
+    v_view: wgpu::TextureView,
+    yuv_size: (u32, u32),
     bind_group: wgpu::BindGroup,
     fx: (f32, f32),
     has_plane: f32,
@@ -954,7 +1021,23 @@ impl GpuCompositor {
         let ui_view = ui_tex.create_view(&Default::default());
         let plane_tex = make_tex(device, 1, 1);
         let plane_view = plane_tex.create_view(&Default::default());
-        let bind_group = make_bg(device, &pipeline, &sampler, &ui_view, &plane_view, &uni_buf);
+        let y_tex = make_r8_tex(device, 1, 1);
+        let y_view = y_tex.create_view(&Default::default());
+        let u_tex = make_r8_tex(device, 1, 1);
+        let u_view = u_tex.create_view(&Default::default());
+        let v_tex = make_r8_tex(device, 1, 1);
+        let v_view = v_tex.create_view(&Default::default());
+        let bind_group = make_bg(
+            device,
+            &pipeline,
+            &sampler,
+            &ui_view,
+            &plane_view,
+            &uni_buf,
+            &y_view,
+            &u_view,
+            &v_view,
+        );
 
         // Pure-GPU DrawOp instanced pipelines
         let quad_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1106,6 +1189,13 @@ impl GpuCompositor {
             plane_tex,
             plane_view,
             plane_size: (1, 1),
+            y_tex,
+            y_view,
+            u_tex,
+            u_view,
+            v_tex,
+            v_view,
+            yuv_size: (1, 1),
             bind_group,
             fx: (0.0, 0.0),
             has_plane: 0.0,
@@ -1150,7 +1240,17 @@ impl GpuCompositor {
             self.ui_tex = make_ui_tex(device, w, h);
             self.ui_view = self.ui_tex.create_view(&Default::default());
             self.ui_size = (w, h);
-            self.bind_group = make_bg(device, &self.pipeline, &self.sampler, &self.ui_view, &self.plane_view, &self.uni_buf);
+            self.bind_group = make_bg(
+                device,
+                &self.pipeline,
+                &self.sampler,
+                &self.ui_view,
+                &self.plane_view,
+                &self.uni_buf,
+                &self.y_view,
+                &self.u_view,
+                &self.v_view,
+            );
         }
 
         // Upload any newly seen @image blobs to GPU textures once (cached by hash16).
@@ -1222,13 +1322,71 @@ impl GpuCompositor {
 
         let mut uploaded_plane = false;
         for pl in state.planes.values() {
-            if !pl.rgba.is_empty() && pl.size.0 > 0 && pl.size.1 > 0 {
+            if let Some(yuv) = &pl.yuv {
+                let (pw, ph) = (yuv.width, yuv.height);
+                if pw >= 2 && ph >= 2 {
+                    let cw = (pw / 2).max(1);
+                    let ch = (ph / 2).max(1);
+                    if self.yuv_size != (pw, ph) {
+                        self.y_tex = make_r8_tex(device, pw, ph);
+                        self.y_view = self.y_tex.create_view(&Default::default());
+                        self.u_tex = make_r8_tex(device, cw, ch);
+                        self.u_view = self.u_tex.create_view(&Default::default());
+                        self.v_tex = make_r8_tex(device, cw, ch);
+                        self.v_view = self.v_tex.create_view(&Default::default());
+                        self.yuv_size = (pw, ph);
+                        self.bind_group = make_bg(
+                            device,
+                            &self.pipeline,
+                            &self.sampler,
+                            &self.ui_view,
+                            &self.plane_view,
+                            &self.uni_buf,
+                            &self.y_view,
+                            &self.u_view,
+                            &self.v_view,
+                        );
+                    }
+                    queue.write_texture(
+                        self.y_tex.as_image_copy(),
+                        &yuv.y,
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(pw), rows_per_image: Some(ph) },
+                        wgpu::Extent3d { width: pw, height: ph, depth_or_array_layers: 1 },
+                    );
+                    queue.write_texture(
+                        self.u_tex.as_image_copy(),
+                        &yuv.u,
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(cw), rows_per_image: Some(ch) },
+                        wgpu::Extent3d { width: cw, height: ch, depth_or_array_layers: 1 },
+                    );
+                    queue.write_texture(
+                        self.v_tex.as_image_copy(),
+                        &yuv.v,
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(cw), rows_per_image: Some(ch) },
+                        wgpu::Extent3d { width: cw, height: ch, depth_or_array_layers: 1 },
+                    );
+                    self.has_plane = 2.0;
+                    self.plane_rect_px = pl.rect;
+                    uploaded_plane = true;
+                    break;
+                }
+            } else if !pl.rgba.is_empty() && pl.size.0 > 0 && pl.size.1 > 0 {
                 let (pw, ph) = pl.size;
                 if self.plane_size != (pw, ph) {
                     self.plane_tex = make_tex(device, pw, ph);
                     self.plane_view = self.plane_tex.create_view(&Default::default());
                     self.plane_size = (pw, ph);
-                    self.bind_group = make_bg(device, &self.pipeline, &self.sampler, &self.ui_view, &self.plane_view, &self.uni_buf);
+                    self.bind_group = make_bg(
+                        device,
+                        &self.pipeline,
+                        &self.sampler,
+                        &self.ui_view,
+                        &self.plane_view,
+                        &self.uni_buf,
+                        &self.y_view,
+                        &self.u_view,
+                        &self.v_view,
+                    );
                 }
                 queue.write_texture(
                     self.plane_tex.as_image_copy(),
@@ -1388,6 +1546,20 @@ fn make_tex(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
     })
 }
 
+fn make_r8_tex(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("tw-r8-tex"),
+        size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn make_bg(
     device: &wgpu::Device,
     pipeline: &wgpu::RenderPipeline,
@@ -1395,6 +1567,9 @@ fn make_bg(
     ui_view: &wgpu::TextureView,
     plane_view: &wgpu::TextureView,
     uni_buf: &wgpu::Buffer,
+    y_view: &wgpu::TextureView,
+    u_view: &wgpu::TextureView,
+    v_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("tw-bg"),
@@ -1404,6 +1579,9 @@ fn make_bg(
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(ui_view) },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(plane_view) },
             wgpu::BindGroupEntry { binding: 3, resource: uni_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(y_view) },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(u_view) },
+            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(v_view) },
         ],
     })
 }
@@ -1535,6 +1713,20 @@ mod tests {
             view_formats: &[],
         });
         let view = target.create_view(&Default::default());
+        comp.render_state(&device, &queue, &view, &st, (320, 180));
+        // Also verify GPU-side YUV420 shader plane rendering
+        st.push_decoded_yuv420(
+            1,
+            64,
+            32,
+            &vec![180u8; 64 * 32],
+            &vec![128u8; 32 * 16],
+            &vec![128u8; 32 * 16],
+            64,
+            32,
+            32,
+            1,
+        );
         comp.render_state(&device, &queue, &view, &st, (320, 180));
         device.poll(wgpu::Maintain::Wait);
     }

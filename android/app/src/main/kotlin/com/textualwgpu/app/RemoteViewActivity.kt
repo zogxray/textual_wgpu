@@ -606,19 +606,13 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
         val t0 = System.nanoTime()
         Thread({
             while (camPumpActive && sessionPtr != 0L) {
-                val pkt = LocalMediaHelper.popCameraFrame()
-                if (pkt != null && pkt.size > 1 && sessionPtr != 0L) {
+                val pkt = LocalMediaHelper.takeCameraFrame() ?: break
+                if (pkt.size > 1 && sessionPtr != 0L) {
                     val isKf = pkt[0].toInt() != 0
                     val au = pkt.copyOfRange(1, pkt.size)
                     val flags = TwBridge.VID_CODEC_H264 or (if (isKf) 0x01 else 0x00)
                     val ptsUs = (System.nanoTime() - t0) / 1000L
                     TwBridge.nativeSendVideoNalu(sessionPtr, ptsUs, flags, au)
-                } else {
-                    try {
-                        Thread.sleep(12)
-                    } catch (_: InterruptedException) {
-                        break
-                    }
                 }
             }
         }, "tw-cam-tx").apply {

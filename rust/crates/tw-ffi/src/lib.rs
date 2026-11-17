@@ -439,6 +439,7 @@ mod android_jni {
                 kind: tw_proto::PLANE_KIND_3D_CLIENT,
                 flags: 0,
                 rgba: render_mesh_rgba(pw, ph, 0.6, 0.35, 1.0, [18, 22, 30, 255], [108, 178, 235]),
+                yuv: None,
                 size: (pw, ph),
             },
         );
