@@ -1077,9 +1077,11 @@ class MediaScreen(Screen):
             cid = src.split(":", 1)[1] if ":" in src else "front"
             facing = 2 if cid == "back" else 1
             device = cid if cid.startswith("/") else None
+            is_remote = hasattr(getattr(self.app, "_driver", None), "on_audio_play")
             self._file_streamer = LocalCameraStreamer(
                 facing=facing,
                 device=device,
+                emit_rgba=not is_remote,
                 on_frame=self._wake_cam_thread,
             )
             self._cam_mode = "local"

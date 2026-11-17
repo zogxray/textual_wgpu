@@ -102,6 +102,9 @@ async def _serve_stream_session(
             await drv.start()
             while drv.app._running and not tx._closed:
                 await asyncio.sleep(0.02)
+            scr = getattr(drv.app, "screen", None)
+            if scr is not None and hasattr(scr, "on_screen_pause"):
+                scr.on_screen_pause()
         else:
             if drv._rx_task is not None and not drv._rx_task.done():
                 drv._rx_task.cancel()
@@ -117,6 +120,9 @@ async def _serve_stream_session(
             drv._rx_task = asyncio.create_task(drv._rx_loop())
             while drv.app._running and not tx._closed:
                 await asyncio.sleep(0.02)
+            scr = getattr(drv.app, "screen", None)
+            if scr is not None and hasattr(scr, "on_screen_pause"):
+                scr.on_screen_pause()
 
 
 async def serve_unix_session(

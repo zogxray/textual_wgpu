@@ -620,14 +620,14 @@ fn main() {
             eprintln!("[tw-cam] starting {cam_dev} (mode={mode})");
             if let Ok(mut child) = Command::new("ffmpeg")
                 .args([
-                    "-y", "-loglevel", "error",
+                    "-y", "-loglevel", "warning",
                     "-f", "v4l2", "-framerate", "24", "-i", cam_dev.as_str(),
                     "-vf", "scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2",
                     "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "ultrafast",
                     "-tune", "zerolatency", "-g", "24", "-bf", "0", "-f", "h264", "pipe:1",
                 ])
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::inherit())
                 .spawn()
             {
                 let Some(mut stdout) = child.stdout.take() else { return };

@@ -751,6 +751,7 @@ class LocalCameraStreamer:
         fps: int = 24,
         facing: int = 1,
         device: str | None = None,
+        emit_rgba: bool = False,
         on_frame: Any = None,
     ) -> None:
         self.width = int(width)
@@ -786,33 +787,56 @@ class LocalCameraStreamer:
         self.device = dev
         if not Path(dev).exists():
             raise RuntimeError(f"No {dev} camera device found")
+        vf = f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease:force_divisible_by=2"
+        if emit_rgba:
+            # Local WgpuDriver mode: single V4L2 reader outputting PAM RGBA
+            self.codec_flag = 0
+            cmd_pam = [
+                ff, "-y", "-loglevel", "error",
+                "-f", "v4l2", "-framerate", str(self.fps), "-i", dev,
+                "-vf", vf,
+                "-f", "image2pipe", "-vcodec", "pam", "-pix_fmt", "rgba", "pipe:1",
+            ]
+            p_pam = subprocess.Popen(cmd_pam, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self._procs.append(p_pam)
+            threading.Thread(target=self._drain_stderr, args=(p_pam,), daemon=True).start()
+            threading.Thread(target=self._read_pam_loop, args=(p_pam,), daemon=True).start()
+            return
+
+        # Remote streaming mode: single V4L2 reader outputting H.264/HEVC Annex-B NALUs
         found = probe_video_encoder(("h264", "hevc"))
         if found is None:
             raise RuntimeError("No working H.264/HEVC encoder for camera")
         enc_name, self.codec_flag = found
         fmt = codec_flag_to_fmt(self.codec_flag)
-        vf = f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease:force_divisible_by=2"
-        cmd_nalu = [ff, "-y", "-loglevel", "error", "-f", "v4l2", "-framerate", str(self.fps), "-i", dev]
+        cmd_nalu = [ff, "-y", "-loglevel", "error"]
         if enc_name.endswith("_vaapi"):
-            cmd_nalu.extend(["-vaapi_device", "/dev/dri/renderD128", "-vf", f"{vf},format=nv12,hwupload"])
+            cmd_nalu.extend(["-vaapi_device", "/dev/dri/renderD128"])
+        cmd_nalu.extend(["-f", "v4l2", "-framerate", str(self.fps), "-i", dev])
+        if enc_name.endswith("_vaapi"):
+            cmd_nalu.extend(["-vf", f"{vf},format=nv12,hwupload"])
         else:
             cmd_nalu.extend(["-vf", vf, "-pix_fmt", "yuv420p"])
         cmd_nalu.extend(["-c:v", enc_name, *_encoder_extra_args(enc_name), "-f", fmt, "pipe:1"])
-        p_nalu = subprocess.Popen(cmd_nalu, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        p_nalu = subprocess.Popen(cmd_nalu, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self._procs.append(p_nalu)
         self._chunker = AnnexBChunker(self.codec_flag)
+        threading.Thread(target=self._drain_stderr, args=(p_nalu,), daemon=True).start()
         threading.Thread(target=self._read_nalu_loop, args=(p_nalu,), daemon=True).start()
 
-        # Also tee lightweight PAM frames for local WgpuDriver display
-        cmd_pam = [
-            ff, "-y", "-loglevel", "error",
-            "-f", "v4l2", "-framerate", str(self.fps), "-i", dev,
-            "-vf", f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease:force_divisible_by=2",
-            "-f", "image2pipe", "-vcodec", "pam", "-pix_fmt", "rgba", "pipe:1",
-        ]
-        p_pam = subprocess.Popen(cmd_pam, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        self._procs.append(p_pam)
-        threading.Thread(target=self._read_pam_loop, args=(p_pam,), daemon=True).start()
+    def _drain_stderr(self, proc: subprocess.Popen) -> None:
+        err = proc.stderr
+        if err is None:
+            return
+        try:
+            for raw_ln in err:
+                txt = raw_ln.decode("utf-8", errors="replace").strip()
+                if txt:
+                    from .server_driver import rlog
+
+                    rlog("CAM", f"ffmpeg: {txt}")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _read_android_loop(self, helper: Any) -> None:
         try:
@@ -887,6 +911,8 @@ class LocalCameraStreamer:
                     del buf[: body_start + need]
                     with self._lock:
                         self._rgba_frames.append((w, h, rgba))
+                    if callable(self._on_frame):
+                        self._on_frame()
         except Exception:  # noqa: BLE001
             pass
 
@@ -917,8 +943,12 @@ class LocalCameraStreamer:
         for p in self._procs:
             try:
                 p.terminate()
+                p.wait(timeout=0.5)
             except Exception:  # noqa: BLE001
-                pass
+                try:
+                    p.kill()
+                except Exception:  # noqa: BLE001
+                    pass
         self._procs.clear()
 
 
