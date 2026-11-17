@@ -366,7 +366,7 @@ impl russh::client::Handler for SshClientHandler {
         _originator_port: u32,
         _session: &mut russh::client::Session,
     ) -> Result<(), Self::Error> {
-        let target_port = if (7424..=7427).contains(&connected_port) {
+        let target_port = if (7424..=7425).contains(&connected_port) {
             Some(7423u16)
         } else {
             self.reverse_local_port
@@ -769,16 +769,16 @@ pub fn spawn_ssh_session_cbs(
                 }
             }
 
-            // Expose local device Resource Service (127.0.0.1:7423) to remote peer at 7424..7427
-            for rport in 7424..=7427u32 {
+            // Expose local device Resource Service (127.0.0.1:7423) to remote peer at 7424..7425
+            for rport in 7424..=7425u32 {
                 if session.tcpip_forward("127.0.0.1", rport).await.is_ok() {
                     break;
                 }
             }
             let session = Arc::new(session);
-            // Expose remote peer's Resource Service (127.0.0.1:7423) locally at 7424..7427
+            // Expose remote peer's Resource Service (127.0.0.1:7423) locally at 7426..7427 (non-overlapping!)
             let mut res_listener = None;
-            for lport in 7424..=7427u16 {
+            for lport in 7426..=7427u16 {
                 if let Ok(l) = tokio::net::TcpListener::bind(("127.0.0.1", lport)).await {
                     res_listener = Some(l);
                     break;

@@ -309,6 +309,27 @@ def snapshot_camera_frame(
     timeout: float = 3.5,
 ) -> tuple[int, int, bytes] | None:
     """Subscribe briefly to a camera resource, grab 1 frame, and encode as PNG bytes."""
+    if int(port or 0) <= 0:
+        from .media_codec import LocalCameraStreamer
+
+        facing = 2 if resource_id == "back" else 1
+        device = resource_id if resource_id.startswith("/") else None
+        cam = LocalCameraStreamer(facing=facing, device=device, emit_rgba=True)
+        try:
+            deadline = time.monotonic() + max(0.3, float(timeout))
+            while time.monotonic() < deadline:
+                frame = cam.pop_rgba()
+                if frame is not None:
+                    w, h, rgba = frame
+                    im = Image.frombytes("RGBA", (w, h), rgba)
+                    buf = io.BytesIO()
+                    im.save(buf, format="PNG")
+                    return (w, h, buf.getvalue())
+                time.sleep(0.03)
+            return None
+        finally:
+            cam.close()
+
     from .media_hub import RemoteCameraSubscriber
 
     sub = RemoteCameraSubscriber(host, port, resource_id, emit_rgba=True)

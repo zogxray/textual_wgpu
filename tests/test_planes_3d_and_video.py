@@ -832,11 +832,12 @@ def test_meta_os_speaker_clipboard_ai_sessions_and_composer(tmp_path: Path):
     p_ph = srv_ph.start()
 
     try:
-        # 1) Discovery includes speaker, clipboard, ai, camera, mic, files
+        # 1) Discovery includes speaker, clipboard, ai, gpu, camera, mic, files
         res_all = discover_all_resources(ports=(p_ws, p_ph), include_local_fallback=False)
         assert any(r.kind == "speaker" and r.device_id == "ws-1" for r in res_all)
         assert any(r.kind == "clipboard" and r.device_id == "ph-2" for r in res_all)
         assert any(r.kind == "ai" and r.resource_id == "ollama:demo-vision" for r in res_all)
+        assert any(r.kind == "gpu" and r.device_id == "ws-1" for r in res_all)
 
         # 2) Speaker stream & Clipboard roundtrip
         sink = RemoteSpeakerSink("127.0.0.1", p_ws, sample_rate=16000, channels=1)
@@ -912,6 +913,9 @@ def test_meta_os_speaker_clipboard_ai_sessions_and_composer(tmp_path: Path):
         cscr._clipboards = [ph_clp]
         cscr._spk_idx = 0
         cscr._clip_idx = 0
+        assert cscr.query_one("#comp-eye-preview") is not None
+        cscr._on_eye_file_bytes("photo.png", buf.getvalue())
+        assert cscr._last_image_b64 != ""
         ws_pcm_log.clear()
         cscr.query_one("#chk-hand-speak", Checkbox).value = True
         cscr.query_one("#chk-hand-clip", Checkbox).value = True
@@ -925,6 +929,28 @@ def test_meta_os_speaker_clipboard_ai_sessions_and_composer(tmp_path: Path):
         assert ws_pcm_log  # Spoken onto Workstation speaker!
         assert "Switch to media" in resource_clip_get("127.0.0.1", p_ph)  # Written to Phone clipboard!
         assert comp_app.mode_key == "media"  # UI Hands switched mode!
+
+        # F8 NodesScreen routes speaker, clipboard, and gpu resources cleanly
+        from textual_wgpu.widgets import OptionList
+
+        comp_app.switch_mode("nodes")
+        nscr = comp_app.screen
+        nscr._resources = [ws_spk, ph_clp]
+        nscr.query_one("#resources-list", OptionList).highlighted = 0
+        ws_pcm_log.clear()
+        nscr.use_selected_resource()
+        assert comp_app.mode_key == "media"
+        for _ in range(25):
+            if ws_pcm_log:
+                break
+            time.sleep(0.02)
+        assert ws_pcm_log
+
+        comp_app.switch_mode("nodes")
+        nscr._resources = [ws_spk, ph_clp]
+        nscr.query_one("#resources-list", OptionList).highlighted = 1
+        nscr.use_selected_resource()
+        assert comp_app.mode_key == "composer"
     finally:
         broker.close_all()
         srv_ws.close()

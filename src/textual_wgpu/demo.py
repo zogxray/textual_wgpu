@@ -65,44 +65,31 @@ DEMO_LABELS: list[tuple[str, str]] = [
 ]
 
 _OVERVIEW_MD = """\
-# textual-wgpu
+# textual-wgpu · Meta-OS GPU Runtime
 
-A Textual-compatible GPU UI runtime powered by **wgpu** and Pillow strip composition.
+> **Devices don't own apps, and apps don't own hardware.**
+> Every physical machine is a symmetric peer exposing independent capabilities (`camera`, `mic`, `speaker`, `files`, `clipboard`, `apps`, `gpu`, `ai`) over a single authenticated SSH link — giving human and AI **Eyes**, **Knowledge**, and **Hands**.
 
-## Highlights
+## Meta-OS Workspace Modes
 
-- **App & Screen model**: `App`, `ModalScreen`, `ModeApp`, `compose()`, reactive state, `Pilot` headless testing
-- **42 / 42 Widgets**: `Button`, `Checkbox`, `RadioSet`, `Switch`, `Select`, `Input`, `MaskedInput`, `TextArea`, `DataTable`, `Tree`, `OptionList`, `MarkdownViewer`, `Sparkline`, `Digits`, `ProgressBar`, `Log`, `Collapsible`, and more
-- **Smooth Scrolling & TOC**: Pixel-level wheel scrolling, expanded `MarkdownViewer` table of contents, exact heading anchors
-- **CRT Shader Post-FX**: Optional GPU bloom and scanline passes in `FrameBlitter`
-- **Themes**: Built-in `textual-dark`, `textual-light`, `system`, or custom `Theme.from_mapping(...)`
+| Key | Mode | Purpose |
+|-----|------|---------|
+| `F1` | **Overview** | Architecture & live TOC documentation |
+| `F2`–`F5` | **Widgets & FX** | Controls, DataTree, Editor/Modals, GPU CRT Themes |
+| `F6` | **3D Scene** | `Viewport3D` with Client/Server GPU balancing |
+| `F7` | **Media Studio** | Multi-cam independent planes (`C`/`B`), Mic (`M`), Speaker (`S`), Unified Files (`O`) |
+| `F8` | **Nodes & Apps** | Saved nodes, unified **System Resources**, App Directory & Running Sessions (`N`/`T`) |
+| `F9` | **Meta-OS Composer** | Compose **Eyes** (Cameras/Mic/Clip/Files/UI) + **Knowledge** (Local/Cloud AI) + **Hands** (Speaker/Clip/UI) |
 
 ## Navigation
 
 | Key | Action |
 |-----|--------|
-| `F1`–`F5` | Switch demo workspace |
+| `F1`–`F9` | Switch workspace |
 | `Tab` / `Shift+Tab` | Cycle focus across panels |
 | `↑` `↓` / `PgUp` `PgDn` / Wheel | Scroll or move selection |
 | `Ctrl+C` / Drag | Select & copy text |
 | `Q` / `Esc` | Quit confirmation modal |
-
-## Demo Screens
-
-### F1 Overview
-This `MarkdownViewer` screen demonstrates the live TOC tree, anchor jumping, and smooth pixel scrolling.
-
-### F2 Controls
-Interactive `Button`, `Checkbox`, `RadioSet`, `Switch`, `Select`, `Input`, `MaskedInput`, `ProgressBar`, `Sparkline`, `Digits`, and `Collapsible`.
-
-### F3 Data & Tree
-A three-panel workspace combining `OptionList`, `DataTable`, and an expandable `Tree` with a clickable `@click` `RichText` inspector.
-
-### F4 Editor & Modals
-Multiline `TextArea` + append-only `Log` + triggers for `ask_prompt`, `ask_confirm`, `ask_pick`, `ask_open_file`, and `show_doc`.
-
-### F5 Themes & FX
-Switch between built-in/custom themes at runtime and toggle GPU CRT bloom / scanlines.
 """
 
 _SHARED_CSS = """
@@ -1281,7 +1268,7 @@ class MediaScreen(Screen):
             elif res.port > 0:
                 key = f"res:{res.uid}"
             else:
-                continue
+                key = f"peer:{res.resource_id}"
             res_map[key] = res
             options.append((key, res.display_label()))
         if not options:
@@ -1457,6 +1444,15 @@ class MediaScreen(Screen):
             return
         if self.app is not None and hasattr(self.app, "play_audio_pcm"):
             self.app.play_audio_pcm(pcm, sample_rate=sample_rate, channels=channels)
+
+    def set_speaker_resource(self, res: Any) -> None:
+        self._speaker_target = res
+        try:
+            short = res.device_name[:10] if res else "Local"
+            self.query_one("#btn-spk", Button).label = f"Spk: {short}"
+            self.query_one("#status", StatusBar).update(f"F7 Media · output speaker = {res.display_label()}")
+        except Exception:  # noqa: BLE001
+            pass
 
     def select_speaker_target(self) -> None:
         from .remote.directory import discover_all_resources
@@ -1932,8 +1928,22 @@ class NodesScreen(Screen):
         res = self._resources[idx]
         if self.app is None or not hasattr(self.app, "switch_mode"):
             return
-        if res.kind == "ai":
+        if res.kind in ("ai", "gpu"):
             self.app.switch_mode("composer")
+            scr = getattr(self.app, "screen", None)
+            if isinstance(scr, ComposerScreen):
+                scr.select_resource(res)
+            return
+        if res.kind == "clipboard":
+            txt = ""
+            if getattr(res, "port", 0) > 0:
+                from .remote.media_hub import resource_clip_get
+
+                txt = resource_clip_get(res.host, res.port)
+            self.app.switch_mode("composer")
+            scr = getattr(self.app, "screen", None)
+            if isinstance(scr, ComposerScreen):
+                scr.select_resource(res, captured_text=txt)
             return
         self.app.switch_mode("media")
         scr = getattr(self.app, "screen", None)
@@ -1942,6 +1952,11 @@ class NodesScreen(Screen):
                 scr.start_camera_resource(res)
             elif res.kind == "mic":
                 scr.start_mic_resource(res)
+            elif res.kind == "speaker":
+                scr.set_speaker_resource(res)
+                from .remote.ai_resource import synthesize_speech_pcm
+
+                scr._play_pcm_out(synthesize_speech_pcm("Speaker active", sample_rate=16000), sample_rate=16000, channels=1)
             elif res.kind == "files":
                 scr.open_media_file()
 
@@ -2004,6 +2019,7 @@ class ComposerScreen(Screen):
     #comp-hands-box { width: 1fr; border: round $primary; }
     #comp-eyes-box:focus-within, #comp-brain-box:focus-within, #comp-hands-box:focus-within { border: round $accent; }
     #comp-eyes-list { height: 1fr; }
+    #comp-eye-preview { height: 10; }
     #comp-brain-list { height: 1fr; }
     #comp-log { height: 1fr; }
     """
@@ -2018,6 +2034,8 @@ class ComposerScreen(Screen):
         self._clip_idx = 0
         self._last_image_b64 = ""
         self._last_context = ""
+        self._last_eye_file_name = ""
+        self._last_eye_file_bytes = b""
 
     def _reload_inventory(self) -> None:
         from .remote.directory import ResourceEntry, discover_all_resources, local_device_profile
@@ -2064,6 +2082,29 @@ class ComposerScreen(Screen):
         c = self._clipboards[self._clip_idx]
         return f"Clip: {c.icon} {c.device_name}"
 
+    def _build_eye_preview_doc(self, summary: str = "Capture Eyes (E) to preview Camera / File / Clip", img_b64: str = "", ctx: str = "") -> Text:
+        import base64
+
+        t = Text()
+        t.append(f" {summary}\n", style="bold")
+        if img_b64:
+            try:
+                raw = base64.b64decode(img_b64)
+                p = _media_asset_dir() / "composer_eye_preview.png"
+                p.write_bytes(raw)
+                img_txt = make_image_text(p, max_width_px=260, max_height_px=130, row_height_px=16, indent_px=8)
+                if img_txt is not None:
+                    t.append_text(img_txt)
+                    t.append("\n")
+            except Exception:  # noqa: BLE001
+                pass
+        if ctx.strip():
+            snippet = ctx.strip().replace("\n", " ")
+            if len(snippet) > 140:
+                snippet = snippet[:137] + "..."
+            t.append(f" {snippet}\n", style="dim")
+        return t
+
     def compose(self):
         yield _mode_bar(self, "composer")
         self._reload_inventory()
@@ -2074,10 +2115,10 @@ class ComposerScreen(Screen):
         btn_ref = Button("Refresh (F)", id="btn-comp-ref", on_press=self.refresh_resources)
         eye_btns = Horizontal(btn_cap, btn_ref, id="comp-eye-btns")
         eye_btns.layout_hint_h = 36
-        eye_status = Static("Eyes: ready (pick Camera / Clipboard / UI)", id="comp-eye-info")
+        eye_preview = RichText(self._build_eye_preview_doc(), id="comp-eye-preview", can_focus=False)
         eyes_box = Panel(
-            Vertical(eye_btns, eye_list, eye_status, id="comp-eyes-inner"),
-            title="1. EYES · Cross-Device Sensors",
+            Vertical(eye_btns, eye_list, eye_preview, id="comp-eyes-inner"),
+            title="1. EYES · Cross-Device Sensors & Preview",
             id="comp-eyes-box",
         )
 
@@ -2086,8 +2127,9 @@ class ComposerScreen(Screen):
         inp = Input("Describe what you see and summarize clearly.", id="comp-prompt", placeholder="Ask AI or Human workflow…")
         p1 = Button("Look & Tell", id="btn-p-look", on_press=self.preset_look_and_tell)
         p2 = Button("Clip Bridge", id="btn-p-clip", on_press=self.preset_clip_bridge)
-        p3 = Button("Co-Pilot UI", id="btn-p-ui", on_press=self.preset_copilot_ui)
-        presets = Horizontal(p1, p2, p3, id="comp-presets")
+        p3 = Button("Listen", id="btn-p-listen", on_press=self.preset_listen_and_reply)
+        p4 = Button("Co-Pilot UI", id="btn-p-ui", on_press=self.preset_copilot_ui)
+        presets = Horizontal(p1, p2, p3, p4, id="comp-presets")
         presets.layout_hint_h = 36
         brain_box = Panel(
             Vertical(presets, inp, brain_list, id="comp-brain-inner"),
@@ -2121,6 +2163,34 @@ class ComposerScreen(Screen):
             ("Q", "Quit", lambda: _quit(self)),
         ])
         yield StatusBar("F9 Meta-OS Composer · Eyes (Sensors) + Knowledge (AI) + Hands (Actuators)", id="status")
+
+    def select_resource(self, res: Any, *, captured_text: str = "") -> None:
+        self.refresh_resources()
+        if res.kind == "ai":
+            for i, b in enumerate(self._brains):
+                if b.uid == res.uid:
+                    self.query_one("#comp-brain-list", OptionList).highlighted = i
+                    break
+            self._log(f"[KNOWLEDGE] selected {res.display_label()}")
+        elif res.kind == "gpu":
+            self._log(f"[RESOURCE] active GPU: {res.display_label()}")
+        elif res.kind == "clipboard":
+            for i, e in enumerate(self._eyes):
+                if e.uid == res.uid:
+                    self.query_one("#comp-eyes-list", OptionList).highlighted = i
+                    break
+            self._last_context = captured_text
+            self._update_eye_preview(f"Clipboard from {res.display_label()}", "", captured_text)
+            self._log(f"[EYES] clipboard from {res.display_label()}: {captured_text[:80]}")
+
+    def _update_eye_preview(self, summary: str, img_b64: str, ctx: str) -> None:
+        try:
+            self.query_one("#comp-eye-preview", RichText).update(
+                self._build_eye_preview_doc(summary, img_b64, ctx),
+                home=True,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def refresh_resources(self) -> None:
         self._reload_inventory()
@@ -2167,14 +2237,16 @@ class ComposerScreen(Screen):
         import base64
 
         if eye.kind == "camera":
-            if getattr(eye, "port", 0) > 0:
-                from .remote.ai_resource import snapshot_camera_frame
+            from .remote.ai_resource import snapshot_camera_frame
 
+            try:
                 snap = snapshot_camera_frame(eye.host, eye.port, eye.resource_id, timeout=3.0)
-                if snap is not None:
-                    w, h, png_bytes = snap
-                    b64 = base64.b64encode(png_bytes).decode("ascii")
-                    return (f"Camera {w}x{h} PNG from {eye.display_label()}", "", b64)
+            except Exception:  # noqa: BLE001
+                snap = None
+            if snap is not None:
+                w, h, png_bytes = snap
+                b64 = base64.b64encode(png_bytes).decode("ascii")
+                return (f"Camera {w}x{h} PNG from {eye.display_label()}", "", b64)
             return (f"Camera metadata: {eye.display_label()} (no live frame)", f"Camera source: {eye.display_label()}", "")
         if eye.kind == "clipboard":
             if getattr(eye, "port", 0) > 0:
@@ -2182,11 +2254,32 @@ class ComposerScreen(Screen):
 
                 txt = resource_clip_get(eye.host, eye.port)
                 return (f"Clipboard ({len(txt)} chars) from {eye.display_label()}", txt or "(empty clipboard)", "")
-            return (f"Clipboard from {eye.display_label()}", "(local clipboard)", "")
+            drv = getattr(self.app, "_driver", None) if self.app is not None else None
+            txt = getattr(drv, "remote_clipboard", "") or ""
+            return (f"Clipboard from {eye.display_label()}", txt or "(empty clipboard)", "")
+        if eye.kind == "files":
+            if self._last_eye_file_bytes:
+                name = self._last_eye_file_name or "file"
+                ext = Path(name).suffix.lower()
+                if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+                    import io as _io
+
+                    try:
+                        im = Image.open(_io.BytesIO(self._last_eye_file_bytes)).convert("RGBA")
+                        buf = _io.BytesIO()
+                        im.save(buf, format="PNG")
+                        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                        return (f"Image file {name} ({im.width}x{im.height})", f"File: {name}", b64)
+                    except Exception:  # noqa: BLE001
+                        pass
+                txt = self._last_eye_file_bytes[:4096].decode("utf-8", errors="replace")
+                return (f"File {name} ({len(self._last_eye_file_bytes)}B)", txt, "")
+            return (f"File source: {eye.display_label()} (press E to pick)", f"File source: {eye.display_label()}", "")
         if eye.kind == "mic":
             if getattr(eye, "port", 0) > 0:
                 from .remote.media_codec import pcm_rms_level
                 from .remote.media_hub import RemoteMicSubscriber
+                import time as _t
 
                 sub = RemoteMicSubscriber(eye.host, eye.port, eye.resource_id)
                 try:
@@ -2195,10 +2288,7 @@ class ComposerScreen(Screen):
                         chunks.extend(sub.pop_chunks())
                         if chunks:
                             break
-                        time_mod_sleep = 0.04
-                        import time
-
-                        time.sleep(time_mod_sleep)
+                        _t.sleep(0.04)
                     pcm = b"".join(chunks)
                     rms = pcm_rms_level(pcm) if pcm else 0.0
                     return (
@@ -2208,11 +2298,46 @@ class ComposerScreen(Screen):
                     )
                 finally:
                     sub.close()
-            return (f"Mic {eye.display_label()}", f"Microphone {eye.display_label()}", "")
+            try:
+                from .remote.media_codec import LocalMicCapture, pcm_rms_level
+                import time as _t
+
+                cap = LocalMicCapture(sample_rate=16000, channels=1, chunk_ms=80)
+                try:
+                    chunks = []
+                    for _ in range(10):
+                        chunks.extend(cap.pop_chunks())
+                        if chunks:
+                            break
+                        _t.sleep(0.04)
+                    pcm = b"".join(chunks)
+                    rms = pcm_rms_level(pcm) if pcm else 0.0
+                    return (
+                        f"Local Mic ({len(pcm)}B, rms={rms:.2f})",
+                        f"Microphone {eye.display_label()} level RMS={rms:.2f} ({len(pcm)} bytes)",
+                        "",
+                    )
+                finally:
+                    cap.close()
+            except Exception:  # noqa: BLE001
+                return (f"Mic {eye.display_label()}", f"Microphone {eye.display_label()}", "")
         if eye.kind == "ui_tree":
             ctx = self._capture_ui_tree_summary()
             return ("Live UI State captured", ctx, "")
         return (f"Resource {eye.display_label()}", f"Resource: {eye.display_label()} ({eye.kind}:{eye.resource_id})", "")
+
+    def _on_eye_file_bytes(self, name: str, data: bytes) -> None:
+        from .remote.directory import ResourceEntry
+
+        self._last_eye_file_name = name
+        self._last_eye_file_bytes = data
+        lbl, ctx, b64 = self._capture_eye_resource(
+            ResourceEntry("local", "File", "desktop", "📁", "files", "fs", name),
+        )
+        self._last_context = ctx
+        self._last_image_b64 = b64
+        self._update_eye_preview(lbl, b64, ctx)
+        self._log(f"[EYES] {lbl}")
 
     def capture_selected_eyes(self) -> None:
         el = self.query_one("#comp-eyes-list", OptionList)
@@ -2220,10 +2345,26 @@ class ComposerScreen(Screen):
         if idx is None or idx < 0 or idx >= len(self._eyes):
             return
         eye = self._eyes[idx]
+        if eye.kind == "files" and self.app is not None and hasattr(self.app, "ask_open_file"):
+            dl = Path.home() / "Downloads"
+            start_dir = dl if dl.is_dir() else Path.home()
+
+            def _on_local_path(p: Path | None) -> None:
+                if p is not None and p.is_file():
+                    self._on_eye_file_bytes(p.name, p.read_bytes())
+
+            self.app.ask_open_file(
+                start_dir,
+                _on_local_path,
+                title="Select File for Eyes (Any Device)",
+                unified_devices=True,
+                peer_file_callback=self._on_eye_file_bytes,
+            )
+            return
         lbl, ctx, b64 = self._capture_eye_resource(eye)
         self._last_context = ctx
         self._last_image_b64 = b64
-        self.query_one("#comp-eye-info", Static).update(f"Captured: {lbl}")
+        self._update_eye_preview(lbl, b64, ctx)
         self._log(f"[EYES] {lbl}")
 
     def _run_with_eye(self, eye: Any, prompt: str) -> str:
@@ -2246,6 +2387,13 @@ class ComposerScreen(Screen):
             if not ctx and not b64:
                 ctx = self._last_context
                 b64 = self._last_image_b64
+            self._last_context = ctx
+            self._last_image_b64 = b64
+            loop = getattr(self.app, "_loop", None) if self.app is not None else None
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(self._update_eye_preview, lbl, b64, ctx)
+            else:
+                self._update_eye_preview(lbl, b64, ctx)
             self._emit_log(f"[EYES] {lbl}")
 
             if brain is not None and getattr(brain, "port", 0) > 0:
@@ -2342,6 +2490,13 @@ class ComposerScreen(Screen):
         self.query_one("#comp-eyes-list", OptionList).highlighted = clip_idx
         self.query_one("#comp-prompt", Input).value = "Summarize and clean up this clipboard content."
         self.query_one("#chk-hand-clip", Checkbox).value = True
+        self.run_pipeline()
+
+    def preset_listen_and_reply(self) -> None:
+        mic_idx = next((i for i, r in enumerate(self._eyes) if r.kind == "mic"), 0)
+        self.query_one("#comp-eyes-list", OptionList).highlighted = mic_idx
+        self.query_one("#comp-prompt", Input).value = "Check microphone input level and reply on speaker."
+        self.query_one("#chk-hand-speak", Checkbox).value = True
         self.run_pipeline()
 
     def preset_copilot_ui(self) -> None:

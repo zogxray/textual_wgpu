@@ -128,6 +128,11 @@ object LocalResourceServer {
                         put("id", "fs")
                         put("label", "Files & Media")
                     })
+                    resArr.put(JSONObject().apply {
+                        put("kind", "gpu")
+                        put("id", "vulkan")
+                        put("label", "Vulkan Mobile GPU (${android.os.Build.HARDWARE ?: "SoC"})")
+                    })
                     val dev = JSONObject().apply {
                         put("device_id", prof.optString("id"))
                         put("name", prof.optString("name"))

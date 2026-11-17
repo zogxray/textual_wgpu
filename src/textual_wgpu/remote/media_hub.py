@@ -487,6 +487,33 @@ class _LocalSpeakerProcess:
             self._proc = None
 
 
+def _probe_local_gpu_label() -> str:
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return "Local GPU (Vulkan/wgpu)"
+    try:
+        if shutil.which("vulkaninfo"):
+            out = subprocess.run(["vulkaninfo", "--summary"], capture_output=True, timeout=0.8)
+            if out.returncode == 0:
+                for ln in out.stdout.decode("utf-8", errors="replace").splitlines():
+                    if "deviceName" in ln and "=" in ln:
+                        name = ln.split("=", 1)[1].strip()
+                        if name and "llvmpipe" not in name.lower():
+                            return f"GPU · {name}"
+    except Exception:  # noqa: BLE001
+        pass
+    return "Local GPU (Vulkan/wgpu)"
+
+
+_CACHED_GPU_LABEL: str | None = None
+
+
+def local_gpu_label() -> str:
+    global _CACHED_GPU_LABEL
+    if _CACHED_GPU_LABEL is None:
+        _CACHED_GPU_LABEL = _probe_local_gpu_label()
+    return _CACHED_GPU_LABEL
+
+
 class ResourceServer:
     """Independent per-device TCP Resource Service (cameras, mic, speaker, clipboard, files, AI, sessions)."""
 
@@ -604,6 +631,7 @@ class ResourceServer:
         resources.append({"kind": "speaker", "id": "default", "label": "Speaker"})
         resources.append({"kind": "clipboard", "id": "default", "label": "Clipboard"})
         resources.append({"kind": "files", "id": "fs", "label": "Files & Media"})
+        resources.append({"kind": "gpu", "id": "vulkan", "label": local_gpu_label()})
         for p in self._get_ai_providers():
             resources.append({"kind": "ai", "id": p.resource_id, "label": p.label})
         return {
