@@ -11,3 +11,9 @@ build/
 .ruff_cache/
 *.so
 .DS_Store
+rust/target/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.apk

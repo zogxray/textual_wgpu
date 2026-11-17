@@ -10,6 +10,27 @@ if TYPE_CHECKING:
     from PIL import ImageDraw
 
 _CACHE: dict[tuple, ImageFont.ImageFont] = {}
+_FONT_TAGS: dict[int, tuple[int, int]] = {}
+
+FONT_MONO = 0
+FONT_MONO_BOLD = 1
+FONT_MONO_ITALIC = 2
+FONT_MONO_BOLD_ITALIC = 3
+FONT_SANS = 4
+FONT_SANS_BOLD = 5
+FONT_BRAILLE = 6
+FONT_BRAILLE_BOLD = 7
+
+_KEY_TO_KIND = {
+    "mono": FONT_MONO,
+    "mono-bold": FONT_MONO_BOLD,
+    "mono-italic": FONT_MONO_ITALIC,
+    "mono-bold-italic": FONT_MONO_BOLD_ITALIC,
+    "sans": FONT_SANS,
+    "sans-bold": FONT_SANS_BOLD,
+    "mono-braille": FONT_BRAILLE,
+    "mono-braille-bold": FONT_BRAILLE_BOLD,
+}
 
 # Optional CRT / app overrides (see ``configure``).
 _MONO_PREFER: tuple[str, ...] = ()
@@ -42,12 +63,57 @@ def _load(names: tuple[str, ...], size: int, key: tuple) -> ImageFont.ImageFont:
         try:
             f = ImageFont.truetype(name, size)
             _CACHE[key] = f
+            kind = _KEY_TO_KIND.get(key[0], FONT_MONO)
+            _FONT_TAGS[id(f)] = (kind, int(size))
+            _FONT_PATHS[kind] = name
             return f
         except OSError:
             continue
     f = ImageFont.load_default()
     _CACHE[key] = f
+    kind = _KEY_TO_KIND.get(key[0], FONT_MONO)
+    _FONT_TAGS[id(f)] = (kind, int(size))
     return f
+
+
+_FONT_PATHS: dict[int, str] = {}
+
+
+def active_font_paths() -> dict[int, str]:
+    """Return loaded font file paths keyed by ``FONT_*`` kind."""
+    if FONT_MONO not in _FONT_PATHS:
+        mono(13)
+    if FONT_SANS not in _FONT_PATHS:
+        font(13)
+    return dict(_FONT_PATHS)
+
+
+def font_tag(f: Any) -> tuple[int, int]:
+    """Return ``(font_kind_id, size)`` for a font returned by this module."""
+    hit = _FONT_TAGS.get(id(f))
+    if hit is not None:
+        return hit
+    size = int(getattr(f, "size", 13) or 13)
+    return (FONT_MONO, size)
+
+
+def font_from_tag(kind: int, size: int) -> ImageFont.ImageFont:
+    """Resolve ``(font_kind_id, size)`` back to an ``ImageFont``."""
+    if kind == FONT_MONO_BOLD:
+        return mono(size, bold=True)
+    if kind == FONT_MONO_ITALIC:
+        return mono(size, italic=True)
+    if kind == FONT_MONO_BOLD_ITALIC:
+        return mono(size, bold=True, italic=True)
+    if kind == FONT_SANS:
+        return font(size, bold=False)
+    if kind == FONT_SANS_BOLD:
+        return font(size, bold=True)
+    if kind == FONT_BRAILLE:
+        return mono_braille(size, bold=False)
+    if kind == FONT_BRAILLE_BOLD:
+        return mono_braille(size, bold=True)
+    return mono(size)
 
 
 def font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
@@ -63,6 +129,8 @@ def font(size: int, *, bold: bool = False) -> ImageFont.ImageFont:
             else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
         ),
         "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        "/system/fonts/Roboto-Bold.ttf" if bold else "/system/fonts/Roboto-Regular.ttf",
+        "/system/fonts/DroidSans-Bold.ttf" if bold else "/system/fonts/DroidSans.ttf",
     )
     return _load(names, size, ("sans-bold" if bold else "sans", size))
 
@@ -92,6 +160,8 @@ def mono(size: int, *, bold: bool = False, italic: bool = False) -> ImageFont.Im
             "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
             "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/system/fonts/DroidSansMono.ttf",
+            "/system/fonts/Roboto-Bold.ttf",
         )
         key = ("mono-bold", size, prefer)
     else:
@@ -100,6 +170,8 @@ def mono(size: int, *, bold: bool = False, italic: bool = False) -> ImageFont.Im
             "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
             "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/system/fonts/DroidSansMono.ttf",
+            "/system/fonts/Roboto-Regular.ttf",
         )
         key = ("mono", size, prefer)
     return _load(names, size, key)

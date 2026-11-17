@@ -1,0 +1,12 @@
+[package]
+name = "tw-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ab_glyph = "0.2"
+bytemuck = { version = "1", features = ["derive"] }
+png = "0.17"
+tw-proto = { path = "../tw-proto" }
+wgpu = "24"

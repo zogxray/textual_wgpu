@@ -264,6 +264,13 @@ class TextArea(Widget):
             self.scroll_y = row - vis + 1
         self.scroll_y = max(0, self.scroll_y)
 
+    def scroll(self, delta: int) -> None:
+        if delta == 0:
+            return
+        max_s = max(0, len(self._lines()) - self._visible())
+        self.scroll_y = max(0, min(max_s, self.scroll_y + int(delta)))
+        self.refresh()
+
     def _emit_cursor(self) -> None:
         from ..events import CursorPosition
         from ..widget import dispatch_event

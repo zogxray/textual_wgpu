@@ -306,6 +306,11 @@ class App:
             return
         if self._canvas is not None:
             self._canvas.request_draw(self.draw)
+            return
+        drv = getattr(self, "_driver", None)
+        on_req = getattr(drv, "on_request_draw", None)
+        if callable(on_req):
+            on_req()
 
     @contextmanager
     def batch_update(self) -> Generator[None, None, None]:
@@ -324,6 +329,11 @@ class App:
                 # Bypass batch guard.
                 if self._canvas is not None:
                     self._canvas.request_draw(self.draw)
+                else:
+                    drv = getattr(self, "_driver", None)
+                    on_req = getattr(drv, "on_request_draw", None)
+                    if callable(on_req):
+                        on_req()
 
     def show_busy(self, title: str, subtitle: str = "") -> None:
         self._busy = f"{title}" + (f" · {subtitle}" if subtitle else "")
@@ -368,16 +378,96 @@ class App:
         clipboard tool accepted the write.
         """
         self._clipboard = text if text is not None else ""
+        drv = getattr(self, "_driver", None)
+        on_clip = getattr(drv, "on_clipboard_set", None)
+        if callable(on_clip):
+            return bool(on_clip(self._clipboard))
         from .clipboard import write_clipboard
         return write_clipboard(self._clipboard)
 
     def read_clipboard(self) -> str | None:
         """Read text from the system clipboard, or fall back to in-app buffer."""
+        drv = getattr(self, "_driver", None)
+        if drv is not None and hasattr(drv, "remote_clipboard"):
+            val = getattr(drv, "remote_clipboard", None)
+            if val:
+                return str(val)
+            return self._clipboard or None
         from .clipboard import read_clipboard
         clip = read_clipboard()
         if clip:
             return clip
         return self._clipboard or None
+
+    def play_audio_pcm(self, pcm: bytes, *, sample_rate: int = 22050, channels: int = 1) -> None:
+        """Play PCM16 audio locally or stream it to the remote client when remote."""
+        drv = getattr(self, "_driver", None)
+        on_play = getattr(drv, "on_audio_play", None)
+        if callable(on_play):
+            on_play(pcm, sample_rate=sample_rate, channels=channels)
+            return
+        self.stop_audio()
+        import shutil
+        import subprocess
+        import tempfile
+        import wave
+
+        tmp = Path(tempfile.gettempdir()) / "textual-wgpu-local-audio.wav"
+        with wave.open(str(tmp), "wb") as wf:
+            wf.setnchannels(max(1, int(channels)))
+            wf.setsampwidth(2)
+            wf.setframerate(max(8000, int(sample_rate)))
+            wf.writeframes(pcm)
+        for tool in ("pw-play", "paplay", "aplay"):
+            exe = shutil.which(tool)
+            if exe:
+                try:
+                    self._audio_proc = subprocess.Popen(
+                        [exe, str(tmp)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except OSError:
+                    self._audio_proc = None
+                break
+
+    def stop_audio(self) -> None:
+        """Stop active PCM audio playback (locally or on remote client)."""
+        drv = getattr(self, "_driver", None)
+        on_stop = getattr(drv, "on_audio_stop", None)
+        if callable(on_stop):
+            on_stop()
+            return
+        proc = getattr(self, "_audio_proc", None)
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+            self._audio_proc = None
+
+    def request_client_file(
+        self,
+        callback: Callable[[str, bytes], None],
+        *,
+        accept: str = "*/*",
+    ) -> None:
+        """Ask the remote client to pick a local file and upload it; fallback locally if non-remote."""
+        drv = getattr(self, "_driver", None)
+        on_req = getattr(drv, "on_request_client_file", None)
+        if callable(on_req):
+            on_req(callback, accept=accept)
+            return
+        ask_open = getattr(self, "ask_open_file", None)
+        if callable(ask_open):
+            def _picked(path: Path | None) -> None:
+                if path is not None and path.is_file():
+                    try:
+                        callback(path.name, path.read_bytes())
+                    except OSError:
+                        pass
+
+            ask_open(Path.home(), _picked, title="Pick media file", ok_label="Open")
 
     def clear_selection(self) -> None:
         """Clear text selection on the active screen."""
@@ -2414,7 +2504,16 @@ class App:
             pass
 
     def run(self) -> None:
-        """Windowed entry via ``WgpuDriver`` (rendercanvas loop)."""
+        """Windowed entry via ``WgpuDriver`` (or ``RemoteServerDriver`` if ``TEXTUAL_WGPU_REMOTE`` is set)."""
+        import os
+
+        remote_spec = os.environ.get("TEXTUAL_WGPU_REMOTE", "").strip()
+        if remote_spec:
+            from .remote.cli import run_app_remote
+
+            run_app_remote(self, remote_spec)
+            return
+
         from .driver import WgpuDriver
 
         WgpuDriver(self).run_blocking()

@@ -1046,6 +1046,78 @@ class ModeApp(App):
             )
         return True
 
+    def _focus_at(self, ix: int, iy: int) -> object | None:
+        """Return the focusable widget (or panel child) under pointer ``(ix, iy)``."""
+        from .widgets import Footer, Header, KeyBar, ModeBar, Panel, RichText, StatusBar, VerticalScroll
+
+        root = self.screen or self._root
+        if root is None:
+            return None
+
+        def _is_focusable(node: Any) -> bool:
+            if getattr(node, "disabled", False):
+                return False
+            if (getattr(node, "styles", None) or {}).get("display") == "none":
+                return False
+            if getattr(node, "layout_hint_h", None) == 0:
+                return False
+            ok = bool(getattr(node, "can_focus", False) or getattr(node, "_focusable", False))
+            if ok and isinstance(node, RichText) and isinstance(getattr(node, "parent", None), VerticalScroll):
+                return False
+            return ok and node is not root
+
+        deepest: Any = None
+
+        def _walk(node: Any) -> None:
+            nonlocal deepest
+            if getattr(node, "disabled", False):
+                return
+            if (getattr(node, "styles", None) or {}).get("display") == "none":
+                return
+            if getattr(node, "layout_hint_h", None) == 0:
+                return
+            r = getattr(node, "rect", None)
+            if r is not None and r.w > 0 and r.h > 0 and r.contains(ix, iy):
+                deepest = node
+            for child in getattr(node, "children", ()) or ():
+                _walk(child)
+
+        _walk(root)
+        if deepest is None:
+            return None
+        if isinstance(deepest, (ModeBar, KeyBar, StatusBar, Header, Footer)):
+            return None
+
+        cur = deepest
+        while cur is not None and cur is not root:
+            if isinstance(cur, (ModeBar, KeyBar, StatusBar, Header, Footer)):
+                return None
+            if _is_focusable(cur):
+                return cur
+            cur = getattr(cur, "parent", None)
+
+        # Clicking a Panel title bar / border focuses its first focusable descendant.
+        if isinstance(deepest, Panel):
+            found: Any = None
+
+            def _first_focusable(node: Any) -> None:
+                nonlocal found
+                if found is not None or getattr(node, "disabled", False):
+                    return
+                if (getattr(node, "styles", None) or {}).get("display") == "none":
+                    return
+                if getattr(node, "layout_hint_h", None) == 0:
+                    return
+                if _is_focusable(node):
+                    found = node
+                    return
+                for child in getattr(node, "children", ()) or ():
+                    _first_focusable(child)
+
+            _first_focusable(deepest)
+            return found
+        return None
+
     def _begin_select(self, widget: object, offset, *, clicks: int = 1) -> None:  # noqa: ANN001
         from .geometry import Offset
         from .selection import SELECT_ALL, Selection, strips_plain, word_span_at
@@ -1080,7 +1152,7 @@ class ModeApp(App):
     def on_pointer(self, x: float, y: float, button: int) -> None:
         import time
 
-        if button not in (0, 1):
+        if button not in (0, 1, 2, 3):
             return
         if self._busy_open():
             return  # Busy modal blocks all pointer input
@@ -1109,6 +1181,23 @@ class ModeApp(App):
                 or self.quit_modal
             ):
                 self.on_escape()
+            return
+
+        focus_target = self._focus_at(ix, iy)
+        if focus_target is not None and focus_target is not self._focus:
+            self.set_focus(focus_target)
+
+        if button in (2, 3):
+            from .events import MouseDown
+            from .widget import dispatch_event
+
+            target = focus_target or self.screen or self._root
+            md = MouseDown(x=ix, y=iy, screen_x=ix, screen_y=iy, button=button, widget=target)
+            node = target
+            while node is not None:
+                if dispatch_event(node, md, "on_mouse_down"):
+                    break
+                node = getattr(node, "parent", None)
             return
 
         chrome = self._chrome_hit(ix, iy)
@@ -1157,6 +1246,17 @@ class ModeApp(App):
             if rect.contains(ix, iy):
                 action(ix, iy)
                 return
+
+        from .events import MouseDown
+        from .widget import dispatch_event
+
+        target = focus_target or self.screen or self._root
+        md = MouseDown(x=ix, y=iy, screen_x=ix, screen_y=iy, button=button, widget=target)
+        node = target
+        while node is not None:
+            if dispatch_event(node, md, "on_mouse_down"):
+                break
+            node = getattr(node, "parent", None)
 
     def on_pointer_move(self, x: float, y: float) -> bool:
         from .widgets import ScrollView, TextArea, VerticalScroll
@@ -1218,6 +1318,8 @@ class ModeApp(App):
                 return True
             if isinstance(w, (VerticalScroll, ScrollView)) and w.on_pointer_move(ix, iy):
                 return True
+            if hasattr(w, "_drag_xy") and callable(getattr(w, "on_pointer_move", None)) and w.on_pointer_move(ix, iy):
+                return True
         # Track deepest hovered widget for :hover CSS & hover-aware widgets (e.g. Link).
         hovered: object | None = None
         for w in root._walk(root):
@@ -1268,7 +1370,7 @@ class ModeApp(App):
             self._pending_hit_xy = None
             self.request_draw()
 
-        root = self._root
+        root = self.screen or self._root
         if root is None:
             return
         for w in root._walk(root):
@@ -1276,6 +1378,18 @@ class ModeApp(App):
                 w.on_pointer_up(ix, iy)
             if isinstance(w, (VerticalScroll, ScrollView)):
                 w.on_pointer_up(ix, iy)
+            if hasattr(w, "_drag_xy") and callable(getattr(w, "on_pointer_up", None)):
+                w.on_pointer_up(ix, iy)
+        from .events import MouseUp
+        from .widget import dispatch_event
+
+        target = self._focus_at(ix, iy) or root
+        mu = MouseUp(x=ix, y=iy, screen_x=ix, screen_y=iy, button=button, widget=target)
+        node = target
+        while node is not None:
+            if dispatch_event(node, mu, "on_mouse_up"):
+                break
+            node = getattr(node, "parent", None)
 
     def on_wheel(self, x: float, y: float, dx: float, dy: float) -> None:
         if self._busy_open():
@@ -1301,7 +1415,7 @@ class ModeApp(App):
         if (self.quit_modal or self._prompt is not None or self._text is not None
                 or self._pick is not None or self._confirm is not None):
             return
-        from .widgets import OptionList, RichText, ScrollView, VerticalScroll
+        from .widgets import OptionList, RichText, ScrollView, TextArea, VerticalScroll
         from .widgets.log import _LogBase
 
         ix, iy = int(x), int(y)
@@ -1310,40 +1424,65 @@ class ModeApp(App):
         acc = float(getattr(self, "_wheel_accum", 0.0) or 0.0) + (dy / 45.0)
         line_steps = int(acc)
         self._wheel_accum = acc - line_steps
-        for w in root._walk(root):
-            if isinstance(w, OptionList) and w.rect.contains(ix, iy):
+
+        vis_nodes: list[Any] = []
+
+        def _walk_vis(node: Any) -> None:
+            if getattr(node, "disabled", False):
+                return
+            if (getattr(node, "styles", None) or {}).get("display") == "none":
+                return
+            if getattr(node, "layout_hint_h", None) == 0:
+                return
+            vis_nodes.append(node)
+            for child in getattr(node, "children", ()) or ():
+                _walk_vis(child)
+
+        _walk_vis(root)
+
+        for w in reversed(vis_nodes):
+            r = getattr(w, "rect", None)
+            if r is None or r.w <= 0 or r.h <= 0 or not r.contains(ix, iy):
+                continue
+            if isinstance(w, OptionList):
                 if line_steps:
                     w.move_highlight(line_steps)
                 return
-            if isinstance(w, (RichText, _LogBase)) and w.rect.contains(ix, iy):
+            if isinstance(w, TextArea):
                 if line_steps:
                     w.scroll(line_steps)
                 return
+            if hasattr(w, "step_zoom") and callable(getattr(w, "step_zoom", None)):
+                if dy != 0:
+                    w.step_zoom(-0.08 if dy > 0 else 0.08)
+                return
+            if isinstance(w, (RichText, _LogBase)):
+                # RichText inside VerticalScroll scrolls via the enclosing VerticalScroll.
+                if isinstance(getattr(w, "parent", None), VerticalScroll):
+                    continue
+                if line_steps:
+                    w.scroll(line_steps)
+                return
+            if isinstance(w, VerticalScroll):
+                if getattr(w, "_allow_vertical", True) and dy != 0:
+                    if hasattr(w, "scroll_pixels"):
+                        w.scroll_pixels(dy * 0.45)
+                    else:
+                        w.scroll(steps)
+                if getattr(w, "_allow_horizontal", False) and dx != 0:
+                    hx = int(round(dx / 40.0)) or (1 if dx > 0 else -1)
+                    w.scroll_relative(x=hx, y=0)
+                return
             focusable = bool(getattr(w, "can_focus", False) or getattr(w, "_focusable", False))
-            if focusable and w.rect.contains(ix, iy) and hasattr(w, "move"):
+            if focusable and hasattr(w, "move"):
                 if line_steps:
                     w.move(getattr(w, "cursor", 0) + line_steps)  # type: ignore[misc]
                 return
             # Tree / DataTable / other ScrollView without custom move().
-            if isinstance(w, ScrollView) and w.rect.contains(ix, iy):
+            if isinstance(w, ScrollView):
                 if line_steps:
                     w.scroll(line_steps)
                 return
-        target: VerticalScroll | None = None
-        for w in root._walk(root):
-            if isinstance(w, VerticalScroll) and w.rect.contains(ix, iy):
-                target = w
-                break
-        if target is None:
-            for w in root._walk(root):
-                if isinstance(w, VerticalScroll):
-                    target = w
-                    break
-        if target is not None:
-            if hasattr(target, "scroll_pixels") and dy != 0:
-                target.scroll_pixels(dy * 0.45)
-            else:
-                target.scroll(steps)
 
     def on_char(self, ch: str) -> None:
         from .widgets import TextArea
@@ -1697,18 +1836,18 @@ class ModeApp(App):
         self._ensure_screen().on_key(key)
 
     def on_mount(self) -> None:
-        assert self._device is not None and self._format is not None
-        self._blitter = FrameBlitter(self._device, self._format)
-        fx = getattr(self, "_post_fx", None)
-        if fx:
-            self._blitter.set_fx(
-                bloom=float(fx.get("bloom", 0.0)),
-                scanlines=float(fx.get("scanlines", 0.0)),
-            )
-        self._booting = True
-        self._boot_frac = 0.12
-        self._boot_label = "Starting…"
-        print("ModeApp · F-keys · Q quit · screen bindings", file=sys.stderr, flush=True)
+        if self._device is not None and self._format is not None:
+            self._blitter = FrameBlitter(self._device, self._format)
+            fx = getattr(self, "_post_fx", None)
+            if fx:
+                self._blitter.set_fx(
+                    bloom=float(fx.get("bloom", 0.0)),
+                    scanlines=float(fx.get("scanlines", 0.0)),
+                )
+            self._booting = True
+            self._boot_frac = 0.12
+            self._boot_label = "Starting…"
+            print("ModeApp · F-keys · Q quit · screen bindings", file=sys.stderr, flush=True)
 
     def after_first_draw(self) -> None:
         """Splash is on the buffer — mount the start mode while the window is still hidden."""

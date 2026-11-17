@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import math
+import shutil
+import struct
+import subprocess
+import tempfile
+import wave
 from pathlib import Path
 from typing import Any
 
+from PIL import Image, ImageDraw
 from rich.style import Style
 from rich.text import Text
 
+from .compositor import make_image_text
 from .mode_app import ModeApp
 from .screen import Screen
 from .theme import BUILTIN_THEMES, Theme
@@ -39,6 +47,9 @@ from .widgets import (
     TextArea,
     Tree,
     Vertical,
+    VerticalScroll,
+    Video,
+    Viewport3D,
 )
 
 DEMO_LABELS: list[tuple[str, str]] = [
@@ -47,6 +58,8 @@ DEMO_LABELS: list[tuple[str, str]] = [
     ("data", "Data & Tree"),
     ("editor", "Editor & Modals"),
     ("themes", "Themes & FX"),
+    ("planes", "3D Scene"),
+    ("media", "Media"),
 ]
 
 _OVERVIEW_MD = """\
@@ -583,6 +596,476 @@ class ThemesFxScreen(Screen):
         return super().on_key(key)
 
 
+class PlanesScreen(Screen):
+    DEFAULT_CSS = _SHARED_CSS + """
+    #vp-box { width: 1fr; border: round $primary; }
+    #notes3d-box { width: 38; border: round $primary; }
+    #vp-box:focus-within, #notes3d-box:focus-within { border: round $accent; }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._spinning = True
+        self._tick_handle = None
+
+    def compose(self):
+        yield _mode_bar(self, "planes")
+        vp = Viewport3D(id="demo-3d")
+        vp_box = Panel(vp, title="3D VIEWPORT (drag / ←→↑↓ Orbit · wheel/+/- Zoom · Space Spin)", id="vp-box")
+        notes = TextArea(
+            "3D Viewport & UI run concurrently:\n"
+            "- Client GPU mode: camera uniforms (64B) stream at 120Hz\n"
+            "- Server GPU mode: viewport-only frames on Priority P2\n"
+            "- Type here without stuttering the 3D scene.\n",
+            id="demo-3d-notes",
+        )
+        notes_box = Panel(notes, title="PARALLEL NOTES", id="notes3d-box")
+        yield Horizontal(vp_box, notes_box, id="main")
+        yield KeyBar([
+            ("←→↑↓/Drag", "Orbit 3D", None),
+            ("Wheel/+/-", "Zoom", None),
+            ("Space", "Spin", lambda: self.toggle_spin()),
+            ("Tab", "Panel", lambda: _focus_next(self)),
+            ("F1–F7", "Modes", None),
+            ("Q", "Quit", lambda: _quit(self)),
+        ])
+        yield StatusBar("F6 3D Scene · dual-mode Client/Server GPU plane + UI", id="status")
+
+    def on_screen_mount(self) -> None:
+        self.query_one("#demo-3d", Viewport3D).focus()
+        if self.app is not None and hasattr(self.app, "set_interval"):
+            self._tick_handle = self.app.set_interval(1 / 30, self._spin_tick)
+
+    def on_screen_resume(self) -> None:
+        self.query_one("#demo-3d", Viewport3D).focus()
+
+    def _spin_tick(self) -> None:
+        if not self._spinning or self.app is None or getattr(self.app, "mode_key", None) != "planes":
+            return
+        try:
+            vp = self.query_one("#demo-3d", Viewport3D)
+        except KeyError:
+            return
+        if vp.rect.w > 8 and vp.rect.h > 8:
+            vp.orbit(0.03, 0.0)
+            self.app.request_draw()
+
+    def toggle_spin(self) -> None:
+        self._spinning = not self._spinning
+
+    def on_key(self, key: str) -> bool:
+        if key == "space":
+            self.toggle_spin()
+            return True
+        return super().on_key(key)
+
+
+def _media_asset_dir() -> Path:
+    d = Path(tempfile.gettempdir()) / "textual-wgpu-demo-media"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _ensure_demo_photo(kind: str) -> Path:
+    d = _media_asset_dir()
+    path = d / f"photo_{kind}.png"
+    if path.is_file():
+        return path
+    w, h = 440, 260
+    im = Image.new("RGBA", (w, h), (16, 18, 28, 255))
+    draw = ImageDraw.Draw(im)
+    if kind == "horizon":
+        for y in range(h):
+            t = y / max(1, h - 1)
+            if y < 165:
+                s = y / 165.0
+                r = int(28 + 185 * (s ** 1.6))
+                g = int(34 + 92 * (s ** 1.4))
+                b = int(88 + 90 * (1.0 - s * 0.5))
+                draw.line([(0, y), (w - 1, y)], fill=(r, g, b, 255))
+            else:
+                s = (y - 165) / max(1, h - 165)
+                draw.line([(0, y), (w - 1, y)], fill=(int(18 + 14 * (1 - s)), int(14 + 10 * (1 - s)), int(32 + 24 * s), 255))
+        draw.ellipse([160, 74, 280, 194], fill=(255, 196, 92, 255))
+        # Retro horizon stripes over sun & ground perspective grid
+        for sy in range(132, 166, 6):
+            draw.rectangle([155, sy, 285, sy + 2], fill=(140, 68, 92, 255))
+        for gx in range(-6, 7):
+            draw.line([(w // 2 + gx * 18, 165), (w // 2 + gx * 85, h - 1)], fill=(96, 184, 240, 170), width=1)
+        for gy in (172, 184, 200, 222, 248):
+            draw.line([(0, gy), (w - 1, gy)], fill=(96, 184, 240, 150), width=1)
+    elif kind == "spectrum":
+        bars = [
+            (235, 78, 88), (242, 154, 62), (240, 212, 78),
+            (108, 204, 112), (78, 188, 224), (112, 124, 240), (198, 108, 226),
+        ]
+        bw = w // len(bars)
+        for i, col in enumerate(bars):
+            draw.rectangle([i * bw, 0, (i + 1) * bw - 1, 185], fill=(*col, 255))
+        for x in range(w):
+            v = int(255 * x / max(1, w - 1))
+            draw.line([(x, 190), (x, h - 1)], fill=(v, v, v, 255))
+    else:
+        for y in range(0, h, 4):
+            for x in range(0, w, 4):
+                r = int(127 + 127 * math.sin(x * 0.032))
+                g = int(127 + 127 * math.sin(y * 0.038 + 1.2))
+                b = int(127 + 127 * math.cos((x + y) * 0.025))
+                draw.rectangle([x, y, x + 3, y + 3], fill=(r, g, b, 255))
+    im.save(path, format="PNG")
+    return path
+
+
+def _ensure_demo_audio() -> tuple[Path, list[float], float]:
+    """Synthesize a clean 4-second C-major9 ambient arpeggio WAV + RMS envelope."""
+    d = _media_asset_dir()
+    path = d / "synth_arpeggio.wav"
+    sr = 22050
+    dur_s = 4.0
+    n_samples = int(sr * dur_s)
+    notes = [261.63, 329.63, 392.00, 493.88, 587.33, 493.88, 392.00, 329.63]
+    step_len = n_samples // len(notes)
+
+    buckets = 48
+    bucket_len = max(1, n_samples // buckets)
+    envelope: list[float] = []
+
+    if not path.is_file():
+        pcm = bytearray(n_samples * 2)
+        for i in range(n_samples):
+            idx = min(len(notes) - 1, i // step_len)
+            local = (i % step_len) / max(1, step_len)
+            env = math.sin(math.pi * min(1.0, local / 0.12)) * math.exp(-2.4 * local)
+            freq = notes[idx]
+            sig = 0.55 * math.sin(2.0 * math.pi * freq * i / sr) + 0.25 * math.sin(2.0 * math.pi * freq * 2.0 * i / sr)
+            val = max(-32767, min(32767, int(sig * env * 22000)))
+            struct.pack_into("<h", pcm, i * 2, val)
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(bytes(pcm))
+
+    for b in range(buckets):
+        mid = b * bucket_len + bucket_len // 2
+        idx = min(len(notes) - 1, mid // step_len)
+        local = (mid % step_len) / max(1, step_len)
+        env = math.sin(math.pi * min(1.0, local / 0.12)) * math.exp(-2.4 * local)
+        envelope.append(round(0.15 + 0.85 * env, 3))
+    return path, envelope, dur_s
+
+
+def _render_demo_video_frame(width: int, height: int, phase: float) -> bytes:
+    """Fast procedural RGBA video frame (moving plasma wave + timecode bar)."""
+    w = max(16, int(width))
+    h = max(16, int(height))
+    im = Image.new("RGBA", (w, h), (14, 18, 28, 255))
+    draw = ImageDraw.Draw(im)
+    bands = 24
+    bh = max(2, h // bands)
+    for bi in range(bands):
+        y0 = bi * bh
+        y1 = min(h - 1, y0 + bh - 1)
+        s = bi / bands
+        r = int(40 + 165 * (0.5 + 0.5 * math.sin(phase * 1.4 + s * 4.5)))
+        g = int(50 + 155 * (0.5 + 0.5 * math.sin(phase * 1.1 + s * 3.1 + 1.4)))
+        b = int(90 + 150 * (0.5 + 0.5 * math.cos(phase * 0.9 + s * 5.0)))
+        draw.rectangle([0, y0, w - 1, y1], fill=(r, g, b, 255))
+    cx = int(w * (0.5 + 0.34 * math.sin(phase * 1.3)))
+    cy = int(h * (0.5 + 0.28 * math.cos(phase * 1.7)))
+    rad = max(10, min(w, h) // 6)
+    draw.ellipse([cx - rad, cy - rad, cx + rad, cy + rad], fill=(255, 240, 200, 210), outline=(255, 255, 255, 255), width=2)
+    return im.tobytes("raw", "RGBA")
+
+
+class MediaScreen(Screen):
+    DEFAULT_CSS = _SHARED_CSS + """
+    #photo-box { width: 1fr; border: round $primary; }
+    #media-right { width: 52; }
+    #video-box { height: 1fr; border: round $primary; }
+    #audio-box { height: 14; border: round $primary; }
+    #photo-box:focus-within, #video-box:focus-within, #audio-box:focus-within { border: round $accent; }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._photo_kind = "horizon"
+        self._custom_photo: Path | None = None
+        self._video_playing = True
+        self._video_phase = 0.0
+        self._file_streamer: Any = None
+        self._audio_playing = False
+        self._audio_elapsed = 0.0
+        self._audio_proc: subprocess.Popen | None = None
+        self._audio_path, self._audio_env, self._audio_dur = _ensure_demo_audio()
+        self._audio_pcm: bytes | None = None
+        self._audio_sr = 22050
+        self._audio_ch = 1
+        self._tick_handle = None
+
+    def compose(self):
+        yield _mode_bar(self, "media")
+
+        photo_body = RichText(self._build_photo_doc(), id="media-photo", can_focus=False)
+        photo_body.on_action = self._on_photo_action
+        photo_scroll = VerticalScroll(photo_body, id="media-photo-scroll")
+        photo_box = Panel(photo_scroll, title="PHOTO · native RGBA (@image)", id="photo-box")
+
+        vid = Video(id="media-video")
+        vid.play()
+        vid.push_rgba_frame(240, 144, _render_demo_video_frame(240, 144, 0.0))
+        vid_box = Panel(vid, title="VIDEO · H.265/H.264 HW plane (V play/pause)", id="video-box")
+
+        btn_audio = Button("Play Synth Audio", id="btn-audio", variant="primary", on_press=self.toggle_audio)
+        btn_vid = Button("Pause Video", id="btn-video", on_press=self.toggle_video)
+        audio_btns = Horizontal(btn_audio, btn_vid, id="media-btns")
+        audio_btns.layout_hint_h = 36
+        btn_srv = Button("Server File (O)", id="btn-srv-file", on_press=self.pick_server_file)
+        btn_cli = Button("Client File (U)", id="btn-cli-file", on_press=self.pick_client_file)
+        file_btns = Horizontal(btn_srv, btn_cli, id="media-file-btns")
+        file_btns.layout_hint_h = 36
+        digits = Digits("00.0s", id="audio-clock")
+        bar = ProgressBar(100, id="audio-bar")
+        spark = Sparkline(self._audio_env, id="audio-spark")
+        spark.layout_hint_h = 26
+        audio_inner = Vertical(audio_btns, file_btns, digits, bar, spark, id="audio-inner")
+        audio_box = Panel(audio_inner, title="AUDIO & FILES · A play · O server · U client", id="audio-box")
+
+        right = Vertical(vid_box, audio_box, id="media-right")
+        yield Horizontal(photo_box, right, id="main")
+        yield KeyBar([
+            ("1/2/3", "Photo", None),
+            ("O", "Server File", lambda: self.pick_server_file()),
+            ("U", "Client File", lambda: self.pick_client_file()),
+            ("V/Space", "Video", lambda: self.toggle_video()),
+            ("A", "Audio", lambda: self.toggle_audio()),
+            ("Tab", "Panel", lambda: _focus_next(self)),
+            ("F1–F7", "Modes", None),
+            ("Q", "Quit", lambda: _quit(self)),
+        ])
+        yield StatusBar("F7 Media · H.265/H.264 video + native PNG + WAV/MP3 + server/client files", id="status")
+
+    def _build_photo_doc(self) -> Text:
+        path = self._custom_photo if (self._custom_photo and self._custom_photo.is_file()) else _ensure_demo_photo(self._photo_kind)
+        t = Text()
+        t.append("  Gallery: ")
+        for idx, (k, label) in enumerate((("horizon", "1 Sunset"), ("spectrum", "2 Bars"), ("plasma", "3 Pattern")), start=1):
+            active = (self._custom_photo is None) and (k == self._photo_kind)
+            sty = Style.from_meta({"@click": f"photo:{k}"}) + (Style(bold=True, reverse=True) if active else Style(bold=True))
+            t.append(f" {label} ", style=sty)
+            if idx < 3:
+                t.append("  ")
+        t.append("\n\n")
+        img_txt = make_image_text(path, max_width_px=440, max_height_px=340, row_height_px=18, indent_px=16)
+        if img_txt is not None:
+            t.append_text(img_txt)
+        t.append(f"\n  File: {path.name} (native RGBA, no half-blocks)\n", style="dim")
+        return t
+
+    def _on_photo_action(self, action: str) -> None:
+        if action.startswith("photo:"):
+            self.set_photo(action.split(":", 1)[1])
+
+    def set_photo(self, kind: str) -> None:
+        if kind not in ("horizon", "spectrum", "plasma"):
+            return
+        self._custom_photo = None
+        self._photo_kind = kind
+        self.query_one("#media-photo", RichText).update(self._build_photo_doc(), home=True)
+        self.query_one("#status", StatusBar).update(f"F7 Media · photo={kind}")
+
+    def pick_server_file(self) -> None:
+        if self.app is None or not hasattr(self.app, "ask_open_file"):
+            return
+        suffixes = (
+            ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif",
+            ".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v",
+            ".wav", ".mp3", ".ogg", ".flac", ".m4a",
+        )
+        self.app.ask_open_file(
+            Path.home(),
+            lambda p: self.load_media_file(p) if p is not None else None,
+            title="Select media file (Server)",
+            subtitle="Photo (.png .jpg .webp) · Video (.mp4 .mkv .webm) · Audio (.wav .mp3 .ogg)",
+            suffixes=suffixes,
+            ok_label="Open",
+        )
+
+    def pick_client_file(self) -> None:
+        if self.app is None or not hasattr(self.app, "request_client_file"):
+            return
+        self.query_one("#status", StatusBar).update("F7 Media · waiting for client file picker…")
+
+        def _uploaded(name: str, data: bytes) -> None:
+            if not data:
+                return
+            safe = Path(name or "client_media.bin").name
+            dst = _media_asset_dir() / f"client_{safe}"
+            dst.write_bytes(data)
+            self.load_media_file(dst)
+
+        self.app.request_client_file(_uploaded, accept="*/*")
+
+    def load_media_file(self, path: Path) -> None:
+        if not path.is_file():
+            return
+        ext = path.suffix.lower()
+        if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"):
+            self._custom_photo = path
+            self.query_one("#media-photo", RichText).update(self._build_photo_doc(), home=True)
+            self.query_one("#status", StatusBar).update(f"F7 Media · loaded photo {path.name}")
+            return
+        if ext in (".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"):
+            if self._file_streamer is not None:
+                self._file_streamer.close()
+                self._file_streamer = None
+            try:
+                from .remote.media_codec import FileVideoStreamer, decode_audio_file_pcm
+
+                self._file_streamer = FileVideoStreamer(path)
+                self._video_playing = True
+                self.query_one("#btn-video", Button).label = "Pause Video"
+                self.query_one("#status", StatusBar).update(f"F7 Media · playing video {path.name}")
+                try:
+                    pcm, sr, ch, env, dur = decode_audio_file_pcm(path)
+                    self._audio_pcm = pcm
+                    self._audio_sr = sr
+                    self._audio_ch = ch
+                    self._audio_env = env
+                    self._audio_dur = dur
+                    self._audio_elapsed = 0.0
+                    self._audio_playing = True
+                    self.query_one("#btn-audio", Button).label = "Stop Audio"
+                    self.query_one("#audio-spark", Sparkline).data = list(env)
+                    if self.app is not None and hasattr(self.app, "play_audio_pcm"):
+                        self.app.play_audio_pcm(pcm, sample_rate=sr, channels=ch)
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception as exc:  # noqa: BLE001
+                self.query_one("#status", StatusBar).update(f"F7 Media · video error: {exc}")
+            return
+        if ext in (".wav", ".mp3", ".ogg", ".flac", ".m4a", ".aac"):
+            try:
+                from .remote.media_codec import decode_audio_file_pcm
+
+                pcm, sr, ch, env, dur = decode_audio_file_pcm(path)
+                self._audio_pcm = pcm
+                self._audio_sr = sr
+                self._audio_ch = ch
+                self._audio_env = env
+                self._audio_dur = dur
+                self._audio_elapsed = 0.0
+                self._audio_playing = True
+                self.query_one("#btn-audio", Button).label = "Stop Audio"
+                self.query_one("#audio-spark", Sparkline).data = list(env)
+                if self.app is not None and hasattr(self.app, "play_audio_pcm"):
+                    self.app.play_audio_pcm(pcm, sample_rate=sr, channels=ch)
+                self.query_one("#status", StatusBar).update(f"F7 Media · playing audio {path.name}")
+            except Exception as exc:  # noqa: BLE001
+                self.query_one("#status", StatusBar).update(f"F7 Media · audio error: {exc}")
+
+    def toggle_video(self) -> None:
+        self._video_playing = not self._video_playing
+        vid = self.query_one("#media-video", Video)
+        btn = self.query_one("#btn-video", Button)
+        if self._video_playing:
+            vid.play()
+            btn.label = "Pause Video"
+        else:
+            vid.pause()
+            btn.label = "Play Video"
+
+    def _stop_audio_proc(self) -> None:
+        if self.app is not None and hasattr(self.app, "stop_audio"):
+            self.app.stop_audio()
+        if self._audio_proc is not None:
+            try:
+                self._audio_proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+            self._audio_proc = None
+
+    def toggle_audio(self, *, play_os: bool = True) -> None:
+        self._audio_playing = not self._audio_playing
+        btn = self.query_one("#btn-audio", Button)
+        if self._audio_playing:
+            self._audio_elapsed = 0.0
+            btn.label = "Stop Audio"
+            if play_os and self.app is not None and hasattr(self.app, "play_audio_pcm"):
+                if self._audio_pcm is not None:
+                    pcm, sr, ch = self._audio_pcm, self._audio_sr, self._audio_ch
+                else:
+                    with wave.open(str(self._audio_path), "rb") as wf:
+                        sr = wf.getframerate()
+                        ch = wf.getnchannels()
+                        pcm = wf.readframes(wf.getnframes())
+                self.app.play_audio_pcm(pcm, sample_rate=sr, channels=ch)
+            self.query_one("#status", StatusBar).update("F7 Media · playing audio")
+        else:
+            self._stop_audio_proc()
+            btn.label = "Play Synth Audio"
+            self.query_one("#status", StatusBar).update("F7 Media · audio stopped")
+
+    def on_screen_mount(self) -> None:
+        if self.app is not None and hasattr(self.app, "set_interval"):
+            self._tick_handle = self.app.set_interval(0.05, self._media_tick)
+
+    def _media_tick(self) -> None:
+        if self.app is None or getattr(self.app, "mode_key", None) != "media":
+            return
+        if self._video_playing:
+            vid = self.query_one("#media-video", Video)
+            if self._file_streamer is not None:
+                is_remote = hasattr(getattr(self.app, "_driver", None), "on_audio_play")
+                if is_remote:
+                    for au, is_kf in self._file_streamer.pop_aus():
+                        vid.push_packet(0, au, keyframe=is_kf, codec_flag=self._file_streamer.codec_flag)
+                else:
+                    frame = self._file_streamer.pop_rgba()
+                    if frame is not None:
+                        fw, fh, rgba = frame
+                        vid.push_rgba_frame(fw, fh, rgba)
+            else:
+                self._video_phase += 0.12
+                vid.push_rgba_frame(240, 144, _render_demo_video_frame(240, 144, self._video_phase))
+        if self._audio_playing:
+            self._audio_elapsed += 0.05
+            if self._audio_elapsed >= self._audio_dur:
+                self._audio_playing = False
+                self._audio_elapsed = 0.0
+                self._stop_audio_proc()
+                self.query_one("#btn-audio", Button).label = "Play Synth Audio"
+            pct = min(100.0, (self._audio_elapsed / max(0.1, self._audio_dur)) * 100.0)
+            self.query_one("#audio-clock", Digits).update(f"{self._audio_elapsed:04.1f}s")
+            self.query_one("#audio-bar", ProgressBar).progress = pct
+            shift = int((self._audio_elapsed / max(0.1, self._audio_dur)) * len(self._audio_env)) % len(self._audio_env)
+            self.query_one("#audio-spark", Sparkline).data = self._audio_env[shift:] + self._audio_env[:shift]
+
+    def on_key(self, key: str) -> bool:
+        if key == "1":
+            self.set_photo("horizon")
+            return True
+        if key == "2":
+            self.set_photo("spectrum")
+            return True
+        if key == "3":
+            self.set_photo("plasma")
+            return True
+        if key == "o":
+            self.pick_server_file()
+            return True
+        if key == "u":
+            self.pick_client_file()
+            return True
+        if key in ("v", "space"):
+            self.toggle_video()
+            return True
+        if key == "a":
+            self.toggle_audio()
+            return True
+        return super().on_key(key)
+
+
 def build_demo_app(theme: Theme | None = None) -> ModeApp:
     """Create the standalone ``textual-wgpu`` demo application."""
     modes: list[tuple[str, str, type[Screen]]] = [
@@ -591,6 +1074,8 @@ def build_demo_app(theme: Theme | None = None) -> ModeApp:
         ("data", "Data & Tree", DataTreeScreen),
         ("editor", "Editor & Modals", EditorModalsScreen),
         ("themes", "Themes & FX", ThemesFxScreen),
+        ("planes", "3D Scene", PlanesScreen),
+        ("media", "Media", MediaScreen),
     ]
     return ModeApp(
         modes,

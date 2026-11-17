@@ -55,6 +55,8 @@ from .textarea import TextArea
 from .toast import Toast
 from .tooltip import Tooltip
 from .tree import Tree, TreeNode
+from .video import Video
+from .viewport3d import Viewport3D
 from .welcome import Welcome
 
 __all__ = [
@@ -124,5 +126,7 @@ __all__ = [
     "Vertical",
     "VerticalGroup",
     "VerticalScroll",
+    "Video",
+    "Viewport3D",
     "Welcome",
 ]

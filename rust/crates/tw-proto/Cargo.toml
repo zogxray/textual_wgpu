@@ -1,0 +1,10 @@
+[package]
+name = "tw-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+flate2 = "1"
+thiserror = "2"
+zstd = "0.13"

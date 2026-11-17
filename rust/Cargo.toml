@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tw-proto",
+    "crates/tw-render",
+    "crates/tw-client",
+    "crates/tw-ffi",
+    "apps/tw-viewer",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"

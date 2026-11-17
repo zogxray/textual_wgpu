@@ -90,6 +90,8 @@ from .widgets import (
     Vertical,
     VerticalGroup,
     VerticalScroll,
+    Video,
+    Viewport3D,
     Welcome,
 )
 
@@ -203,6 +205,8 @@ __all__ = [
     "Vertical",
     "VerticalGroup",
     "VerticalScroll",
+    "Video",
+    "Viewport3D",
     "Welcome",
     "parse_size",
     "tick_transitions",

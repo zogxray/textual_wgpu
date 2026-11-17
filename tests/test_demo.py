@@ -15,7 +15,7 @@ def test_demo_all_modes_layout_and_paint():
     app = build_demo_app()
     app._pixel_size = (1100, 720)
     assert app.TITLE == "textual-wgpu · demo"
-    assert len(DEMO_LABELS) == 5
+    assert len(DEMO_LABELS) == 7
 
     for idx, (key, _title) in enumerate(DEMO_LABELS):
         app.set_mode(idx)
@@ -108,4 +108,17 @@ async def test_demo_pilot_navigation_and_modals():
         await pilot.press("b")
         await pilot.pause()
         assert app.screen._bloom == 0.45
+
+        await pilot.press("f7")
+        await pilot.pause()
+        assert app.mode_key == "media"
+        app.screen.set_photo("spectrum")
+        rt = pilot.query_one("#media-photo", RichText)
+        assert any(seg.meta and "@image" in seg.meta for st in rt.render_lines() for seg in st.segments)
+        app.screen.toggle_audio(play_os=False)
+        assert app.screen._audio_playing is True
+        app.screen._media_tick()
+        assert app.screen._audio_elapsed > 0
+        app.screen.toggle_audio(play_os=False)
+        assert app.screen._audio_playing is False
 
