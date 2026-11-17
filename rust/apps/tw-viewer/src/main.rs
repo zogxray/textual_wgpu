@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tw_client::{
@@ -8,8 +10,7 @@ use tw_client::{
     ClientHandle,
 };
 use tw_proto::{
-    FsEntry, POINTER_DOWN, POINTER_MOVE, POINTER_UP, VID_CODEC_AV1, VID_CODEC_H264, VID_CODEC_HEVC,
-    VID_FLAG_KEYFRAME,
+    FsEntry, POINTER_DOWN, POINTER_MOVE, POINTER_UP, VID_CODEC_AV1, VID_CODEC_HEVC,
 };
 use tw_render::{GpuCompositor, SceneState};
 use winit::application::ApplicationHandler;
@@ -274,6 +275,41 @@ fn find_v4l2_capture_device() -> String {
     "/dev/video0".to_string()
 }
 
+fn find_hub_python() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let cached = std::path::PathBuf::from(home).join(".cache/textual-wgpu/python_bin");
+    if let Ok(p) = std::fs::read_to_string(cached) {
+        let p = p.trim();
+        if !p.is_empty() && std::path::Path::new(p).exists() {
+            return p.to_string();
+        }
+    }
+    "python3".to_string()
+}
+
+fn connect_media_hub(sock_path: &std::path::Path, hub_args: &[&str]) -> Option<UnixStream> {
+    if let Ok(s) = UnixStream::connect(sock_path) {
+        return Some(s);
+    }
+    let py = find_hub_python();
+    let mut cmd = Command::new(&py);
+    cmd.args(["-m", "textual_wgpu.remote.media_hub"])
+        .args(hub_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if cmd.spawn().is_err() {
+        return None;
+    }
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if let Ok(s) = UnixStream::connect(sock_path) {
+            return Some(s);
+        }
+    }
+    None
+}
+
 fn stop_audio(slot: &Arc<Mutex<Option<Child>>>) {
     if let Ok(mut guard) = slot.lock() {
         if let Some(mut ch) = guard.take() {
@@ -467,11 +503,11 @@ fn main() {
     let client_for_file = Arc::clone(&client_slot);
     let client_for_fsl = Arc::clone(&client_slot);
     let client_for_fsg = Arc::clone(&client_slot);
-    let cam_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
-    let cam_ctl_slot = Arc::clone(&cam_slot);
+    let cam_stop_slot: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
+    let cam_ctl_stop = Arc::clone(&cam_stop_slot);
     let client_for_cam = Arc::clone(&client_slot);
-    let mic_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
-    let mic_ctl_slot = Arc::clone(&mic_slot);
+    let mic_stop_slot: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
+    let mic_ctl_stop = Arc::clone(&mic_stop_slot);
     let client_for_mic = Arc::clone(&client_slot);
 
     let cbs = ClientCallbacks {
@@ -606,7 +642,11 @@ fn main() {
             });
         }),
         on_cam_ctl: Arc::new(move |mode, cam_id| {
-            stop_audio(&cam_ctl_slot);
+            if let Ok(mut g) = cam_ctl_stop.lock() {
+                if let Some(prev) = g.take() {
+                    prev.store(true, Ordering::Relaxed);
+                }
+            }
             if mode == 0 {
                 eprintln!("[tw-cam] stopped");
                 return;
@@ -617,100 +657,104 @@ fn main() {
             } else {
                 find_v4l2_capture_device()
             };
-            eprintln!("[tw-cam] starting {cam_dev} (mode={mode})");
-            if let Ok(mut child) = Command::new("ffmpeg")
-                .args([
-                    "-y", "-loglevel", "warning",
-                    "-f", "v4l2", "-framerate", "24", "-i", cam_dev.as_str(),
-                    "-vf", "scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2",
-                    "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "ultrafast",
-                    "-tune", "zerolatency", "-g", "24", "-bf", "0", "-f", "h264", "pipe:1",
-                ])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
-                .spawn()
-            {
-                let Some(mut stdout) = child.stdout.take() else { return };
-                *cam_ctl_slot.lock().unwrap() = Some(child);
-                std::thread::spawn(move || {
-                    let mut buf: Vec<u8> = Vec::with_capacity(131072);
-                    let mut pending_hdr: Vec<u8> = Vec::new();
-                    let mut tmp = [0u8; 32768];
-                    let t_start = std::time::Instant::now();
-                    while let Ok(n) = stdout.read(&mut tmp) {
-                        if n == 0 {
-                            break;
-                        }
-                        buf.extend_from_slice(&tmp[..n]);
-                        loop {
-                            let Some(p0) = buf.windows(4).position(|w| w == [0, 0, 0, 1]) else {
-                                break;
-                            };
-                            if p0 > 0 {
-                                buf.drain(..p0);
-                            }
-                            let Some(p1_rel) = buf[4..].windows(4).position(|w| w == [0, 0, 0, 1]) else {
-                                break;
-                            };
-                            let p1 = 4 + p1_rel;
-                            let nal: Vec<u8> = buf.drain(..p1).collect();
-                            if nal.len() < 5 {
-                                continue;
-                            }
-                            let ntype = nal[4] & 0x1F;
-                            if matches!(ntype, 1..=5) {
-                                let mut au = Vec::with_capacity(pending_hdr.len() + nal.len());
-                                au.extend_from_slice(&pending_hdr);
-                                au.extend_from_slice(&nal);
-                                let is_kf = ntype == 5 || !pending_hdr.is_empty();
-                                pending_hdr.clear();
-                                let fl = VID_CODEC_H264 | if is_kf { VID_FLAG_KEYFRAME } else { 0 };
-                                ch.send_video_nalu(t_start.elapsed().as_micros() as u64, fl, &au);
-                            } else {
-                                pending_hdr.extend_from_slice(&nal);
-                            }
+            let flag = Arc::new(AtomicBool::new(false));
+            *cam_ctl_stop.lock().unwrap() = Some(Arc::clone(&flag));
+            eprintln!("[tw-cam] subscribing to shared hub for {cam_dev} (mode={mode})");
+            std::thread::spawn(move || {
+                let home = std::env::var("HOME").unwrap_or_default();
+                let dev_name = std::path::Path::new(&cam_dev)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "video0".into());
+                let sock_path = std::path::PathBuf::from(home).join(format!(".cache/textual-wgpu/cam_{dev_name}.sock"));
+                let Some(mut stream) = connect_media_hub(&sock_path, &["--video", &cam_dev]) else {
+                    eprintln!("[tw-cam] failed to connect media_hub for {cam_dev}");
+                    return;
+                };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+                let mut hdr = [0u8; 13];
+                let mut payload = Vec::new();
+                while !flag.load(Ordering::Relaxed) {
+                    match stream.read_exact(&mut hdr) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => continue,
+                        Err(_) => break,
+                    }
+                    let pts_us = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
+                    let flags = hdr[8];
+                    let plen = u32::from_le_bytes(hdr[9..13].try_into().unwrap()) as usize;
+                    if plen > 16 * 1024 * 1024 {
+                        break;
+                    }
+                    payload.resize(plen, 0);
+                    let mut got = 0usize;
+                    let mut broken = false;
+                    while got < plen && !flag.load(Ordering::Relaxed) {
+                        match stream.read(&mut payload[got..]) {
+                            Ok(0) => { broken = true; break; }
+                            Ok(n) => got += n,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => continue,
+                            Err(_) => { broken = true; break; }
                         }
                     }
-                });
-            }
+                    if broken || flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    ch.send_video_nalu(pts_us, flags, &payload);
+                }
+            });
         }),
         on_mic_ctl: Arc::new(move |mode| {
-            stop_audio(&mic_ctl_slot);
+            if let Ok(mut g) = mic_ctl_stop.lock() {
+                if let Some(prev) = g.take() {
+                    prev.store(true, Ordering::Relaxed);
+                }
+            }
             if mode == 0 {
                 eprintln!("[tw-mic] stopped");
                 return;
             }
             let Some(ch) = client_for_mic.lock().ok().and_then(|g| g.clone()) else { return };
-            eprintln!("[tw-mic] starting 16kHz mic capture");
-            let child_opt = Command::new("pw-record")
-                .args(["--format=s16", "--rate=16000", "--channels=1", "-"])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .or_else(|_| {
-                    Command::new("parecord")
-                        .args(["--raw", "--format=s16le", "--rate=16000", "--channels=1"])
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::null())
-                        .spawn()
-                })
-                .or_else(|_| {
-                    Command::new("arecord")
-                        .args(["-q", "-t", "raw", "-f", "S16_LE", "-r", "16000", "-c", "1", "-"])
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::null())
-                        .spawn()
-                });
-            if let Ok(mut child) = child_opt {
-                let Some(mut stdout) = child.stdout.take() else { return };
-                *mic_ctl_slot.lock().unwrap() = Some(child);
-                std::thread::spawn(move || {
-                    let mut pcm = [0u8; 2560];
-                    while stdout.read_exact(&mut pcm).is_ok() {
-                        ch.send_audio_pcm(16000, 1, &pcm);
+            let flag = Arc::new(AtomicBool::new(false));
+            *mic_ctl_stop.lock().unwrap() = Some(Arc::clone(&flag));
+            eprintln!("[tw-mic] subscribing to shared mic hub");
+            std::thread::spawn(move || {
+                let home = std::env::var("HOME").unwrap_or_default();
+                let sock_path = std::path::PathBuf::from(home).join(".cache/textual-wgpu/mic_default.sock");
+                let Some(mut stream) = connect_media_hub(&sock_path, &["--mic"]) else {
+                    eprintln!("[tw-mic] failed to connect mic media_hub");
+                    return;
+                };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+                let mut hdr = [0u8; 13];
+                let mut pcm = Vec::new();
+                while !flag.load(Ordering::Relaxed) {
+                    match stream.read_exact(&mut hdr) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => continue,
+                        Err(_) => break,
                     }
-                });
-            }
+                    let plen = u32::from_le_bytes(hdr[9..13].try_into().unwrap()) as usize;
+                    if plen > 1024 * 1024 {
+                        break;
+                    }
+                    pcm.resize(plen, 0);
+                    let mut got = 0usize;
+                    let mut broken = false;
+                    while got < plen && !flag.load(Ordering::Relaxed) {
+                        match stream.read(&mut pcm[got..]) {
+                            Ok(0) => { broken = true; break; }
+                            Ok(n) => got += n,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => continue,
+                            Err(_) => { broken = true; break; }
+                        }
+                    }
+                    if broken || flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    ch.send_audio_pcm(16000, 1, &pcm);
+                }
+            });
         }),
         ..Default::default()
     };
@@ -800,6 +844,10 @@ fn main() {
     let mut app = ViewerApp::new(client, proxy);
     event_loop.run_app(&mut app).expect("run app");
     stop_audio(&audio_slot);
-    stop_audio(&cam_slot);
-    stop_audio(&mic_slot);
+    if let Ok(mut g) = cam_stop_slot.lock() {
+        if let Some(f) = g.take() { f.store(true, Ordering::Relaxed); }
+    };
+    if let Ok(mut g) = mic_stop_slot.lock() {
+        if let Some(f) = g.take() { f.store(true, Ordering::Relaxed); }
+    };
 }

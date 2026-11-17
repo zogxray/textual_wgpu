@@ -63,9 +63,9 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
     private var activeTrack: AudioTrack? = null
     private val videoDecoders = ConcurrentHashMap<Int, VideoDecoderSlot>()
     @Volatile
-    private var camPumpActive = false
+    private var camSubId: Int = -1
     @Volatile
-    private var micPumpActive = false
+    private var micSubId: Int = -1
     @Volatile
     private var pendingCamMode = 0
     @Volatile
@@ -587,8 +587,9 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
     }
 
     override fun onCamCtl(mode: Int) {
-        camPumpActive = false
-        LocalMediaHelper.stopCamera()
+        val prev = camSubId
+        camSubId = -1
+        if (prev > 0) LocalMediaHelper.unsubscribeCamera(prev)
         if (mode <= 0) {
             TwLog.log("TwCam", "Peer stopped camera")
             return
@@ -602,12 +603,13 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
     }
 
     private fun startCameraPump(mode: Int) {
-        LocalMediaHelper.startCamera(applicationContext, mode)
-        camPumpActive = true
+        val sid = LocalMediaHelper.subscribeCamera(applicationContext, mode)
+        if (sid <= 0) return
+        camSubId = sid
         val t0 = System.nanoTime()
         Thread({
-            while (camPumpActive && sessionPtr != 0L) {
-                val pkt = LocalMediaHelper.takeCameraFrame() ?: break
+            while (camSubId == sid && sessionPtr != 0L) {
+                val pkt = LocalMediaHelper.takeCameraFrame(sid) ?: break
                 if (pkt.size > 1 && sessionPtr != 0L) {
                     val hdr = pkt[0].toInt() and 0xFF
                     val isKf = (hdr and 0x01) != 0
@@ -625,8 +627,9 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
     }
 
     override fun onMicCtl(mode: Int) {
-        micPumpActive = false
-        LocalMediaHelper.stopMic()
+        val prev = micSubId
+        micSubId = -1
+        if (prev > 0) LocalMediaHelper.unsubscribeMic(prev)
         if (mode <= 0) {
             TwLog.log("TwMic", "Peer stopped mic")
             return
@@ -640,19 +643,14 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
     }
 
     private fun startMicPump() {
-        LocalMediaHelper.startMic(applicationContext, 16000)
-        micPumpActive = true
+        val sid = LocalMediaHelper.subscribeMic(applicationContext, 16000)
+        if (sid <= 0) return
+        micSubId = sid
         Thread({
-            while (micPumpActive && sessionPtr != 0L) {
-                val pcm = LocalMediaHelper.popMicChunk()
-                if (pcm != null && pcm.isNotEmpty() && sessionPtr != 0L) {
+            while (micSubId == sid && sessionPtr != 0L) {
+                val pcm = LocalMediaHelper.takeMicChunk(sid) ?: break
+                if (pcm.isNotEmpty() && sessionPtr != 0L) {
                     TwBridge.nativeSendAudioPcm(sessionPtr, 16000, 1, pcm)
-                } else {
-                    try {
-                        Thread.sleep(20)
-                    } catch (_: InterruptedException) {
-                        break
-                    }
                 }
             }
         }, "tw-mic-tx").apply {
@@ -877,10 +875,12 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
     override fun onDestroy() {
         super.onDestroy()
         onAudioStop()
-        camPumpActive = false
-        micPumpActive = false
-        LocalMediaHelper.stopCamera()
-        LocalMediaHelper.stopMic()
+        val prevCam = camSubId
+        camSubId = -1
+        if (prevCam > 0) LocalMediaHelper.unsubscribeCamera(prevCam)
+        val prevMic = micSubId
+        micSubId = -1
+        if (prevMic > 0) LocalMediaHelper.unsubscribeMic(prevMic)
         for (slot in videoDecoders.values) {
             slot.close()
         }

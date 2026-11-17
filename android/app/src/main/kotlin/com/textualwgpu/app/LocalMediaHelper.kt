@@ -34,7 +34,9 @@ import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.atomic.AtomicInteger
 
 object TwLog {
     private val lines = ArrayDeque<String>(160)
@@ -505,10 +507,16 @@ object LocalMediaHelper {
         }
     }
 
-    // ── Camera2 + H.264 MediaCodec encoder (surface-to-NALU) ───────────────
-    private val camQueue = LinkedBlockingQueue<ByteArray>(32)
+    // ── Multi-subscriber Camera2 + H.264 MediaCodec resource hub ───────────
+    private val camSubs = ConcurrentHashMap<Int, LinkedBlockingQueue<ByteArray>>()
+    private val camSubSeq = AtomicInteger(1)
+    private val camLock = Any()
     @Volatile
     private var camActive = false
+    @Volatile
+    private var camFacing = 1
+    @Volatile
+    private var lastCamKf: ByteArray? = null
     private var camDevice: CameraDevice? = null
     private var camSession: CameraCaptureSession? = null
     private var camEncoder: MediaCodec? = null
@@ -517,15 +525,58 @@ object LocalMediaHelper {
     private var camDrainThread: Thread? = null
 
     @JvmStatic
-    @SuppressLint("MissingPermission")
-    fun startCamera(ctx: Context, facing: Int = 1) {
-        stopCamera()
+    fun subscribeCamera(ctx: Context, facing: Int = 1): Int {
         if (ctx.checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             TwLog.err("TwCam", "CAMERA permission not granted")
-            return
+            return -1
         }
+        synchronized(camLock) {
+            val sid = camSubSeq.getAndIncrement()
+            val q = LinkedBlockingQueue<ByteArray>(32)
+            camSubs[sid] = q
+            if (camActive && camFacing == facing) {
+                lastCamKf?.let { q.offer(it) }
+                TwLog.log("TwCam", "subscribeCamera #$sid reused active Camera2 (subs=${camSubs.size})")
+                return sid
+            }
+            if (camActive && camFacing != facing) {
+                stopCameraHardwareLocked()
+            }
+            startCameraHardwareLocked(ctx, facing)
+            TwLog.log("TwCam", "subscribeCamera #$sid started Camera2 facing=$facing (subs=${camSubs.size})")
+            return sid
+        }
+    }
+
+    @JvmStatic
+    fun takeCameraFrame(subId: Int): ByteArray? {
+        val q = camSubs[subId] ?: return null
+        return try {
+            val pkt = q.take()
+            if (pkt.isEmpty() || !camSubs.containsKey(subId)) null else pkt
+        } catch (_: InterruptedException) {
+            null
+        }
+    }
+
+    @JvmStatic
+    fun unsubscribeCamera(subId: Int) {
+        synchronized(camLock) {
+            val q = camSubs.remove(subId)
+            q?.clear()
+            q?.offer(ByteArray(0))
+            if (camSubs.isEmpty() && camActive) {
+                stopCameraHardwareLocked()
+                TwLog.log("TwCam", "All camera subscribers left; Camera2 released")
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startCameraHardwareLocked(ctx: Context, facing: Int) {
         camActive = true
-        camQueue.clear()
+        camFacing = facing
+        lastCamKf = null
         val bgThread = HandlerThread("tw-cam-bg").apply { start() }
         camBgThread = bgThread
         val handler = Handler(bgThread.looper)
@@ -533,12 +584,12 @@ object LocalMediaHelper {
         try {
             val mgr = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
             val wantLens = if (facing >= 2) CameraCharacteristics.LENS_FACING_BACK else CameraCharacteristics.LENS_FACING_FRONT
-            var camId = mgr.cameraIdList.firstOrNull { id ->
+            val camId = mgr.cameraIdList.firstOrNull { id ->
                 mgr.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) == wantLens
             } ?: mgr.cameraIdList.firstOrNull()
             if (camId == null) {
                 TwLog.err("TwCam", "No camera device found")
-                stopCamera()
+                stopCameraHardwareLocked()
                 return
             }
 
@@ -593,13 +644,16 @@ object LocalMediaHelper {
                                     val pkt = ByteArray(1 + au.size)
                                     pkt[0] = ((if (isKf) 1 else 0) or (rotIdx shl 1)).toByte()
                                     System.arraycopy(au, 0, pkt, 1, au.size)
-                                    if (!camQueue.offer(pkt)) {
-                                        camQueue.poll()
-                                        camQueue.offer(pkt)
+                                    if (isKf) lastCamKf = pkt
+                                    for (q in camSubs.values) {
+                                        if (!q.offer(pkt)) {
+                                            q.poll()
+                                            q.offer(pkt)
+                                        }
                                     }
                                     frameCount++
                                     if (frameCount == 1L || frameCount % 120L == 0L) {
-                                        TwLog.log("TwCam", "encoded frame #$frameCount (${au.size}B, kf=$isKf)")
+                                        TwLog.log("TwCam", "encoded frame #$frameCount (${au.size}B, kf=$isKf, subs=${camSubs.size})")
                                     }
                                 }
                             }
@@ -626,8 +680,8 @@ object LocalMediaHelper {
                         }
                         camDevice = camera
                         try {
-                            val chars = mgr.getCameraCharacteristics(camId)
-                            val ranges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                            val chars2 = mgr.getCameraCharacteristics(camId)
+                            val ranges = chars2.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
                             val bestRange = ranges
                                 ?.filter { it.upper in 24..30 }
                                 ?.maxWithOrNull(compareBy({ it.lower }, { it.upper }))
@@ -679,29 +733,12 @@ object LocalMediaHelper {
             )
         } catch (t: Throwable) {
             TwLog.err("TwCam", "startCamera failed", t)
-            stopCamera()
+            stopCameraHardwareLocked()
         }
     }
 
-    @JvmStatic
-    fun popCameraFrame(): ByteArray? = camQueue.poll()
-
-    @JvmStatic
-    fun takeCameraFrame(): ByteArray? {
-        if (!camActive) return null
-        return try {
-            val pkt = camQueue.take()
-            if (!camActive || pkt.isEmpty()) null else pkt
-        } catch (_: InterruptedException) {
-            null
-        }
-    }
-
-    @JvmStatic
-    fun stopCamera() {
+    private fun stopCameraHardwareLocked() {
         camActive = false
-        camQueue.clear()
-        camQueue.offer(ByteArray(0))
         camDrainThread?.interrupt()
         camDrainThread = null
         try { camSession?.close() } catch (_: Throwable) {}
@@ -715,23 +752,62 @@ object LocalMediaHelper {
         camInputSurface = null
         try { camBgThread?.quitSafely() } catch (_: Throwable) {}
         camBgThread = null
-        camQueue.clear()
+        lastCamKf = null
     }
 
-    // ── Android Microphone (AudioRecord 16kHz PCM16) ───────────────────────
-    private val micQueue = LinkedBlockingQueue<ByteArray>(32)
+    // ── Multi-subscriber Android Microphone (AudioRecord 16kHz PCM16) ──────
+    private val micSubs = ConcurrentHashMap<Int, LinkedBlockingQueue<ByteArray>>()
+    private val micSubSeq = AtomicInteger(1)
+    private val micLock = Any()
     @Volatile
     private var micActive = false
     private var micThread: Thread? = null
 
     @JvmStatic
-    @SuppressLint("MissingPermission")
-    fun startMic(ctx: Context, sampleRate: Int = 16000) {
-        stopMic()
+    fun subscribeMic(ctx: Context, sampleRate: Int = 16000): Int {
         if (ctx.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             TwLog.err("TwMic", "RECORD_AUDIO permission not granted")
-            return
+            return -1
         }
+        synchronized(micLock) {
+            val sid = micSubSeq.getAndIncrement()
+            micSubs[sid] = LinkedBlockingQueue(32)
+            if (!micActive) {
+                startMicHardwareLocked(sampleRate)
+            }
+            TwLog.log("TwMic", "subscribeMic #$sid (subs=${micSubs.size})")
+            return sid
+        }
+    }
+
+    @JvmStatic
+    fun takeMicChunk(subId: Int): ByteArray? {
+        val q = micSubs[subId] ?: return null
+        return try {
+            val pkt = q.take()
+            if (pkt.isEmpty() || !micSubs.containsKey(subId)) null else pkt
+        } catch (_: InterruptedException) {
+            null
+        }
+    }
+
+    @JvmStatic
+    fun unsubscribeMic(subId: Int) {
+        synchronized(micLock) {
+            val q = micSubs.remove(subId)
+            q?.clear()
+            q?.offer(ByteArray(0))
+            if (micSubs.isEmpty() && micActive) {
+                micActive = false
+                micThread?.interrupt()
+                micThread = null
+                TwLog.log("TwMic", "All mic subscribers left; AudioRecord released")
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startMicHardwareLocked(sampleRate: Int) {
         val minBuf = AudioRecord.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_IN_MONO,
@@ -755,7 +831,6 @@ object LocalMediaHelper {
             return
         }
         micActive = true
-        micQueue.clear()
         micThread = Thread({
             val chunk = ByteArray(2560) // 80ms @ 16kHz mono s16le
             try {
@@ -770,9 +845,11 @@ object LocalMediaHelper {
                     }
                     if (off == chunk.size) {
                         val copy = chunk.copyOf()
-                        if (!micQueue.offer(copy)) {
-                            micQueue.poll()
-                            micQueue.offer(copy)
+                        for (q in micSubs.values) {
+                            if (!q.offer(copy)) {
+                                q.poll()
+                                q.offer(copy)
+                            }
                         }
                     }
                 }
@@ -786,16 +863,5 @@ object LocalMediaHelper {
             isDaemon = true
             start()
         }
-    }
-
-    @JvmStatic
-    fun popMicChunk(): ByteArray? = micQueue.poll()
-
-    @JvmStatic
-    fun stopMic() {
-        micActive = false
-        micThread?.interrupt()
-        micThread = null
-        micQueue.clear()
     }
 }

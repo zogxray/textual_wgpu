@@ -262,10 +262,11 @@ async def test_client_file_upload_and_media_screen_file_loading(monkeypatch, tmp
         app._open_file_activate()
 
         # Drain FS_LIST -> viewer responds with FS_ENTRIES -> modal populates peer folders!
-        for _ in range(25):
+        for _ in range(60):
             f = await asyncio.wait_for(viewer.transport.recv(), timeout=2.0)
             assert f is not None
             viewer.handle_frame(f)
+            await asyncio.sleep(0.005)
             if any(e[0] == "peer_dir" and e[1] != "" for e in (getattr(app, "_open_file", None) or {}).get("entries", [])):
                 break
         assert any(e[0] == "peer_dir" for e in app._open_file["entries"])
@@ -490,3 +491,69 @@ def test_camera_source_discovery_adapts_to_host_os(monkeypatch):
     scr._cam_mode = "peer"
     scr.on_screen_pause()
     assert scr._cam_mode is None and scr._mic_mode is None
+
+
+def test_media_hub_fanout_and_two_simultaneous_camera_subscribers(tmp_path: Path):
+    import socket
+    import time
+    from textual_wgpu.remote.media_codec import LocalCameraStreamer, list_linux_cameras
+    from textual_wgpu.remote.media_hub import HUB_PKT_STRUCT, _BroadcastHub
+
+    # 1) Unit test _BroadcastHub late-joiner keyframe cache & multi-subscriber fanout
+    sock_p = tmp_path / "hub.sock"
+    hub = _BroadcastHub(sock_p, idle_timeout=0.5, startup_grace=2.0)
+    hub.start_accepting()
+    try:
+        sps_idr = b"\x00\x00\x00\x01\x67\x42\x00\x1e\x00\x00\x00\x01\x65KF1"
+        hub.publish(100, 0x11, sps_idr, is_keyframe=True, codec_flag=0x10)
+
+        c1 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c2 = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        c1.connect(str(sock_p))
+        c2.connect(str(sock_p))
+        c1.settimeout(1.0)
+        c2.settimeout(1.0)
+        try:
+            for c in (c1, c2):
+                hdr = c.recv(HUB_PKT_STRUCT.size)
+                pts, fl, plen = HUB_PKT_STRUCT.unpack(hdr)
+                assert pts == 100 and (fl & 0x01) == 1
+                assert c.recv(plen) == sps_idr
+
+            hub.publish(200, 0x10, b"\x00\x00\x00\x01\x41P2", is_keyframe=False, codec_flag=0x10)
+            for c in (c1, c2):
+                hdr = c.recv(HUB_PKT_STRUCT.size)
+                pts, _fl, plen = HUB_PKT_STRUCT.unpack(hdr)
+                assert pts == 200 and c.recv(plen) == b"\x00\x00\x00\x01\x41P2"
+        finally:
+            c1.close()
+            c2.close()
+    finally:
+        hub.close()
+
+    # 2) If a real V4L2 camera is free on this host, verify TWO LocalCameraStreamers share it simultaneously!
+    cams = list_linux_cameras()
+    if cams:
+        import shutil
+        import subprocess
+
+        dev = cams[0][0]
+        busy = False
+        if shutil.which("fuser"):
+            busy = subprocess.run(["fuser", dev], capture_output=True).returncode == 0
+        if not busy:
+            s1 = LocalCameraStreamer(device=dev)
+            s2 = LocalCameraStreamer(device=dev)
+            try:
+                got1 = []
+                got2 = []
+                for _ in range(40):
+                    got1.extend(s1.pop_aus())
+                    got2.extend(s2.pop_aus())
+                    if got1 and got2:
+                        break
+                    time.sleep(0.05)
+                assert len(got1) >= 1 and len(got2) >= 1
+            finally:
+                s1.close()
+                s2.close()

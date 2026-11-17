@@ -741,7 +741,7 @@ def list_linux_cameras() -> list[tuple[str, str]]:
 
 
 class LocalCameraStreamer:
-    """Captures local camera (/dev/video* on Linux, Camera2+MediaCodec on Android) to NALUs/RGBA."""
+    """Subscribes to the shared local camera resource hub (Linux media_hub or Android Camera2 hub)."""
 
     def __init__(
         self,
@@ -759,89 +759,45 @@ class LocalCameraStreamer:
         self.fps = int(fps)
         self.facing = int(facing)
         self.rotation = 0
+        self._emit_rgba = bool(emit_rgba)
         self._on_frame = on_frame
         self._aus: deque[tuple[bytes, bool]] = deque(maxlen=64)
-        self._rgba_frames: deque[tuple[int, int, bytes]] = deque(maxlen=8)
         self._lock = threading.Lock()
         self._closed = False
-        self._procs: list[subprocess.Popen] = []
-        self._android_active = False
+        self._sock: Any = None
+        self._decoder: StreamVideoDecoder | None = None
+        self._android_sub_id: int | None = None
 
-        ff = shutil.which("ffmpeg")
-        if not ff:
-            helper = _android_media_helper()
-            if helper is None:
-                raise RuntimeError("No ffmpeg or Android Camera2 available")
+        helper = _android_media_helper()
+        if helper is not None and not shutil.which("ffmpeg"):
             from com.textualwgpu.app import LocalPythonHost  # type: ignore[import-not-found]
 
             ctx = LocalPythonHost.appContext
             if ctx is None:
                 raise RuntimeError("Android context not initialized")
-            helper.startCamera(ctx, self.facing)
-            self._android_active = True
+            sub_id = int(helper.subscribeCamera(ctx, self.facing))
+            if sub_id <= 0:
+                raise RuntimeError("Android camera permission or hardware unavailable")
+            self._android_sub_id = sub_id
             self.codec_flag = VID_CODEC_H264
-            threading.Thread(target=self._read_android_loop, args=(helper,), daemon=True).start()
+            threading.Thread(target=self._read_android_loop, args=(helper, sub_id), daemon=True).start()
             return
 
         dev = device or (list_linux_cameras()[0][0] if list_linux_cameras() else "/dev/video0")
         self.device = dev
         if not Path(dev).exists():
             raise RuntimeError(f"No {dev} camera device found")
-        vf = f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease:force_divisible_by=2"
-        if emit_rgba:
-            # Local WgpuDriver mode: single V4L2 reader outputting PAM RGBA
-            self.codec_flag = 0
-            cmd_pam = [
-                ff, "-y", "-loglevel", "error",
-                "-f", "v4l2", "-framerate", str(self.fps), "-i", dev,
-                "-vf", vf,
-                "-f", "image2pipe", "-vcodec", "pam", "-pix_fmt", "rgba", "pipe:1",
-            ]
-            p_pam = subprocess.Popen(cmd_pam, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            self._procs.append(p_pam)
-            threading.Thread(target=self._drain_stderr, args=(p_pam,), daemon=True).start()
-            threading.Thread(target=self._read_pam_loop, args=(p_pam,), daemon=True).start()
-            return
 
-        # Remote streaming mode: single V4L2 reader outputting H.264/HEVC Annex-B NALUs
-        found = probe_video_encoder(("h264", "hevc"))
-        if found is None:
-            raise RuntimeError("No working H.264/HEVC encoder for camera")
-        enc_name, self.codec_flag = found
-        fmt = codec_flag_to_fmt(self.codec_flag)
-        cmd_nalu = [ff, "-y", "-loglevel", "error"]
-        if enc_name.endswith("_vaapi"):
-            cmd_nalu.extend(["-vaapi_device", "/dev/dri/renderD128"])
-        cmd_nalu.extend(["-f", "v4l2", "-framerate", str(self.fps), "-i", dev])
-        if enc_name.endswith("_vaapi"):
-            cmd_nalu.extend(["-vf", f"{vf},format=nv12,hwupload"])
-        else:
-            cmd_nalu.extend(["-vf", vf, "-pix_fmt", "yuv420p"])
-        cmd_nalu.extend(["-c:v", enc_name, *_encoder_extra_args(enc_name), "-f", fmt, "pipe:1"])
-        p_nalu = subprocess.Popen(cmd_nalu, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        self._procs.append(p_nalu)
-        self._chunker = AnnexBChunker(self.codec_flag)
-        threading.Thread(target=self._drain_stderr, args=(p_nalu,), daemon=True).start()
-        threading.Thread(target=self._read_nalu_loop, args=(p_nalu,), daemon=True).start()
+        from .media_hub import connect_camera_hub
 
-    def _drain_stderr(self, proc: subprocess.Popen) -> None:
-        err = proc.stderr
-        if err is None:
-            return
-        try:
-            for raw_ln in err:
-                txt = raw_ln.decode("utf-8", errors="replace").strip()
-                if txt:
-                    from .server_driver import rlog
+        self._sock = connect_camera_hub(dev, width=self.width, height=self.height, fps=self.fps)
+        self.codec_flag = VID_CODEC_H264
+        threading.Thread(target=self._read_hub_loop, daemon=True).start()
 
-                    rlog("CAM", f"ffmpeg: {txt}")
-        except Exception:  # noqa: BLE001
-            pass
-
-    def _read_android_loop(self, helper: Any) -> None:
+    def _read_android_loop(self, helper: Any, sub_id: int) -> None:
         try:
             while not self._closed:
-                pkt = helper.takeCameraFrame()
+                pkt = helper.takeCameraFrame(sub_id)
                 if pkt is None:
                     break
                 raw = bytes(pkt)
@@ -858,62 +814,47 @@ class LocalCameraStreamer:
         except Exception:  # noqa: BLE001
             pass
 
-    def _read_nalu_loop(self, proc: subprocess.Popen) -> None:
-        out = proc.stdout
-        if out is None:
-            return
-        fd = out.fileno()
-        try:
-            while not self._closed:
-                chunk = os.read(fd, 65536)
-                if not chunk:
-                    break
-                aus = self._chunker.feed(chunk)
-                if aus:
-                    with self._lock:
-                        self._aus.extend(aus)
-                    if callable(self._on_frame):
-                        self._on_frame()
-        except Exception:  # noqa: BLE001
-            pass
+    def _read_hub_loop(self) -> None:
+        from .media_hub import HUB_PKT_STRUCT
 
-    def _read_pam_loop(self, proc: subprocess.Popen) -> None:
-        out = proc.stdout
-        if out is None:
+        sock = self._sock
+        if sock is None:
             return
-        fd = out.fileno()
-        buf = bytearray()
+        hdr_sz = HUB_PKT_STRUCT.size
+
+        def _recv_exact(n: int) -> bytes | None:
+            buf = bytearray()
+            while len(buf) < n and not self._closed:
+                chunk = sock.recv(n - len(buf))
+                if not chunk:
+                    return None
+                buf.extend(chunk)
+            return bytes(buf) if len(buf) == n else None
+
         try:
             while not self._closed:
-                chunk = os.read(fd, 65536)
-                if not chunk:
+                hdr = _recv_exact(hdr_sz)
+                if hdr is None:
                     break
-                buf.extend(chunk)
-                while True:
-                    end_hdr = buf.find(b"ENDHDR\n")
-                    if end_hdr < 0:
-                        break
-                    hdr_txt = buf[:end_hdr].decode("ascii", errors="ignore")
-                    w = h = 0
-                    for ln in hdr_txt.splitlines():
-                        if ln.startswith("WIDTH "):
-                            w = int(ln.split()[1])
-                        elif ln.startswith("HEIGHT "):
-                            h = int(ln.split()[1])
-                    body_start = end_hdr + 7
-                    need = w * h * 4
-                    if w <= 0 or h <= 0:
-                        del buf[:body_start]
-                        continue
-                    if len(buf) < body_start + need:
-                        break
-                    rgba = bytes(buf[body_start : body_start + need])
-                    del buf[: body_start + need]
+                _pts, flags, plen = HUB_PKT_STRUCT.unpack(hdr)
+                au = _recv_exact(plen) if plen > 0 else b""
+                if au is None:
+                    break
+                is_kf = bool(flags & 0x01)
+                cflag = flags & 0xF0
+                if cflag:
+                    self.codec_flag = cflag
+                if self._emit_rgba:
+                    if self._decoder is None and cflag:
+                        self._decoder = StreamVideoDecoder(cflag)
+                    if self._decoder is not None:
+                        self._decoder.feed(au)
+                else:
                     with self._lock:
-                        self._rgba_frames.append((w, h, rgba))
-                    if callable(self._on_frame):
-                        self._on_frame()
-        except Exception:  # noqa: BLE001
+                        self._aus.append((au, is_kf))
+                if callable(self._on_frame):
+                    self._on_frame()
+        except OSError:
             pass
 
     def pop_aus(self) -> list[tuple[bytes, bool]]:
@@ -923,37 +864,36 @@ class LocalCameraStreamer:
             return out
 
     def pop_rgba(self) -> tuple[int, int, bytes] | None:
-        with self._lock:
-            if not self._rgba_frames:
-                return None
-            while len(self._rgba_frames) > 1:
-                self._rgba_frames.popleft()
-            return self._rgba_frames.popleft()
+        if self._decoder is not None:
+            return self._decoder.latest_frame()
+        return None
 
     def close(self) -> None:
         self._closed = True
-        if self._android_active:
+        if self._android_sub_id is not None:
             helper = _android_media_helper()
             if helper is not None:
                 try:
-                    helper.stopCamera()
+                    helper.unsubscribeCamera(self._android_sub_id)
                 except Exception:  # noqa: BLE001
                     pass
-            self._android_active = False
-        for p in self._procs:
+            self._android_sub_id = None
+        if self._sock is not None:
             try:
-                p.terminate()
-                p.wait(timeout=0.5)
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+        if self._decoder is not None:
+            try:
+                self._decoder.close()
             except Exception:  # noqa: BLE001
-                try:
-                    p.kill()
-                except Exception:  # noqa: BLE001
-                    pass
-        self._procs.clear()
+                pass
+            self._decoder = None
 
 
 class LocalMicCapture:
-    """Captures mono 16kHz PCM16 microphone chunks on Linux (pw-record/parecord/arecord) or Android."""
+    """Subscribes to the shared local microphone hub (Linux media_hub or Android AudioRecord hub)."""
 
     def __init__(self, *, sample_rate: int = 16000, channels: int = 1, chunk_ms: int = 80) -> None:
         self.sample_rate = int(sample_rate)
@@ -962,78 +902,65 @@ class LocalMicCapture:
         self._chunks: deque[bytes] = deque(maxlen=64)
         self._lock = threading.Lock()
         self._closed = False
-        self._proc: subprocess.Popen | None = None
-        self._android_active = False
-
-        cmd = None
-        if shutil.which("pw-record"):
-            cmd = [
-                "pw-record", "--format=s16",
-                f"--rate={self.sample_rate}", f"--channels={self.channels}", "-",
-            ]
-        elif shutil.which("parecord"):
-            cmd = [
-                "parecord", "--raw", "--format=s16le",
-                f"--rate={self.sample_rate}", f"--channels={self.channels}",
-            ]
-        elif shutil.which("arecord"):
-            cmd = [
-                "arecord", "-q", "-t", "raw", "-f", "S16_LE",
-                "-r", str(self.sample_rate), "-c", str(self.channels), "-",
-            ]
-        elif shutil.which("ffmpeg"):
-            cmd = [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-f", "pulse", "-i", "default",
-                "-f", "s16le", "-ac", str(self.channels), "-ar", str(self.sample_rate), "pipe:1",
-            ]
-
-        if cmd is not None:
-            self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            threading.Thread(target=self._read_proc_loop, daemon=True).start()
-            return
+        self._sock: Any = None
+        self._android_sub_id: int | None = None
 
         helper = _android_media_helper()
-        if helper is not None:
+        if helper is not None and not shutil.which("pw-record") and not shutil.which("arecord"):
             from com.textualwgpu.app import LocalPythonHost  # type: ignore[import-not-found]
 
             ctx = LocalPythonHost.appContext
             if ctx is not None:
-                helper.startMic(ctx, self.sample_rate)
-                self._android_active = True
-                threading.Thread(target=self._read_android_loop, args=(helper,), daemon=True).start()
-                return
-        raise RuntimeError("No microphone capture backend (pw-record/parecord/arecord/Android AudioRecord)")
+                sub_id = int(helper.subscribeMic(ctx, self.sample_rate))
+                if sub_id > 0:
+                    self._android_sub_id = sub_id
+                    threading.Thread(target=self._read_android_loop, args=(helper, sub_id), daemon=True).start()
+                    return
+            raise RuntimeError("Android microphone permission or hardware unavailable")
 
-    def _read_proc_loop(self) -> None:
-        out = self._proc.stdout if self._proc else None
-        if out is None:
+        from .media_hub import connect_mic_hub
+
+        self._sock = connect_mic_hub(sample_rate=self.sample_rate)
+        threading.Thread(target=self._read_hub_loop, daemon=True).start()
+
+    def _read_hub_loop(self) -> None:
+        from .media_hub import HUB_PKT_STRUCT
+
+        sock = self._sock
+        if sock is None:
             return
-        fd = out.fileno()
-        buf = bytearray()
+        hdr_sz = HUB_PKT_STRUCT.size
+
+        def _recv_exact(n: int) -> bytes | None:
+            buf = bytearray()
+            while len(buf) < n and not self._closed:
+                chunk = sock.recv(n - len(buf))
+                if not chunk:
+                    return None
+                buf.extend(chunk)
+            return bytes(buf) if len(buf) == n else None
+
         try:
             while not self._closed:
-                chunk = os.read(fd, self.chunk_bytes)
-                if not chunk:
+                hdr = _recv_exact(hdr_sz)
+                if hdr is None:
                     break
-                buf.extend(chunk)
-                while len(buf) >= self.chunk_bytes:
-                    piece = bytes(buf[: self.chunk_bytes])
-                    del buf[: self.chunk_bytes]
+                _pts, _fl, plen = HUB_PKT_STRUCT.unpack(hdr)
+                pcm = _recv_exact(plen) if plen > 0 else b""
+                if pcm is None:
+                    break
+                if pcm:
                     with self._lock:
-                        self._chunks.append(piece)
-        except Exception:  # noqa: BLE001
+                        self._chunks.append(pcm)
+        except OSError:
             pass
 
-    def _read_android_loop(self, helper: Any) -> None:
-        import time
-
+    def _read_android_loop(self, helper: Any, sub_id: int) -> None:
         try:
             while not self._closed:
-                pcm = helper.popMicChunk()
+                pcm = helper.takeMicChunk(sub_id)
                 if pcm is None:
-                    time.sleep(0.02)
-                    continue
+                    break
                 b = bytes(pcm)
                 if b:
                     with self._lock:
@@ -1049,17 +976,17 @@ class LocalMicCapture:
 
     def close(self) -> None:
         self._closed = True
-        if self._android_active:
+        if self._android_sub_id is not None:
             helper = _android_media_helper()
             if helper is not None:
                 try:
-                    helper.stopMic()
+                    helper.unsubscribeMic(self._android_sub_id)
                 except Exception:  # noqa: BLE001
                     pass
-            self._android_active = False
-        if self._proc is not None:
+            self._android_sub_id = None
+        if self._sock is not None:
             try:
-                self._proc.terminate()
-            except Exception:  # noqa: BLE001
+                self._sock.close()
+            except OSError:
                 pass
-            self._proc = None
+            self._sock = None
