@@ -2,6 +2,8 @@ package com.textualwgpu.app
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentUris
 import android.content.Context
 import android.content.pm.PackageManager
@@ -10,8 +12,10 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
+import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaExtractor
@@ -22,6 +26,7 @@ import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.provider.Settings
@@ -867,6 +872,75 @@ object LocalMediaHelper {
         }, "tw-mic").apply {
             isDaemon = true
             start()
+        }
+    }
+
+    @Volatile
+    private var clipCache: String = ""
+
+    @JvmStatic
+    fun getClipboardText(ctx: Context): String {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        var result = clipCache
+        Handler(Looper.getMainLooper()).post {
+            try {
+                val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val txt = cm.primaryClip?.getItemAt(0)?.coerceToText(ctx)?.toString()
+                if (txt != null) {
+                    clipCache = txt
+                    result = txt
+                }
+            } catch (_: Throwable) {
+            } finally {
+                latch.countDown()
+            }
+        }
+        try {
+            latch.await(600, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+        }
+        return result
+    }
+
+    @JvmStatic
+    fun setClipboardText(ctx: Context, text: String) {
+        clipCache = text
+        Handler(Looper.getMainLooper()).post {
+            try {
+                val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("textual-wgpu", text))
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    @JvmStatic
+    fun createSpeakerTrack(sampleRate: Int = 16000, channels: Int = 1): AudioTrack? {
+        val sr = sampleRate.coerceIn(8000, 48000)
+        val chMask = if (channels >= 2) AudioFormat.CHANNEL_OUT_STEREO else AudioFormat.CHANNEL_OUT_MONO
+        val minBuf = AudioTrack.getMinBufferSize(sr, chMask, AudioFormat.ENCODING_PCM_16BIT).coerceAtLeast(4096)
+        return try {
+            AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build(),
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sr)
+                        .setChannelMask(chMask)
+                        .build(),
+                )
+                .setBufferSizeInBytes(minBuf * 2)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+                .apply { play() }
+        } catch (t: Throwable) {
+            TwLog.err("TwSpk", "AudioTrack init failed", t)
+            null
         }
     }
 }

@@ -449,8 +449,46 @@ def _list_local_fs(req_path: str) -> list[dict[str, Any]]:
     return out
 
 
+class _LocalSpeakerProcess:
+    """Writes raw PCM16 chunks to the Linux audio sink (pw-play / paplay / aplay)."""
+
+    def __init__(self, sample_rate: int = 16000, channels: int = 1) -> None:
+        sr = max(8000, int(sample_rate))
+        ch = max(1, min(2, int(channels)))
+        cmd = None
+        if shutil.which("pw-play"):
+            cmd = ["pw-play", "--format=s16", f"--rate={sr}", f"--channels={ch}", "-"]
+        elif shutil.which("paplay"):
+            cmd = ["paplay", "--raw", "--format=s16le", f"--rate={sr}", f"--channels={ch}"]
+        elif shutil.which("aplay"):
+            cmd = ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", str(sr), "-c", str(ch), "-"]
+        self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) if cmd else None
+
+    def write(self, pcm: bytes) -> None:
+        if self._proc is not None and self._proc.stdin is not None and pcm:
+            try:
+                self._proc.stdin.write(pcm)
+                self._proc.stdin.flush()
+            except OSError:
+                pass
+
+    def close(self) -> None:
+        if self._proc is not None:
+            try:
+                if self._proc.stdin is not None:
+                    self._proc.stdin.close()
+            except OSError:
+                pass
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=0.3)
+            except Exception:  # noqa: BLE001
+                pass
+            self._proc = None
+
+
 class ResourceServer:
-    """Independent per-device TCP Resource Service (cameras, mic, files) on 127.0.0.1:7423."""
+    """Independent per-device TCP Resource Service (cameras, mic, speaker, clipboard, files, AI, sessions)."""
 
     def __init__(
         self,
@@ -460,6 +498,10 @@ class ResourceServer:
         profile_fn: Callable[[], Any] | None = None,
         camera_connector: Callable[[str], socket.socket] | None = None,
         mic_connector: Callable[[], socket.socket] | None = None,
+        speaker_sink_factory: Callable[[int, int], Any] | None = None,
+        ai_providers_fn: Callable[[], list[Any]] | None = None,
+        ai_infer_fn: Callable[..., str] | None = None,
+        session_broker: Any | None = None,
         fs_root: Path | None = None,
     ) -> None:
         self.host = host
@@ -467,10 +509,58 @@ class ResourceServer:
         self._profile_fn = profile_fn
         self._camera_connector = camera_connector or connect_camera_hub
         self._mic_connector = mic_connector or connect_mic_hub
+        self._speaker_sink_factory = speaker_sink_factory or (lambda sr, ch: _LocalSpeakerProcess(sr, ch))
+        self._ai_providers_fn = ai_providers_fn
+        self._ai_infer_fn = ai_infer_fn
+        self._session_broker = session_broker
         self._fs_root = fs_root
+        self._clip_lock = threading.Lock()
+        self._clip_buf = ""
         self._srv: socket.socket | None = None
         self._closed = False
         self._port = 0
+
+    def _get_broker(self) -> Any:
+        if self._session_broker is None:
+            from .session_broker import SessionBroker
+
+            self._session_broker = SessionBroker()
+        return self._session_broker
+
+    def _get_ai_providers(self) -> list[Any]:
+        if self._ai_providers_fn is not None:
+            return list(self._ai_providers_fn())
+        from .ai_resource import discover_local_ai_providers
+
+        return discover_local_ai_providers()
+
+    def _clip_read(self) -> str:
+        if not os.environ.get("PYTEST_CURRENT_TEST"):
+            for cmd in (["wl-paste", "--no-newline"], ["xclip", "-selection", "clipboard", "-o"], ["xsel", "-ob"]):
+                if shutil.which(cmd[0]):
+                    try:
+                        res = subprocess.run(cmd, capture_output=True, timeout=0.6)
+                        if res.returncode == 0:
+                            txt = res.stdout.decode("utf-8", errors="replace")
+                            with self._clip_lock:
+                                self._clip_buf = txt
+                            return txt
+                    except Exception:  # noqa: BLE001
+                        pass
+        with self._clip_lock:
+            return self._clip_buf
+
+    def _clip_write(self, text: str) -> None:
+        with self._clip_lock:
+            self._clip_buf = text
+        if not os.environ.get("PYTEST_CURRENT_TEST"):
+            for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "-ib"]):
+                if shutil.which(cmd[0]):
+                    try:
+                        subprocess.run(cmd, input=text.encode("utf-8"), capture_output=True, timeout=0.6)
+                        return
+                    except Exception:  # noqa: BLE001
+                        pass
 
     @property
     def port(self) -> int:
@@ -511,7 +601,11 @@ class ResourceServer:
         ]
         if getattr(prof, "has_mic", True):
             resources.append({"kind": "mic", "id": "default", "label": "Microphone"})
+        resources.append({"kind": "speaker", "id": "default", "label": "Speaker"})
+        resources.append({"kind": "clipboard", "id": "default", "label": "Clipboard"})
         resources.append({"kind": "files", "id": "fs", "label": "Files & Media"})
+        for p in self._get_ai_providers():
+            resources.append({"kind": "ai", "id": p.resource_id, "label": p.label})
         return {
             "ok": True,
             "device": {
@@ -525,7 +619,7 @@ class ResourceServer:
 
     def _handle_conn(self, conn: socket.socket) -> None:
         try:
-            conn.settimeout(5.0)
+            conn.settimeout(10.0)
             line = _read_line(conn)
             if not line:
                 return
@@ -555,6 +649,91 @@ class ResourceServer:
                 conn.sendall(hdr.encode("utf-8"))
                 conn.sendall(data)
                 return
+            if op == "clip_get":
+                conn.sendall((json.dumps({"ok": True, "text": self._clip_read()}) + "\n").encode("utf-8"))
+                return
+            if op == "clip_set":
+                self._clip_write(str(req.get("text") or ""))
+                conn.sendall(b'{"ok":true}\n')
+                return
+            if op == "play":
+                sr = int(req.get("sr") or 16000)
+                ch = int(req.get("ch") or 1)
+                sink = self._speaker_sink_factory(sr, ch)
+                conn.settimeout(None)
+                conn.sendall(b'{"ok":true}\n')
+                hdr_sz = HUB_PKT_STRUCT.size
+                try:
+                    while not self._closed:
+                        hdr = _recv_exact(conn, hdr_sz)
+                        if hdr is None:
+                            break
+                        _pts, _fl, plen = HUB_PKT_STRUCT.unpack(hdr)
+                        if plen > 4 * 1024 * 1024:
+                            break
+                        pcm = _recv_exact(conn, plen) if plen > 0 else b""
+                        if pcm is None:
+                            break
+                        if pcm:
+                            sink.write(pcm)
+                finally:
+                    try:
+                        sink.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                return
+            if op == "ai_infer":
+                from .ai_resource import run_ai_inference
+
+                model_id = str(req.get("model") or "builtin:analyzer")
+                prompt = str(req.get("prompt") or "")
+                context = str(req.get("context") or "")
+                image_b64 = str(req.get("image_b64") or "")
+                providers = self._get_ai_providers()
+                chosen = next((p for p in providers if p.resource_id == model_id), None)
+                if chosen is None and providers:
+                    chosen = providers[0]
+                conn.settimeout(60.0)
+
+                def _emit_tok(tok: str) -> None:
+                    conn.sendall((json.dumps({"token": tok}) + "\n").encode("utf-8"))
+
+                if self._ai_infer_fn is not None:
+                    full = self._ai_infer_fn(chosen, prompt, context=context, image_b64=image_b64, on_token=_emit_tok)
+                else:
+                    full = run_ai_inference(chosen, prompt, context=context, image_b64=image_b64, on_token=_emit_tok)
+                conn.sendall((json.dumps({"done": True, "text": full}) + "\n").encode("utf-8"))
+                return
+            if op == "sessions":
+                sessions = [s.to_dict() for s in self._get_broker().list_sessions()]
+                conn.sendall((json.dumps({"ok": True, "sessions": sessions}) + "\n").encode("utf-8"))
+                return
+            if op == "spawn_session":
+                app_id = str(req.get("app_id") or "demo")
+                args = str(req.get("args") or "")
+                w = int(req.get("width") or 1100)
+                h = int(req.get("height") or 720)
+                info = self._get_broker().spawn_session(app_id, args, width=w, height=h)
+                conn.sendall((json.dumps({"ok": True, "session": info.to_dict()}) + "\n").encode("utf-8"))
+                return
+            if op == "stop_session":
+                sid = str(req.get("session_id") or "")
+                ok = self._get_broker().stop_session(sid)
+                conn.sendall((json.dumps({"ok": ok}) + "\n").encode("utf-8"))
+                return
+            if op == "tunnel_tcp":
+                tport = int(req.get("port") or 0)
+                if tport <= 1024 or tport > 65535:
+                    conn.sendall(b'{"ok":false,"error":"invalid port"}\n')
+                    return
+                upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                upstream.settimeout(4.0)
+                upstream.connect(("127.0.0.1", tport))
+                upstream.settimeout(None)
+                conn.settimeout(None)
+                conn.sendall(b'{"ok":true}\n')
+                self._bridge_bidi(conn, upstream)
+                return
             if op == "sub":
                 kind = str(req.get("kind") or "")
                 rid = str(req.get("id") or "")
@@ -580,6 +759,33 @@ class ResourceServer:
                 conn.close()
             except OSError:
                 pass
+
+    def _bridge_bidi(self, a: socket.socket, b: socket.socket) -> None:
+        def _pipe(src: socket.socket, dst: socket.socket) -> None:
+            try:
+                while not self._closed:
+                    buf = src.recv(65536)
+                    if not buf:
+                        break
+                    dst.sendall(buf)
+            except OSError:
+                pass
+            finally:
+                try:
+                    dst.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+
+        t1 = threading.Thread(target=_pipe, args=(a, b), daemon=True)
+        t2 = threading.Thread(target=_pipe, args=(b, a), daemon=True)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        try:
+            b.close()
+        except OSError:
+            pass
 
     def _pump_stream(self, hub_sock: socket.socket, client_sock: socket.socket) -> None:
         stop_ev = threading.Event()
@@ -911,6 +1117,205 @@ class RemoteMicSubscriber:
         self._closed = True
         try:
             self._sock.close()
+        except OSError:
+            pass
+
+
+class RemoteSpeakerSink:
+    """Streams PCM16 audio out of any device's Speaker resource (local or remote over SSH)."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        sample_rate: int = 16000,
+        channels: int = 1,
+    ) -> None:
+        self.sample_rate = int(sample_rate)
+        self.channels = int(channels)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(4.0)
+        sock.connect((host, int(port)))
+        sock.sendall(
+            (json.dumps({"op": "play", "kind": "speaker", "sr": self.sample_rate, "ch": self.channels}) + "\n").encode("utf-8"),
+        )
+        line = _read_line(sock)
+        if not line:
+            sock.close()
+            raise RuntimeError("Empty response from speaker resource service")
+        meta = json.loads(line)
+        if not meta.get("ok"):
+            sock.close()
+            raise RuntimeError(str(meta.get("error") or "Speaker resource unavailable"))
+        sock.settimeout(None)
+        self._sock = sock
+        self._t0 = time.monotonic()
+
+    def write_pcm(self, pcm: bytes) -> None:
+        if not pcm:
+            return
+        pts_us = int((time.monotonic() - self._t0) * 1_000_000)
+        pkt = HUB_PKT_STRUCT.pack(pts_us, 1, len(pcm)) + pcm
+        self._sock.sendall(pkt)
+
+    def close(self) -> None:
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+
+def resource_clip_get(host: str, port: int, *, timeout: float = 2.0) -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, int(port)))
+        s.sendall(b'{"op":"clip_get"}\n')
+        line = _read_line(s)
+        if not line:
+            return ""
+        data = json.loads(line)
+        return str(data.get("text") or "") if data.get("ok") else ""
+    except (OSError, json.JSONDecodeError):
+        return ""
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def resource_clip_set(host: str, port: int, text: str, *, timeout: float = 2.0) -> bool:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, int(port)))
+        s.sendall((json.dumps({"op": "clip_set", "text": text}) + "\n").encode("utf-8"))
+        line = _read_line(s)
+        if not line:
+            return False
+        data = json.loads(line)
+        return bool(data.get("ok"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def resource_ai_infer(
+    host: str,
+    port: int,
+    model_id: str,
+    prompt: str,
+    *,
+    context: str = "",
+    image_b64: str = "",
+    on_token: Callable[[str], None] | None = None,
+    timeout: float = 60.0,
+) -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, int(port)))
+        req = {
+            "op": "ai_infer",
+            "model": model_id,
+            "prompt": prompt,
+            "context": context,
+            "image_b64": image_b64,
+        }
+        s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+        chunks: list[str] = []
+        while True:
+            line = _read_line(s, max_bytes=2 * 1024 * 1024)
+            if not line:
+                break
+            obj = json.loads(line)
+            if obj.get("ok") is False and "error" in obj:
+                raise RuntimeError(str(obj["error"]))
+            tok = obj.get("token")
+            if isinstance(tok, str) and tok:
+                chunks.append(tok)
+                if callable(on_token):
+                    on_token(tok)
+            if obj.get("done"):
+                full = obj.get("text")
+                return str(full) if full is not None else "".join(chunks)
+        return "".join(chunks)
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def resource_list_sessions(host: str, port: int, *, timeout: float = 2.0) -> list[dict[str, Any]]:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, int(port)))
+        s.sendall(b'{"op":"sessions"}\n')
+        line = _read_line(s)
+        if not line:
+            return []
+        data = json.loads(line)
+        return list(data.get("sessions") or ()) if data.get("ok") else []
+    except (OSError, json.JSONDecodeError):
+        return []
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def resource_spawn_session(
+    host: str,
+    port: int,
+    app_id: str = "demo",
+    args: str = "",
+    *,
+    timeout: float = 6.0,
+) -> dict[str, Any] | None:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, int(port)))
+        s.sendall((json.dumps({"op": "spawn_session", "app_id": app_id, "args": args}) + "\n").encode("utf-8"))
+        line = _read_line(s)
+        if not line:
+            return None
+        data = json.loads(line)
+        return data.get("session") if data.get("ok") else None
+    except (OSError, json.JSONDecodeError):
+        return None
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def resource_stop_session(host: str, port: int, session_id: str, *, timeout: float = 2.0) -> bool:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, int(port)))
+        s.sendall((json.dumps({"op": "stop_session", "session_id": session_id}) + "\n").encode("utf-8"))
+        line = _read_line(s)
+        if not line:
+            return False
+        data = json.loads(line)
+        return bool(data.get("ok"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    finally:
+        try:
+            s.close()
         except OSError:
             pass
 

@@ -728,3 +728,205 @@ def test_independent_resource_servers_and_dual_app_camera_isolation(tmp_path: Pa
         srv_ph.close()
         for h in (hub_ws, hub_pf, hub_pb, hub_pm):
             h.close()
+
+
+def test_meta_os_speaker_clipboard_ai_sessions_and_composer(tmp_path: Path):
+    import base64
+    import io
+    import socket
+    import threading
+    import time
+    from PIL import Image as PilImage
+
+    from textual_wgpu.demo import build_demo_app
+    from textual_wgpu.remote.ai_resource import AiProviderInfo, synthesize_speech_pcm
+    from textual_wgpu.remote.directory import DeviceProfile, discover_all_resources
+    from textual_wgpu.remote.media_hub import (
+        RemoteSpeakerSink,
+        ResourceServer,
+        _BroadcastHub,
+        resource_ai_infer,
+        resource_clip_get,
+        resource_clip_set,
+        resource_list_sessions,
+        resource_spawn_session,
+        resource_stop_session,
+    )
+    from textual_wgpu.remote.session_broker import SessionBroker, start_session_tcp_relay
+    from textual_wgpu.widgets import Checkbox, Input, Video
+
+    # Phase 1: Speaker sink + Clipboard across two devices
+    ws_pcm_log: list[bytes] = []
+
+    class _FakeSink:
+        def write(self, data: bytes) -> None:
+            ws_pcm_log.append(data)
+
+        def close(self) -> None:
+            pass
+
+    # Phase 3: SessionBroker spawning an echo TCP server on its assigned port
+    def _spawn_echo(target: str, args: str, port: int):
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", port))
+        srv.listen(4)
+        srv.settimeout(0.2)
+        stop_flag = [False]
+
+        def _loop():
+            while not stop_flag[0]:
+                try:
+                    c, _ = srv.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                data = c.recv(1024)
+                c.sendall(b"ECHO:" + data)
+                c.close()
+
+        t = threading.Thread(target=_loop, daemon=True)
+        t.start()
+
+        class _H:
+            pid = 4242
+
+            def is_alive(self) -> bool:
+                return not stop_flag[0]
+
+            def close(self) -> None:
+                stop_flag[0] = True
+                srv.close()
+
+        return _H()
+
+    broker = SessionBroker(spawner=_spawn_echo)
+
+    cam_sock = tmp_path / "cam.sock"
+    hub_cam = _BroadcastHub(cam_sock, idle_timeout=5.0, startup_grace=5.0)
+    hub_cam.start_accepting()
+    hub_cam.publish(10, 0x11, b"\x00\x00\x00\x01\x65CAM1", is_keyframe=True, codec_flag=0x10)
+
+    def _conn_cam(_cid: str) -> socket.socket:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(str(cam_sock))
+        return s
+
+    ai_prov = AiProviderInfo("ollama:demo-vision", "Local Vision LLM", "builtin", "local://test", "demo-vision")
+    srv_ws = ResourceServer(
+        port=0,
+        profile_fn=lambda: DeviceProfile("ws-1", "Workstation", "desktop", [("/dev/video0", "Webcam")]),
+        camera_connector=_conn_cam,
+        speaker_sink_factory=lambda _sr, _ch: _FakeSink(),
+        ai_providers_fn=lambda: [ai_prov],
+        session_broker=broker,
+    )
+    srv_ph = ResourceServer(
+        port=0,
+        profile_fn=lambda: DeviceProfile("ph-2", "Phone", "android", [("front", "Front Cam")]),
+        camera_connector=_conn_cam,
+        ai_providers_fn=lambda: [],
+    )
+    p_ws = srv_ws.start()
+    p_ph = srv_ph.start()
+
+    try:
+        # 1) Discovery includes speaker, clipboard, ai, camera, mic, files
+        res_all = discover_all_resources(ports=(p_ws, p_ph), include_local_fallback=False)
+        assert any(r.kind == "speaker" and r.device_id == "ws-1" for r in res_all)
+        assert any(r.kind == "clipboard" and r.device_id == "ph-2" for r in res_all)
+        assert any(r.kind == "ai" and r.resource_id == "ollama:demo-vision" for r in res_all)
+
+        # 2) Speaker stream & Clipboard roundtrip
+        sink = RemoteSpeakerSink("127.0.0.1", p_ws, sample_rate=16000, channels=1)
+        sink.write_pcm(b"\x10\x20" * 160)
+        sink.close()
+        for _ in range(20):
+            if ws_pcm_log:
+                break
+            time.sleep(0.02)
+        assert ws_pcm_log and ws_pcm_log[0] == b"\x10\x20" * 160
+
+        assert resource_clip_set("127.0.0.1", p_ph, "Hello from Workstation")
+        assert resource_clip_get("127.0.0.1", p_ph) == "Hello from Workstation"
+
+        # 3) AI inference with attached PNG snapshot + TTS synth
+        im = PilImage.new("RGBA", (32, 32), (240, 180, 60, 255))
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        ans = resource_ai_infer("127.0.0.1", p_ws, "ollama:demo-vision", "Inspect scene", context="clip=test", image_b64=img_b64)
+        assert "32x32" in ans and "Inspect scene" in ans
+        tts_pcm = synthesize_speech_pcm("Ready", sample_rate=16000)
+        assert len(tts_pcm) >= 640
+
+        # 4) SessionBroker spawn + list + tunnel_tcp relay + stop
+        sinfo = resource_spawn_session("127.0.0.1", p_ws, "demo:media")
+        assert sinfo is not None and sinfo["port"] >= 7430
+        listed = resource_list_sessions("127.0.0.1", p_ws)
+        assert len(listed) == 1 and listed[0]["session_id"] == sinfo["session_id"]
+
+        relay_port, close_relay = start_session_tcp_relay("127.0.0.1", p_ws, int(sinfo["port"]))
+        try:
+            c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            c.settimeout(2.0)
+            c.connect(("127.0.0.1", relay_port))
+            c.sendall(b"PING")
+            assert c.recv(64) == b"ECHO:PING"
+            c.close()
+        finally:
+            close_relay()
+        assert resource_stop_session("127.0.0.1", p_ws, sinfo["session_id"])
+        assert resource_list_sessions("127.0.0.1", p_ws) == []
+
+        # 5) F7 Media dual-camera slots + F9 Composer Eyes -> Knowledge -> Hands
+        media_app = build_demo_app(start="media")
+        mscr = media_app._ensure_screen()
+
+        class _RemoteTag:
+            def on_audio_play(self, *_a, **_kw):
+                pass
+
+        media_app._driver = _RemoteTag()
+        ph_cam = next(r for r in res_all if r.kind == "camera" and r.device_id == "ph-2")
+        ws_cam = next(r for r in res_all if r.kind == "camera" and r.device_id == "ws-1")
+        mscr.start_camera_resource(ph_cam)
+        mscr._cam2_resources = {f"res:{ws_cam.uid}": ws_cam}
+        mscr._start_camera2_source(f"res:{ws_cam.uid}")
+        try:
+            assert mscr._cam_mode == "resource" and mscr._cam2_mode == "resource"
+            assert mscr.query_one("#media-video-2", Video).styles["display"] == "block"
+        finally:
+            mscr.on_screen_pause()
+
+        # F9 Composer: Clipboard Eyes (Phone) -> AI Brain (Workstation) -> Speaker + Clipboard + UI Hands!
+        comp_app = build_demo_app(start="composer")
+        cscr = comp_app._ensure_screen()
+        ws_spk = next(r for r in res_all if r.kind == "speaker" and r.device_id == "ws-1")
+        ph_clp = next(r for r in res_all if r.kind == "clipboard" and r.device_id == "ph-2")
+        ws_ai = next(r for r in res_all if r.kind == "ai" and r.device_id == "ws-1")
+        cscr._eyes = [ph_clp]
+        cscr._brains = [ws_ai]
+        cscr._speakers = [ws_spk]
+        cscr._clipboards = [ph_clp]
+        cscr._spk_idx = 0
+        cscr._clip_idx = 0
+        ws_pcm_log.clear()
+        cscr.query_one("#chk-hand-speak", Checkbox).value = True
+        cscr.query_one("#chk-hand-clip", Checkbox).value = True
+        cscr.query_one("#chk-hand-ui", Checkbox).value = True
+        cscr.query_one("#comp-prompt", Input).value = "Switch to media after reading clipboard"
+        cscr.run_pipeline()
+        for _ in range(25):
+            if ws_pcm_log:
+                break
+            time.sleep(0.02)
+        assert ws_pcm_log  # Spoken onto Workstation speaker!
+        assert "Switch to media" in resource_clip_get("127.0.0.1", p_ph)  # Written to Phone clipboard!
+        assert comp_app.mode_key == "media"  # UI Hands switched mode!
+    finally:
+        broker.close_all()
+        srv_ws.close()
+        srv_ph.close()
+        hub_cam.close()

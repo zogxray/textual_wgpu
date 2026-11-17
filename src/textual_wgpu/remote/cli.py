@@ -228,6 +228,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_tcp.add_argument("--app", default="textual_wgpu.demo:build_demo_app")
     s_tcp.add_argument("--width", type=int, default=1100)
     s_tcp.add_argument("--height", type=int, default=720)
+    s_tcp.add_argument("--no-advertise", action="store_true")
 
     s_atcp = sub.add_parser("attach-tcp", help="Attach local GPU window to a TCP session")
     s_atcp.add_argument("host", nargs="?", default="127.0.0.1")
@@ -288,7 +289,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "serve-tcp":
         app = _load_target(args.app)()
-        asyncio.run(serve_tcp_session(app, host=args.host, port=args.port, size=(args.width, args.height)))
+        asyncio.run(
+            serve_tcp_session(
+                app,
+                host=args.host,
+                port=args.port,
+                size=(args.width, args.height),
+                advertise=False if args.no_advertise else None,
+            ),
+        )
         return 0
     if args.cmd == "attach-tcp":  # pragma: no cover
         viewer = RemoteViewer(connector=lambda: spawn_tcp_transport(args.host, args.port))

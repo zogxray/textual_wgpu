@@ -69,6 +69,16 @@ object LocalResourceServer {
         return buf.toString(Charsets.UTF_8.name())
     }
 
+    private fun readExact(inp: InputStream, dst: ByteArray, n: Int): Boolean {
+        var off = 0
+        while (off < n) {
+            val r = inp.read(dst, off, n - off)
+            if (r <= 0) return false
+            off += r
+        }
+        return true
+    }
+
     private fun writeJsonLine(out: BufferedOutputStream, obj: JSONObject) {
         out.write((obj.toString() + "\n").toByteArray(Charsets.UTF_8))
         out.flush()
@@ -102,6 +112,16 @@ object LocalResourceServer {
                         put("kind", "mic")
                         put("id", "default")
                         put("label", "Microphone")
+                    })
+                    resArr.put(JSONObject().apply {
+                        put("kind", "speaker")
+                        put("id", "default")
+                        put("label", "Speaker")
+                    })
+                    resArr.put(JSONObject().apply {
+                        put("kind", "clipboard")
+                        put("id", "default")
+                        put("label", "Clipboard")
                     })
                     resArr.put(JSONObject().apply {
                         put("kind", "files")
@@ -155,6 +175,92 @@ object LocalResourceServer {
                     })
                     out.write(res.second)
                     out.flush()
+                }
+                "clip_get" -> {
+                    val txt = LocalMediaHelper.getClipboardText(ctx)
+                    writeJsonLine(out, JSONObject().apply {
+                        put("ok", true)
+                        put("text", txt)
+                    })
+                }
+                "clip_set" -> {
+                    val txt = req.optString("text", "")
+                    LocalMediaHelper.setClipboardText(ctx, txt)
+                    writeJsonLine(out, JSONObject().apply { put("ok", true) })
+                }
+                "play" -> {
+                    val sr = req.optInt("sr", 16000)
+                    val ch = req.optInt("ch", 1)
+                    val track = LocalMediaHelper.createSpeakerTrack(sr, ch)
+                    if (track == null) {
+                        writeJsonLine(out, JSONObject().apply {
+                            put("ok", false)
+                            put("error", "speaker unavailable")
+                        })
+                        return
+                    }
+                    conn.soTimeout = 0
+                    writeJsonLine(out, JSONObject().apply { put("ok", true) })
+                    val hdr = ByteArray(13)
+                    try {
+                        while (!conn.isClosed) {
+                            if (!readExact(inp, hdr, 13)) break
+                            val bb = ByteBuffer.wrap(hdr).order(ByteOrder.LITTLE_ENDIAN)
+                            bb.getLong() // pts
+                            bb.get() // flags
+                            val plen = bb.getInt()
+                            if (plen <= 0 || plen > 4 * 1024 * 1024) {
+                                if (plen == 0) continue else break
+                            }
+                            val pcm = ByteArray(plen)
+                            if (!readExact(inp, pcm, plen)) break
+                            track.write(pcm, 0, pcm.size)
+                        }
+                    } finally {
+                        try { track.stop() } catch (_: Throwable) {}
+                        try { track.release() } catch (_: Throwable) {}
+                    }
+                }
+                "tunnel_tcp" -> {
+                    val tport = req.optInt("port", 0)
+                    if (tport <= 1024 || tport > 65535) {
+                        writeJsonLine(out, JSONObject().apply {
+                            put("ok", false)
+                            put("error", "invalid port")
+                        })
+                        return
+                    }
+                    val up = Socket("127.0.0.1", tport)
+                    conn.soTimeout = 0
+                    writeJsonLine(out, JSONObject().apply { put("ok", true) })
+                    val upIn = up.getInputStream()
+                    val upOut = up.getOutputStream()
+                    val t1 = Thread({
+                        try {
+                            val buf = ByteArray(65536)
+                            while (true) {
+                                val n = inp.read(buf)
+                                if (n <= 0) break
+                                upOut.write(buf, 0, n)
+                                upOut.flush()
+                            }
+                        } catch (_: Throwable) {
+                        } finally {
+                            try { up.close() } catch (_: Throwable) {}
+                        }
+                    }, "tw-tun-tx").apply { isDaemon = true; start() }
+                    try {
+                        val buf = ByteArray(65536)
+                        while (true) {
+                            val n = upIn.read(buf)
+                            if (n <= 0) break
+                            out.write(buf, 0, n)
+                            out.flush()
+                        }
+                    } finally {
+                        try { up.close() } catch (_: Throwable) {}
+                        t1.interrupt()
+                    }
                 }
                 "sub" -> {
                     val kind = req.optString("kind")

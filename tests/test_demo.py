@@ -15,7 +15,7 @@ def test_demo_all_modes_layout_and_paint():
     app = build_demo_app()
     app._pixel_size = (1100, 720)
     assert app.TITLE == "textual-wgpu · demo"
-    assert len(DEMO_LABELS) == 8
+    assert len(DEMO_LABELS) == 9
 
     for idx, (key, _title) in enumerate(DEMO_LABELS):
         app.set_mode(idx)

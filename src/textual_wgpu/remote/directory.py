@@ -226,10 +226,17 @@ def _builtin_apps() -> list[AppEntry]:
         ),
         AppEntry(
             app_id="demo:media",
-            name="Media Studio (Photo/Video/Audio)",
-            description="H.265/H.264 video, native RGBA photos & audio playback",
+            name="Media Studio (Multi-Cam/Audio/Files)",
+            description="Multi-camera HW video, native RGBA photos & cross-device audio",
             kind="mode",
             target="media",
+        ),
+        AppEntry(
+            app_id="demo:composer",
+            name="Meta-OS Composer (Eyes/Knowledge/Hands)",
+            description="Wire cross-device sensors, Local/Cloud AI & actuators",
+            kind="mode",
+            target="composer",
         ),
     ]
 
@@ -657,6 +664,47 @@ def discover_all_resources(
                     source="local",
                 ),
             )
+        for rkind, rid, rlabel in (
+            ("speaker", "default", "Speaker"),
+            ("clipboard", "default", "Clipboard"),
+        ):
+            key = (local.device_id, rkind, rid)
+            if key not in seen:
+                seen.add(key)
+                out.append(
+                    ResourceEntry(
+                        device_id=local.device_id,
+                        device_name=local.name,
+                        device_kind=local.kind,
+                        icon=local.icon,
+                        kind=rkind,
+                        resource_id=rid,
+                        label=rlabel,
+                        host="127.0.0.1",
+                        port=0,
+                        source="local",
+                    ),
+                )
+        from .ai_resource import discover_local_ai_providers
+
+        for ai_p in discover_local_ai_providers():
+            key = (local.device_id, "ai", ai_p.resource_id)
+            if key not in seen:
+                seen.add(key)
+                out.append(
+                    ResourceEntry(
+                        device_id=local.device_id,
+                        device_name=local.name,
+                        device_kind=local.kind,
+                        icon=local.icon,
+                        kind="ai",
+                        resource_id=ai_p.resource_id,
+                        label=ai_p.label,
+                        host="127.0.0.1",
+                        port=0,
+                        source="local",
+                    ),
+                )
 
     peer = driver.distinct_peer_profile(local) if hasattr(driver, "distinct_peer_profile") else None
     if peer is not None:

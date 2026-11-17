@@ -61,6 +61,7 @@ DEMO_LABELS: list[tuple[str, str]] = [
     ("planes", "3D Scene"),
     ("media", "Media"),
     ("nodes", "Nodes & Apps"),
+    ("composer", "Composer"),
 ]
 
 _OVERVIEW_MD = """\
@@ -782,8 +783,11 @@ def _render_demo_video_frame(width: int, height: int, phase: float) -> bytes:
 class MediaScreen(Screen):
     DEFAULT_CSS = _SHARED_CSS + """
     #photo-box { width: 1fr; border: round $primary; }
-    #media-right { width: 52; }
+    #media-right { width: 58; }
     #video-box { height: 1fr; border: round $primary; }
+    #video-row { height: 1fr; }
+    #media-video { width: 1fr; height: 1fr; }
+    #media-video-2 { width: 1fr; height: 1fr; display: none; }
     #audio-box { height: 14; border: round $primary; }
     #photo-box:focus-within, #video-box:focus-within, #audio-box:focus-within { border: round $accent; }
     """
@@ -796,6 +800,8 @@ class MediaScreen(Screen):
         self._video_phase = 0.0
         self._file_streamer: Any = None
         self._cam_mode: str | None = None
+        self._cam2_streamer: Any = None
+        self._cam2_mode: str | None = None
         self._mic_mode: str | None = None
         self._mic_cap: Any = None
         self._mic_env: list[float] = [0.08] * 48
@@ -803,6 +809,8 @@ class MediaScreen(Screen):
         self._mic_mon_buf = bytearray()
         self._mic_monitor = False
         self._mic_elapsed = 0.0
+        self._speaker_target: Any = None
+        self._speaker_sink: Any = None
         self._audio_playing = False
         self._audio_elapsed = 0.0
         self._audio_proc: subprocess.Popen | None = None
@@ -823,18 +831,23 @@ class MediaScreen(Screen):
         vid = Video(id="media-video")
         vid.play()
         vid.push_rgba_frame(240, 144, _render_demo_video_frame(240, 144, 0.0))
-        vid_box = Panel(vid, title="VIDEO / CAMERA · H.265/H.264 HW plane (V pause · C cam)", id="video-box")
+        vid2 = Video(id="media-video-2")
+        vid2.play()
+        vid_row = Horizontal(vid, vid2, id="video-row")
+        vid_box = Panel(vid_row, title="VIDEO / CAMERAS · C cam1 · B cam2 (independent HW planes)", id="video-box")
 
         btn_open = Button("Open File (O)", id="btn-open-file", variant="primary", on_press=self.open_media_file)
         btn_cam = Button("Camera (C)", id="btn-cam", on_press=self.toggle_camera)
+        btn_cam2 = Button("Cam 2 (B)", id="btn-cam2", on_press=self.toggle_camera2)
         btn_mic = Button("Mic (M)", id="btn-mic", on_press=self.toggle_mic)
-        row1 = Horizontal(btn_open, btn_cam, btn_mic, id="media-btns-1")
+        row1 = Horizontal(btn_open, btn_cam, btn_cam2, btn_mic, id="media-btns-1")
         row1.layout_hint_h = 36
 
         btn_audio = Button("Play Audio (A)", id="btn-audio", on_press=self.toggle_audio)
-        btn_vid = Button("Pause Video (V)", id="btn-video", on_press=self.toggle_video)
+        btn_spk = Button("Spk: Local (S)", id="btn-spk", on_press=self.select_speaker_target)
         btn_mon = Button("Monitor: Off", id="btn-mon", on_press=self.toggle_mic_monitor)
-        row2 = Horizontal(btn_audio, btn_vid, btn_mon, id="media-btns-2")
+        btn_vid = Button("Pause (V)", id="btn-video", on_press=self.toggle_video)
+        row2 = Horizontal(btn_audio, btn_spk, btn_mon, btn_vid, id="media-btns-2")
         row2.layout_hint_h = 36
 
         digits = Digits("00.0s", id="audio-clock")
@@ -842,22 +855,22 @@ class MediaScreen(Screen):
         spark = Sparkline(self._audio_env, id="audio-spark")
         spark.layout_hint_h = 26
         audio_inner = Vertical(row1, row2, digits, bar, spark, id="audio-inner")
-        audio_box = Panel(audio_inner, title="MEDIA · O file · C camera · M mic · L monitor", id="audio-box")
+        audio_box = Panel(audio_inner, title="MEDIA · O file · C/B cams · M mic · S speaker", id="audio-box")
 
         right = Vertical(vid_box, audio_box, id="media-right")
         yield Horizontal(photo_box, right, id="main")
         yield KeyBar([
-            ("O", "Open File", lambda: self.open_media_file()),
-            ("C", "Camera", lambda: self.toggle_camera()),
+            ("O", "File", lambda: self.open_media_file()),
+            ("C/B", "Cam 1/2", lambda: self.toggle_camera()),
             ("M", "Mic", lambda: self.toggle_mic()),
+            ("S", "Speaker", lambda: self.select_speaker_target()),
             ("L", "Monitor", lambda: self.toggle_mic_monitor()),
-            ("V", "Video", lambda: self.toggle_video()),
             ("A", "Audio", lambda: self.toggle_audio()),
             ("Tab", "Panel", lambda: _focus_next(self)),
-            ("F1–F8", "Modes", None),
+            ("F1–F9", "Modes", None),
             ("Q", "Quit", lambda: _quit(self)),
         ])
-        yield StatusBar("F7 Media · Any-device Files, Camera & Mic + H.265/H.264", id="status")
+        yield StatusBar("F7 Media · Multi-Cam + Any-Device Files, Mic & Speaker", id="status")
 
     def _build_photo_doc(self) -> Text:
         path = self._custom_photo if (self._custom_photo and self._custom_photo.is_file()) else _ensure_demo_photo(self._photo_kind)
@@ -1167,6 +1180,122 @@ class MediaScreen(Screen):
         else:
             self._start_camera_source(options[0][0])
 
+    def _stop_camera2(self) -> None:
+        if self._cam2_streamer is not None:
+            try:
+                self._cam2_streamer.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._cam2_streamer = None
+        self._cam2_mode = None
+        try:
+            vid2 = self.query_one("#media-video-2", Video)
+            vid2.styles["display"] = "none"
+            self.query_one("#btn-cam2", Button).label = "Cam 2 (B)"
+            if self.app is not None:
+                self.app._layout_size = (0, 0)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _wake_cam2_thread(self) -> None:
+        if self.app is None:
+            return
+        loop = getattr(self.app, "_loop", None)
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(self._flush_cam2)
+
+    def _flush_cam2(self) -> None:
+        if self._cam2_streamer is None or not self._video_playing:
+            return
+        try:
+            vid2 = self.query_one("#media-video-2", Video)
+        except Exception:  # noqa: BLE001
+            return
+        is_remote = hasattr(getattr(self.app, "_driver", None), "on_audio_play")
+        if is_remote:
+            rot = getattr(self._cam2_streamer, "rotation", 0)
+            for au, is_kf in self._cam2_streamer.pop_aus():
+                vid2.push_packet(0, au, keyframe=is_kf, codec_flag=self._cam2_streamer.codec_flag, rotation=rot)
+        else:
+            frame = self._cam2_streamer.pop_rgba()
+            if frame is not None:
+                fw, fh, rgba = frame
+                vid2.push_rgba_frame(fw, fh, rgba)
+
+    def _start_camera2_source(self, src: str) -> None:
+        self._stop_camera2()
+        drv = getattr(self.app, "_driver", None) if self.app is not None else None
+        res_map = getattr(self, "_cam2_resources", None) or {}
+        res_entry = res_map.get(src)
+        is_remote = hasattr(drv, "on_audio_play")
+        try:
+            if res_entry is not None and res_entry.port > 0 and src.startswith("res:"):
+                from .remote.media_hub import RemoteCameraSubscriber
+
+                self._cam2_streamer = RemoteCameraSubscriber(
+                    res_entry.host,
+                    res_entry.port,
+                    res_entry.resource_id,
+                    emit_rgba=not is_remote,
+                    on_frame=self._wake_cam2_thread,
+                )
+                self._cam2_mode = "resource"
+            else:
+                from .remote.media_codec import LocalCameraStreamer
+
+                cid = src.split(":", 1)[1] if ":" in src else "front"
+                facing = 2 if cid == "back" else 1
+                device = cid if cid.startswith("/") else None
+                self._cam2_streamer = LocalCameraStreamer(
+                    facing=facing,
+                    device=device,
+                    emit_rgba=not is_remote,
+                    on_frame=self._wake_cam2_thread,
+                )
+                self._cam2_mode = "local"
+            vid2 = self.query_one("#media-video-2", Video)
+            vid2.styles["display"] = "block"
+            if self.app is not None:
+                self.app._layout_size = (0, 0)  # type: ignore[attr-defined]
+            self.query_one("#btn-cam2", Button).label = "Stop 2 (B)"
+            lbl = res_entry.display_label() if res_entry is not None else src
+            self.query_one("#status", StatusBar).update(f"F7 Media · Cam 2 streaming {lbl}")
+        except Exception as exc:  # noqa: BLE001
+            self.query_one("#status", StatusBar).update(f"F7 Media · Cam 2 error: {exc}")
+
+    def toggle_camera2(self) -> None:
+        from .remote.directory import discover_all_resources, local_device_profile
+
+        if self._cam2_mode is not None:
+            self._stop_camera2()
+            self.query_one("#status", StatusBar).update("F7 Media · Cam 2 stopped")
+            return
+        local = local_device_profile()
+        drv = getattr(self.app, "_driver", None) if self.app is not None else None
+        cam_resources = discover_all_resources(kind="camera", driver=drv)
+        options: list[tuple[str, str]] = []
+        res_map: dict[str, Any] = {}
+        for res in cam_resources:
+            if res.device_id == local.device_id:
+                key = f"local:{res.resource_id}"
+            elif res.port > 0:
+                key = f"res:{res.uid}"
+            else:
+                continue
+            res_map[key] = res
+            options.append((key, res.display_label()))
+        if not options:
+            options.append(("local:front", f"{local.icon} {local.name} · Camera"))
+        self._cam2_resources = res_map
+        if len(options) > 1 and hasattr(self.app, "ask_pick"):
+            self.app.ask_pick(
+                "Select Second Camera (Independent Plane)",
+                options,
+                lambda val: self._start_camera2_source(val) if val else None,
+            )
+        else:
+            self._start_camera2_source(options[0][0])
+
     def _stop_mic(self) -> None:
         if self._mic_mode == "peer":
             drv = getattr(self.app, "_driver", None) if self.app is not None else None
@@ -1207,12 +1336,12 @@ class MediaScreen(Screen):
             self.query_one("#audio-clock", Digits).update(f"{self._mic_elapsed:04.1f}s")
         except Exception:  # noqa: BLE001
             pass
-        if self._mic_monitor and self.app is not None and hasattr(self.app, "play_audio_pcm"):
+        if self._mic_monitor:
             self._mic_mon_buf.extend(pcm)
             if len(self._mic_mon_buf) >= int(sr * ch * 2 * 0.32):
                 chunk = bytes(self._mic_mon_buf)
                 self._mic_mon_buf.clear()
-                self.app.play_audio_pcm(chunk, sample_rate=sr, channels=ch)
+                self._play_pcm_out(chunk, sample_rate=sr, channels=ch)
 
     def _start_mic_source(self, src: str) -> None:
         self._stop_mic()
@@ -1303,6 +1432,64 @@ class MediaScreen(Screen):
         else:
             self._start_mic_source(options[0][0])
 
+    def _play_pcm_out(self, pcm: bytes, *, sample_rate: int, channels: int) -> None:
+        if not pcm:
+            return
+        target = self._speaker_target
+        if target is not None and getattr(target, "port", 0) > 0:
+            import threading
+
+            def _send() -> None:
+                try:
+                    from .remote.media_hub import RemoteSpeakerSink
+
+                    sink = RemoteSpeakerSink(target.host, target.port, sample_rate=sample_rate, channels=channels)
+                    try:
+                        # Stream in 4096B chunks so playback starts immediately
+                        for off in range(0, len(pcm), 4096):
+                            sink.write_pcm(pcm[off : off + 4096])
+                    finally:
+                        sink.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            threading.Thread(target=_send, daemon=True).start()
+            return
+        if self.app is not None and hasattr(self.app, "play_audio_pcm"):
+            self.app.play_audio_pcm(pcm, sample_rate=sample_rate, channels=channels)
+
+    def select_speaker_target(self) -> None:
+        from .remote.directory import discover_all_resources
+
+        drv = getattr(self.app, "_driver", None) if self.app is not None else None
+        spks = discover_all_resources(kind="speaker", driver=drv)
+        options: list[tuple[str, str]] = [("default", "🔊 Default Viewer Speaker")]
+        spk_map: dict[str, Any] = {}
+        for s in spks:
+            if s.port > 0:
+                options.append((s.uid, s.display_label()))
+                spk_map[s.uid] = s
+
+        def _pick(val: str | None) -> None:
+            if not val:
+                return
+            if val == "default":
+                self._speaker_target = None
+                self.query_one("#btn-spk", Button).label = "Spk: Local (S)"
+                self.query_one("#status", StatusBar).update("F7 Media · output speaker = Default")
+            else:
+                res = spk_map.get(val)
+                self._speaker_target = res
+                short = res.device_name[:10] if res else "Peer"
+                self.query_one("#btn-spk", Button).label = f"Spk: {short}"
+                if res is not None:
+                    self.query_one("#status", StatusBar).update(f"F7 Media · output speaker = {res.display_label()}")
+
+        if len(options) > 1 and hasattr(self.app, "ask_pick"):
+            self.app.ask_pick("Select Output Speaker Resource", options, _pick)
+        else:
+            _pick("default")
+
     def toggle_mic_monitor(self) -> None:
         self._mic_monitor = not self._mic_monitor
         self._mic_mon_buf.clear()
@@ -1317,7 +1504,7 @@ class MediaScreen(Screen):
         if self._audio_playing:
             self._audio_elapsed = 0.0
             btn.label = "Stop Audio"
-            if play_os and self.app is not None and hasattr(self.app, "play_audio_pcm"):
+            if play_os:
                 if self._audio_pcm is not None:
                     pcm, sr, ch = self._audio_pcm, self._audio_sr, self._audio_ch
                 else:
@@ -1325,7 +1512,7 @@ class MediaScreen(Screen):
                         sr = wf.getframerate()
                         ch = wf.getnchannels()
                         pcm = wf.readframes(wf.getnframes())
-                self.app.play_audio_pcm(pcm, sample_rate=sr, channels=ch)
+                self._play_pcm_out(pcm, sample_rate=sr, channels=ch)
             self.query_one("#status", StatusBar).update("F7 Media · playing audio")
         else:
             self._stop_audio_proc()
@@ -1338,6 +1525,7 @@ class MediaScreen(Screen):
 
     def on_screen_pause(self) -> None:
         self._stop_camera()
+        self._stop_camera2()
         self._stop_mic()
         if self._file_streamer is not None:
             self._file_streamer.close()
@@ -1383,6 +1571,8 @@ class MediaScreen(Screen):
                 else:
                     self._video_phase += 0.12
                     vid.push_rgba_frame(240, 144, _render_demo_video_frame(240, 144, self._video_phase))
+            if self._cam2_streamer is not None:
+                self._flush_cam2()
         if self._audio_playing:
             self._audio_elapsed += 0.05
             if self._audio_elapsed >= self._audio_dur:
@@ -1412,6 +1602,12 @@ class MediaScreen(Screen):
         if key == "c":
             self.toggle_camera()
             return True
+        if key == "b":
+            self.toggle_camera2()
+            return True
+        if key == "s":
+            self.select_speaker_target()
+            return True
         if key == "m":
             self.toggle_mic()
             return True
@@ -1428,15 +1624,17 @@ class MediaScreen(Screen):
 
 
 class NodesScreen(Screen):
-    """F8 · Network OS Directory: saved nodes, independent cross-device resources & App Launcher."""
+    """F8 · Network OS Directory: saved nodes, independent cross-device resources, sessions & App Launcher."""
 
     DEFAULT_CSS = """
     #main { height: 1fr; }
     #nodes-col { width: 1fr; }
+    #apps-col { width: 1fr; }
     #nodes-box { height: 1fr; border: round $primary; }
     #resources-box { height: 1fr; border: round $primary; }
-    #apps-box { width: 1fr; border: round $primary; }
-    #nodes-box:focus-within, #resources-box:focus-within, #apps-box:focus-within { border: round $accent; }
+    #apps-box { height: 1fr; border: round $primary; }
+    #sessions-box { height: 1fr; border: round $primary; }
+    #nodes-box:focus-within, #resources-box:focus-within, #apps-box:focus-within, #sessions-box:focus-within { border: round $accent; }
     """
 
     def __init__(self) -> None:
@@ -1446,10 +1644,36 @@ class NodesScreen(Screen):
         self._registry = NodeRegistry()
         self._apps = discover_local_apps()
         self._resources: list[Any] = []
+        self._sessions: list[dict[str, Any]] = []
+        self._relays: list[Any] = []
 
     def _resource_option_label(self, res: Any) -> str:
         ep = f"{res.host}:{res.port}" if getattr(res, "port", 0) else getattr(res, "source", "local")
-        return f"[{res.kind.upper():<6}] {res.display_label()}  ({res.resource_id} · {ep})"
+        return f"[{res.kind.upper():<9}] {res.display_label()}  ({res.resource_id} · {ep})"
+
+    def _collect_sessions(self) -> list[dict[str, Any]]:
+        from .remote.media_hub import resource_list_sessions
+
+        seen_eps: set[tuple[str, int]] = set()
+        out: list[dict[str, Any]] = []
+        for r in self._resources:
+            if getattr(r, "port", 0) <= 0:
+                continue
+            ep = (r.host, r.port)
+            if ep in seen_eps:
+                continue
+            seen_eps.add(ep)
+            for s in resource_list_sessions(r.host, r.port):
+                s_copy = dict(s)
+                s_copy["res_host"] = r.host
+                s_copy["res_port"] = r.port
+                s_copy["device_name"] = r.device_name
+                s_copy["icon"] = r.icon
+                out.append(s_copy)
+        return out
+
+    def _session_option_label(self, s: dict[str, Any]) -> str:
+        return f"{s.get('icon', '💻')} {s.get('device_name', 'Node')} · {s.get('name', s.get('app_id'))} (:{s.get('port')} #{s.get('session_id')})"
 
     def compose(self):
         yield _mode_bar(self, "nodes")
@@ -1458,6 +1682,7 @@ class NodesScreen(Screen):
         from .remote.directory import discover_all_resources
 
         self._resources = discover_all_resources(driver=drv)
+        self._sessions = self._collect_sessions()
 
         node_opts = [
             Option(f"[{n.role.upper()}] {n.name} — {n.endpoint_label()}", id=n.id)
@@ -1479,7 +1704,7 @@ class NodesScreen(Screen):
         res_btns = Horizontal(btn_res_refresh, btn_res_use, id="res-btns")
         res_btns.layout_hint_h = 36
         res_inner = Vertical(res_btns, res_list, id="res-inner")
-        res_box = Panel(res_inner, title="SYSTEM RESOURCES · Independent Cameras / Mics / Files", id="resources-box")
+        res_box = Panel(res_inner, title="SYSTEM RESOURCES · Cameras / Mics / Speakers / Clip / AI", id="resources-box")
 
         left_col = Vertical(nodes_box, res_box, id="nodes-col")
 
@@ -1488,25 +1713,41 @@ class NodesScreen(Screen):
             for a in self._apps
         ]
         app_list = OptionList(*app_opts, id="apps-list")
-        btn_refresh = Button("Refresh Apps (R)", id="btn-apps-refresh", on_press=self.refresh_apps)
-        btn_launch = Button("Launch App (Enter)", id="btn-apps-launch", variant="primary", on_press=self.launch_selected_app)
-        app_btns = Horizontal(btn_refresh, btn_launch, id="apps-btns")
+        btn_refresh = Button("Refresh (R)", id="btn-apps-refresh", on_press=self.refresh_apps)
+        btn_launch = Button("Switch (Enter)", id="btn-apps-launch", variant="primary", on_press=self.launch_selected_app)
+        btn_spawn = Button("Spawn New (N)", id="btn-apps-spawn", on_press=self.spawn_independent_session)
+        app_btns = Horizontal(btn_refresh, btn_launch, btn_spawn, id="apps-btns")
         app_btns.layout_hint_h = 36
         apps_inner = Vertical(app_btns, app_list, id="apps-inner")
-        apps_box = Panel(apps_inner, title="APP DIRECTORY · Browse & Launch Without Shell Commands", id="apps-box")
+        apps_box = Panel(apps_inner, title="APP DIRECTORY · Switch Here or Spawn Independent Session", id="apps-box")
 
-        yield Horizontal(left_col, apps_box, id="main")
+        sess_opts = [
+            Option(self._session_option_label(s), id=str(s.get("session_id")))
+            for s in self._sessions
+        ] or [Option("(No spawned sessions yet — press N to spawn)", id="_none")]
+        sess_list = OptionList(*sess_opts, id="sessions-list")
+        btn_attach = Button("Attach / Open Here (T)", id="btn-sess-attach", variant="primary", on_press=self.attach_selected_session)
+        btn_stop = Button("Stop", id="btn-sess-stop", on_press=self.stop_selected_session)
+        sess_btns = Horizontal(btn_attach, btn_stop, id="sess-btns")
+        sess_btns.layout_hint_h = 36
+        sess_inner = Vertical(sess_btns, sess_list, id="sess-inner")
+        sess_box = Panel(sess_inner, title="RUNNING SESSIONS · Independent App Mobility", id="sessions-box")
+
+        right_col = Vertical(apps_box, sess_box, id="apps-col")
+
+        yield Horizontal(left_col, right_col, id="main")
         yield KeyBar([
-            ("Enter", "Launch App", lambda: self.launch_selected_app()),
+            ("Enter", "Switch", lambda: self.launch_selected_app()),
+            ("N", "Spawn App", lambda: self.spawn_independent_session()),
+            ("T", "Attach", lambda: self.attach_selected_session()),
             ("U", "Use Resource", lambda: self.use_selected_resource()),
             ("R", "Refresh", lambda: self.refresh_apps()),
-            ("W/P/C", "Add Node", None),
             ("Tab", "Panel", lambda: _focus_next(self)),
-            ("F1–F8", "Modes", None),
+            ("F1–F9", "Modes", None),
             ("Q", "Quit", lambda: _quit(self)),
         ])
         yield StatusBar(
-            f"F8 Directory · {len(self._resources)} independent resources · {len(self._apps)} apps",
+            f"F8 Directory · {len(self._resources)} resources · {len(self._sessions)} sessions · {len(self._apps)} apps",
             id="status",
         )
 
@@ -1515,6 +1756,14 @@ class NodesScreen(Screen):
 
     def on_screen_resume(self) -> None:
         self.refresh_apps()
+
+    def on_screen_unmount(self) -> None:
+        for close_fn in self._relays:
+            try:
+                close_fn()
+            except Exception:  # noqa: BLE001
+                pass
+        self._relays.clear()
 
     def _reload_node_list(self) -> None:
         nl = self.query_one("#nodes-list", OptionList)
@@ -1574,6 +1823,7 @@ class NodesScreen(Screen):
         drv = getattr(self.app, "_driver", None) if self.app is not None else None
         self._apps = discover_local_apps()
         self._resources = discover_all_resources(driver=drv)
+        self._sessions = self._collect_sessions()
         al = self.query_one("#apps-list", OptionList)
         al.clear_options()
         for a in self._apps:
@@ -1582,9 +1832,97 @@ class NodesScreen(Screen):
         rl.clear_options()
         for r in self._resources:
             rl.add_option(Option(self._resource_option_label(r), id=r.uid))
+        sl = self.query_one("#sessions-list", OptionList)
+        sl.clear_options()
+        if self._sessions:
+            for s in self._sessions:
+                sl.add_option(Option(self._session_option_label(s), id=str(s.get("session_id"))))
+        else:
+            sl.add_option(Option("(No spawned sessions yet — press N to spawn)", id="_none"))
         self.query_one("#status", StatusBar).update(
-            f"F8 Directory · {len(self._resources)} independent resources · {len(self._apps)} apps",
+            f"F8 Directory · {len(self._resources)} resources · {len(self._sessions)} sessions · {len(self._apps)} apps",
         )
+
+    def spawn_independent_session(self) -> None:
+        from .remote.media_hub import resource_spawn_session
+
+        al = self.query_one("#apps-list", OptionList)
+        idx = al.highlighted
+        entry = self._apps[idx] if (idx is not None and 0 <= idx < len(self._apps)) else self._apps[0]
+        # Prefer spawning on a reachable ResourceServer
+        targets: list[tuple[str, int, str]] = []
+        seen: set[tuple[str, int]] = set()
+        for r in self._resources:
+            if getattr(r, "port", 0) > 0 and (r.host, r.port) not in seen:
+                seen.add((r.host, r.port))
+                targets.append((r.host, r.port, f"{r.icon} {r.device_name}"))
+        if not targets:
+            self.query_one("#status", StatusBar).update("F8 · No active Resource Service to spawn session")
+            return
+
+        def _do_spawn(ep_idx: int) -> None:
+            host, port, dlabel = targets[ep_idx]
+            sess = resource_spawn_session(host, port, entry.app_id)
+            if sess is None:
+                self.query_one("#status", StatusBar).update(f"F8 · Failed to spawn {entry.name} on {dlabel}")
+                return
+            self.refresh_apps()
+            self.query_one("#status", StatusBar).update(
+                f"F8 · Spawned {entry.name} on {dlabel} (:{sess.get('port')} #{sess.get('session_id')})",
+            )
+
+        if len(targets) > 1 and hasattr(self.app, "ask_pick"):
+            self.app.ask_pick(
+                f"Spawn Independent '{entry.name}' on Device",
+                [(str(i), t[2]) for i, t in enumerate(targets)],
+                lambda val: _do_spawn(int(val)) if val is not None else None,
+            )
+        else:
+            _do_spawn(0)
+
+    def attach_selected_session(self) -> None:
+        sl = self.query_one("#sessions-list", OptionList)
+        idx = sl.highlighted
+        if idx is None or idx < 0 or idx >= len(self._sessions):
+            return
+        sess = self._sessions[idx]
+        tport = int(sess.get("port") or 0)
+        rhost = str(sess.get("res_host") or "127.0.0.1")
+        rport = int(sess.get("res_port") or 7423)
+        if tport <= 0:
+            return
+        from .remote.session_broker import start_session_tcp_relay
+
+        local_port, close_fn = start_session_tcp_relay(rhost, rport, tport)
+        self._relays.append(close_fn)
+        viewer_bin = Path(__file__).resolve().parents[2] / "rust" / "target" / "debug" / "tw-viewer"
+        if viewer_bin.is_file():
+            subprocess.Popen(
+                [str(viewer_bin), "--tcp", f"127.0.0.1:{local_port}"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            self.query_one("#status", StatusBar).update(
+                f"F8 · Opened {sess.get('name')} via SSH relay 127.0.0.1:{local_port}",
+            )
+        else:
+            self.query_one("#status", StatusBar).update(
+                f"F8 · Session tunnel ready at 127.0.0.1:{local_port}",
+            )
+
+    def stop_selected_session(self) -> None:
+        from .remote.media_hub import resource_stop_session
+
+        sl = self.query_one("#sessions-list", OptionList)
+        idx = sl.highlighted
+        if idx is None or idx < 0 or idx >= len(self._sessions):
+            return
+        sess = self._sessions[idx]
+        ok = resource_stop_session(str(sess["res_host"]), int(sess["res_port"]), str(sess["session_id"]))
+        self.refresh_apps()
+        self.query_one("#status", StatusBar).update("F8 · Stopped session" if ok else "F8 · Stop failed")
 
     def use_selected_resource(self) -> None:
         rl = self.query_one("#resources-list", OptionList)
@@ -1593,6 +1931,9 @@ class NodesScreen(Screen):
             return
         res = self._resources[idx]
         if self.app is None or not hasattr(self.app, "switch_mode"):
+            return
+        if res.kind == "ai":
+            self.app.switch_mode("composer")
             return
         self.app.switch_mode("media")
         scr = getattr(self.app, "screen", None)
@@ -1621,13 +1962,24 @@ class NodesScreen(Screen):
         if key == "r":
             self.refresh_apps()
             return True
+        if key == "n":
+            self.spawn_independent_session()
+            return True
+        if key == "t":
+            self.attach_selected_session()
+            return True
         if key == "u":
             self.use_selected_resource()
             return True
         if key == "enter":
             rl = self.query_one("#resources-list", OptionList)
-            if self.app is not None and getattr(self.app, "_focus", None) is rl:
+            sl = self.query_one("#sessions-list", OptionList)
+            foc = getattr(self.app, "_focus", None) if self.app is not None else None
+            if foc is rl:
                 self.use_selected_resource()
+                return True
+            if foc is sl:
+                self.attach_selected_session()
                 return True
             self.launch_selected_app()
             return True
@@ -1643,6 +1995,375 @@ class NodesScreen(Screen):
         return super().on_key(key)
 
 
+class ComposerScreen(Screen):
+    """F9 · Meta-OS Composer: wire Eyes (Sensors) + Knowledge (Local/Cloud AI) + Hands (Actuators)."""
+
+    DEFAULT_CSS = _SHARED_CSS + """
+    #comp-eyes-box { width: 1fr; border: round $primary; }
+    #comp-brain-box { width: 1fr; border: round $primary; }
+    #comp-hands-box { width: 1fr; border: round $primary; }
+    #comp-eyes-box:focus-within, #comp-brain-box:focus-within, #comp-hands-box:focus-within { border: round $accent; }
+    #comp-eyes-list { height: 1fr; }
+    #comp-brain-list { height: 1fr; }
+    #comp-log { height: 1fr; }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._eyes: list[Any] = []
+        self._brains: list[Any] = []
+        self._speakers: list[Any] = []
+        self._clipboards: list[Any] = []
+        self._spk_idx = 0
+        self._clip_idx = 0
+        self._last_image_b64 = ""
+        self._last_context = ""
+
+    def _reload_inventory(self) -> None:
+        from .remote.directory import ResourceEntry, discover_all_resources, local_device_profile
+
+        drv = getattr(self.app, "_driver", None) if self.app is not None else None
+        all_res = discover_all_resources(driver=drv)
+        local = local_device_profile()
+        self._eyes = [r for r in all_res if r.kind in ("camera", "clipboard", "files", "mic")]
+        self._eyes.append(
+            ResourceEntry(
+                device_id=local.device_id,
+                device_name=local.name,
+                device_kind=local.kind,
+                icon="🖥",
+                kind="ui_tree",
+                resource_id="active",
+                label="Live App UI State",
+                source="local",
+            ),
+        )
+        self._brains = [r for r in all_res if r.kind == "ai"]
+        self._speakers = [r for r in all_res if r.kind == "speaker"]
+        self._clipboards = [r for r in all_res if r.kind == "clipboard"]
+        if self._spk_idx >= len(self._speakers):
+            self._spk_idx = 0
+        if self._clip_idx >= len(self._clipboards):
+            self._clip_idx = 0
+
+    def _eye_label(self, r: Any) -> str:
+        return f"[{r.kind.upper():<7}] {r.display_label()}"
+
+    def _brain_label(self, r: Any) -> str:
+        return f"🤖 {r.device_name} · {r.label}"
+
+    def _speaker_btn_label(self) -> str:
+        if not self._speakers:
+            return "Target Speaker: Local"
+        s = self._speakers[self._spk_idx]
+        return f"Speaker: {s.icon} {s.device_name}"
+
+    def _clip_btn_label(self) -> str:
+        if not self._clipboards:
+            return "Target Clip: Local"
+        c = self._clipboards[self._clip_idx]
+        return f"Clip: {c.icon} {c.device_name}"
+
+    def compose(self):
+        yield _mode_bar(self, "composer")
+        self._reload_inventory()
+
+        eye_opts = [Option(self._eye_label(r), id=r.uid) for r in self._eyes]
+        eye_list = OptionList(*eye_opts, id="comp-eyes-list")
+        btn_cap = Button("Capture Eyes (E)", id="btn-comp-cap", on_press=self.capture_selected_eyes)
+        btn_ref = Button("Refresh (F)", id="btn-comp-ref", on_press=self.refresh_resources)
+        eye_btns = Horizontal(btn_cap, btn_ref, id="comp-eye-btns")
+        eye_btns.layout_hint_h = 36
+        eye_status = Static("Eyes: ready (pick Camera / Clipboard / UI)", id="comp-eye-info")
+        eyes_box = Panel(
+            Vertical(eye_btns, eye_list, eye_status, id="comp-eyes-inner"),
+            title="1. EYES · Cross-Device Sensors",
+            id="comp-eyes-box",
+        )
+
+        brain_opts = [Option(self._brain_label(r), id=r.uid) for r in self._brains]
+        brain_list = OptionList(*brain_opts, id="comp-brain-list")
+        inp = Input("Describe what you see and summarize clearly.", id="comp-prompt", placeholder="Ask AI or Human workflow…")
+        p1 = Button("Look & Tell", id="btn-p-look", on_press=self.preset_look_and_tell)
+        p2 = Button("Clip Bridge", id="btn-p-clip", on_press=self.preset_clip_bridge)
+        p3 = Button("Co-Pilot UI", id="btn-p-ui", on_press=self.preset_copilot_ui)
+        presets = Horizontal(p1, p2, p3, id="comp-presets")
+        presets.layout_hint_h = 36
+        brain_box = Panel(
+            Vertical(presets, inp, brain_list, id="comp-brain-inner"),
+            title="2. KNOWLEDGE · Local & Cloud AI",
+            id="comp-brain-box",
+        )
+
+        chk_spk = Checkbox("Speak -> Speaker", True, id="chk-hand-speak")
+        btn_spk = Button(self._speaker_btn_label(), id="btn-comp-spk", on_press=self.cycle_speaker)
+        chk_clip = Checkbox("Write -> Clipboard", True, id="chk-hand-clip")
+        btn_clip = Button(self._clip_btn_label(), id="btn-comp-clip", on_press=self.cycle_clipboard)
+        chk_ui = Checkbox("Allow UI Hands (switch/act)", False, id="chk-hand-ui")
+        btn_run = Button("Run Pipeline (R)", id="btn-comp-run", variant="primary", on_press=self.run_pipeline)
+        hands_btns = Horizontal(btn_spk, btn_clip, id="comp-hand-btns")
+        hands_btns.layout_hint_h = 36
+        comp_log = Log(id="comp-log")
+        comp_log.write_line("Meta-OS Composer ready. Pick Eyes + Brain + Hands, or click a Preset.")
+        hands_box = Panel(
+            Vertical(chk_spk, chk_clip, chk_ui, hands_btns, btn_run, comp_log, id="comp-hands-inner"),
+            title="3. HANDS · Cross-Device Actuation",
+            id="comp-hands-box",
+        )
+
+        yield Horizontal(eyes_box, brain_box, hands_box, id="main")
+        yield KeyBar([
+            ("E", "Capture Eyes", lambda: self.capture_selected_eyes()),
+            ("R", "Run Pipeline", lambda: self.run_pipeline()),
+            ("F", "Refresh", lambda: self.refresh_resources()),
+            ("Tab", "Panel", lambda: _focus_next(self)),
+            ("F1–F9", "Modes", None),
+            ("Q", "Quit", lambda: _quit(self)),
+        ])
+        yield StatusBar("F9 Meta-OS Composer · Eyes (Sensors) + Knowledge (AI) + Hands (Actuators)", id="status")
+
+    def refresh_resources(self) -> None:
+        self._reload_inventory()
+        el = self.query_one("#comp-eyes-list", OptionList)
+        el.clear_options()
+        for r in self._eyes:
+            el.add_option(Option(self._eye_label(r), id=r.uid))
+        bl = self.query_one("#comp-brain-list", OptionList)
+        bl.clear_options()
+        for r in self._brains:
+            bl.add_option(Option(self._brain_label(r), id=r.uid))
+        self.query_one("#btn-comp-spk", Button).label = self._speaker_btn_label()
+        self.query_one("#btn-comp-clip", Button).label = self._clip_btn_label()
+        self.query_one("#status", StatusBar).update(
+            f"F9 Composer · {len(self._eyes)} eyes · {len(self._brains)} AI brains · {len(self._speakers)} speakers",
+        )
+
+    def cycle_speaker(self) -> None:
+        if self._speakers:
+            self._spk_idx = (self._spk_idx + 1) % len(self._speakers)
+        self.query_one("#btn-comp-spk", Button).label = self._speaker_btn_label()
+
+    def cycle_clipboard(self) -> None:
+        if self._clipboards:
+            self._clip_idx = (self._clip_idx + 1) % len(self._clipboards)
+        self.query_one("#btn-comp-clip", Button).label = self._clip_btn_label()
+
+    def _log(self, msg: str) -> None:
+        try:
+            self.query_one("#comp-log", Log).write_line(msg)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _capture_ui_tree_summary(self) -> str:
+        if self.app is None:
+            return "No active app"
+        labels = [f"{k}:{t}" for k, t in getattr(self.app, "_labels", ())]
+        scr = getattr(self.app, "screen", None)
+        mode = getattr(self.app, "mode_key", "composer")
+        return f"App={getattr(self.app, 'TITLE', 'textual-wgpu')}; mode={mode}; screen={type(scr).__name__}; modes=[{', '.join(labels)}]"
+
+    def _capture_eye_resource(self, eye: Any) -> tuple[str, str, str]:
+        """Return (summary_label, text_context, image_b64)."""
+        import base64
+
+        if eye.kind == "camera":
+            if getattr(eye, "port", 0) > 0:
+                from .remote.ai_resource import snapshot_camera_frame
+
+                snap = snapshot_camera_frame(eye.host, eye.port, eye.resource_id, timeout=3.0)
+                if snap is not None:
+                    w, h, png_bytes = snap
+                    b64 = base64.b64encode(png_bytes).decode("ascii")
+                    return (f"Camera {w}x{h} PNG from {eye.display_label()}", "", b64)
+            return (f"Camera metadata: {eye.display_label()} (no live frame)", f"Camera source: {eye.display_label()}", "")
+        if eye.kind == "clipboard":
+            if getattr(eye, "port", 0) > 0:
+                from .remote.media_hub import resource_clip_get
+
+                txt = resource_clip_get(eye.host, eye.port)
+                return (f"Clipboard ({len(txt)} chars) from {eye.display_label()}", txt or "(empty clipboard)", "")
+            return (f"Clipboard from {eye.display_label()}", "(local clipboard)", "")
+        if eye.kind == "mic":
+            if getattr(eye, "port", 0) > 0:
+                from .remote.media_codec import pcm_rms_level
+                from .remote.media_hub import RemoteMicSubscriber
+
+                sub = RemoteMicSubscriber(eye.host, eye.port, eye.resource_id)
+                try:
+                    chunks: list[bytes] = []
+                    for _ in range(15):
+                        chunks.extend(sub.pop_chunks())
+                        if chunks:
+                            break
+                        time_mod_sleep = 0.04
+                        import time
+
+                        time.sleep(time_mod_sleep)
+                    pcm = b"".join(chunks)
+                    rms = pcm_rms_level(pcm) if pcm else 0.0
+                    return (
+                        f"Mic sample ({len(pcm)}B, rms={rms:.2f}) from {eye.display_label()}",
+                        f"Microphone {eye.display_label()} level RMS={rms:.2f} ({len(pcm)} bytes)",
+                        "",
+                    )
+                finally:
+                    sub.close()
+            return (f"Mic {eye.display_label()}", f"Microphone {eye.display_label()}", "")
+        if eye.kind == "ui_tree":
+            ctx = self._capture_ui_tree_summary()
+            return ("Live UI State captured", ctx, "")
+        return (f"Resource {eye.display_label()}", f"Resource: {eye.display_label()} ({eye.kind}:{eye.resource_id})", "")
+
+    def capture_selected_eyes(self) -> None:
+        el = self.query_one("#comp-eyes-list", OptionList)
+        idx = el.highlighted
+        if idx is None or idx < 0 or idx >= len(self._eyes):
+            return
+        eye = self._eyes[idx]
+        lbl, ctx, b64 = self._capture_eye_resource(eye)
+        self._last_context = ctx
+        self._last_image_b64 = b64
+        self.query_one("#comp-eye-info", Static).update(f"Captured: {lbl}")
+        self._log(f"[EYES] {lbl}")
+
+    def _run_with_eye(self, eye: Any, prompt: str) -> str:
+        import threading
+
+        bl = self.query_one("#comp-brain-list", OptionList)
+        bidx = bl.highlighted
+        brain = self._brains[bidx] if (bidx is not None and 0 <= bidx < len(self._brains)) else (self._brains[0] if self._brains else None)
+        speak_on = bool(self.query_one("#chk-hand-speak", Checkbox).value)
+        clip_on = bool(self.query_one("#chk-hand-clip", Checkbox).value)
+        ui_on = bool(self.query_one("#chk-hand-ui", Checkbox).value)
+        spk = self._speakers[self._spk_idx] if self._speakers else None
+        clp = self._clipboards[self._clip_idx] if self._clipboards else None
+
+        def _worker() -> None:
+            from .remote.ai_resource import run_ai_inference, synthesize_speech_pcm
+            from .remote.media_hub import RemoteSpeakerSink, resource_ai_infer, resource_clip_set
+
+            lbl, ctx, b64 = self._capture_eye_resource(eye)
+            if not ctx and not b64:
+                ctx = self._last_context
+                b64 = self._last_image_b64
+            self._emit_log(f"[EYES] {lbl}")
+
+            if brain is not None and getattr(brain, "port", 0) > 0:
+                answer = resource_ai_infer(
+                    brain.host,
+                    brain.port,
+                    brain.resource_id,
+                    prompt,
+                    context=ctx,
+                    image_b64=b64,
+                )
+            else:
+                answer = run_ai_inference(None, prompt, context=ctx, image_b64=b64)
+            self._emit_log(f"[KNOWLEDGE] {answer}")
+
+            if clip_on and clp is not None and getattr(clp, "port", 0) > 0:
+                ok = resource_clip_set(clp.host, clp.port, answer)
+                self._emit_log(f"[HANDS/CLIP] -> {clp.display_label()} ({'ok' if ok else 'err'})")
+
+            if speak_on:
+                pcm = synthesize_speech_pcm(answer, sample_rate=16000)
+                if spk is not None and getattr(spk, "port", 0) > 0:
+                    try:
+                        sink = RemoteSpeakerSink(spk.host, spk.port, sample_rate=16000, channels=1)
+                        try:
+                            for off in range(0, len(pcm), 4096):
+                                sink.write_pcm(pcm[off : off + 4096])
+                        finally:
+                            sink.close()
+                        self._emit_log(f"[HANDS/SPEAK] -> {spk.display_label()}")
+                    except Exception as exc:  # noqa: BLE001
+                        self._emit_log(f"[HANDS/SPEAK] error: {exc}")
+                elif self.app is not None and hasattr(self.app, "play_audio_pcm"):
+                    self.app.play_audio_pcm(pcm, sample_rate=16000, channels=1)
+                    self._emit_log("[HANDS/SPEAK] -> Default Viewer Speaker")
+
+            if ui_on:
+                self._apply_ui_hands(prompt, answer)
+
+        if self.app is not None and getattr(self.app, "_loop", None) is not None and self.app._loop.is_running():
+            threading.Thread(target=_worker, daemon=True).start()
+            return "running"
+        _worker()
+        return "done"
+
+    def _emit_log(self, msg: str) -> None:
+        loop = getattr(self.app, "_loop", None) if self.app is not None else None
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(self._log, msg)
+        else:
+            self._log(msg)
+
+    def _apply_ui_hands(self, prompt: str, answer: str) -> None:
+        low = (prompt + " " + answer).lower()
+        target_mode = None
+        for key in ("overview", "controls", "data", "editor", "themes", "planes", "media", "nodes"):
+            if key in low:
+                target_mode = key
+                break
+
+        def _act() -> None:
+            if target_mode and self.app is not None and hasattr(self.app, "switch_mode"):
+                self.app.switch_mode(target_mode)
+                self._log(f"[HANDS/UI] switched app mode -> {target_mode}")
+            elif self.app is not None and hasattr(self.app, "notify"):
+                self.app.notify(answer[:80], severity="information", timeout=3.0)
+                self._log("[HANDS/UI] showed toast notification on live canvas")
+
+        loop = getattr(self.app, "_loop", None) if self.app is not None else None
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(_act)
+        else:
+            _act()
+
+    def run_pipeline(self) -> None:
+        el = self.query_one("#comp-eyes-list", OptionList)
+        idx = el.highlighted
+        eye = self._eyes[idx] if (idx is not None and 0 <= idx < len(self._eyes)) else (self._eyes[0] if self._eyes else None)
+        if eye is None:
+            self._log("[ERR] No Eyes selected")
+            return
+        prompt = self.query_one("#comp-prompt", Input).value or "Analyze active resource."
+        self._run_with_eye(eye, prompt)
+
+    def preset_look_and_tell(self) -> None:
+        cam_idx = next((i for i, r in enumerate(self._eyes) if r.kind == "camera"), 0)
+        self.query_one("#comp-eyes-list", OptionList).highlighted = cam_idx
+        self.query_one("#comp-prompt", Input).value = "Look at this camera frame and describe what you see."
+        self.query_one("#chk-hand-speak", Checkbox).value = True
+        self.run_pipeline()
+
+    def preset_clip_bridge(self) -> None:
+        clip_idx = next((i for i, r in enumerate(self._eyes) if r.kind == "clipboard"), 0)
+        self.query_one("#comp-eyes-list", OptionList).highlighted = clip_idx
+        self.query_one("#comp-prompt", Input).value = "Summarize and clean up this clipboard content."
+        self.query_one("#chk-hand-clip", Checkbox).value = True
+        self.run_pipeline()
+
+    def preset_copilot_ui(self) -> None:
+        ui_idx = next((i for i, r in enumerate(self._eyes) if r.kind == "ui_tree"), 0)
+        self.query_one("#comp-eyes-list", OptionList).highlighted = ui_idx
+        self.query_one("#comp-prompt", Input).value = "Inspect UI state and demonstrate switching to media or nodes."
+        self.query_one("#chk-hand-ui", Checkbox).value = True
+        self.run_pipeline()
+
+    def on_key(self, key: str) -> bool:
+        if key == "e":
+            self.capture_selected_eyes()
+            return True
+        if key == "r":
+            self.run_pipeline()
+            return True
+        if key == "f":
+            self.refresh_resources()
+            return True
+        return super().on_key(key)
+
+
 def build_demo_app(theme: Theme | None = None, *, start: str = "overview") -> ModeApp:
     """Create the standalone ``textual-wgpu`` demo application."""
     modes: list[tuple[str, str, type[Screen]]] = [
@@ -1654,6 +2375,7 @@ def build_demo_app(theme: Theme | None = None, *, start: str = "overview") -> Mo
         ("planes", "3D Scene", PlanesScreen),
         ("media", "Media", MediaScreen),
         ("nodes", "Nodes & Apps", NodesScreen),
+        ("composer", "Composer", ComposerScreen),
     ]
     return ModeApp(
         modes,
