@@ -1051,7 +1051,8 @@ class MediaScreen(Screen):
             self._file_streamer = None
         drv = getattr(self.app, "_driver", None) if self.app is not None else None
         if src.startswith("peer") and hasattr(drv, "on_request_peer_camera"):
-            facing = 2 if (src in ("peer_back", "peer:2")) else 1
+            cid = src.split(":", 1)[1] if ":" in src else ""
+            facing = 2 if (src in ("peer_back", "peer:2") or cid == "back") else 1
             vid = self.query_one("#media-video", Video)
 
             def _on_peer_nalu(pts_us: int, flags: int, raw: bytes) -> None:
@@ -1060,19 +1061,22 @@ class MediaScreen(Screen):
                 cflag = flags & 0xF0
                 vid.push_packet(pts_us, raw, keyframe=is_kf, codec_flag=cflag, rotation=rot)
 
-            drv.on_request_peer_camera(facing, _on_peer_nalu)
+            drv.on_request_peer_camera(facing, _on_peer_nalu, cam_id=cid)
             self._cam_mode = "peer"
             self._video_playing = True
             self.query_one("#btn-cam", Button).label = "Stop Cam (C)"
+            peer = getattr(drv, "peer_profile", None)
+            pname = peer.name if peer is not None else "Peer"
             self.query_one("#status", StatusBar).update(
-                f"F7 Media · streaming connected device camera ({'back' if facing == 2 else 'front'})",
+                f"F7 Media · streaming {pname} camera ({cid or ('back' if facing == 2 else 'front')})",
             )
             return
         try:
             from .remote.media_codec import LocalCameraStreamer
 
-            facing = 2 if src == "local:back" else 1
-            device = src.split(":", 1)[1] if src.startswith("local:/") else None
+            cid = src.split(":", 1)[1] if ":" in src else "front"
+            facing = 2 if cid == "back" else 1
+            device = cid if cid.startswith("/") else None
             self._file_streamer = LocalCameraStreamer(
                 facing=facing,
                 device=device,
@@ -1082,46 +1086,32 @@ class MediaScreen(Screen):
             self._video_playing = True
             self.query_one("#btn-cam", Button).label = "Stop Cam (C)"
             self.query_one("#btn-video", Button).label = "Pause Video (V)"
-            label = device or ("Back Camera" if facing == 2 else "Front Camera")
-            self.query_one("#status", StatusBar).update(f"F7 Media · streaming local camera ({label})")
+            self.query_one("#status", StatusBar).update(f"F7 Media · streaming camera ({cid})")
         except Exception as exc:  # noqa: BLE001
             self.query_one("#status", StatusBar).update(f"F7 Media · camera error: {exc}")
 
     def toggle_camera(self) -> None:
-        import os
-        import socket
-        import sys
+        from .remote.directory import local_device_profile
 
         if self._cam_mode is not None:
             self._stop_camera()
             self.query_one("#status", StatusBar).update("F7 Media · camera stopped")
             return
-        is_android = (
-            "ANDROID_ROOT" in os.environ
-            or hasattr(sys, "getandroidapilevel")
-            or Path("/system/build.prop").exists()
-        )
+        local = local_device_profile()
         drv = getattr(self.app, "_driver", None) if self.app is not None else None
-        has_peer = hasattr(drv, "on_request_peer_camera")
-        options: list[tuple[str, str]] = []
-        if is_android:
-            options.append(("local:front", "📱 This Phone · Front Camera"))
-            options.append(("local:back", "📱 This Phone · Back Camera"))
-            if has_peer:
-                options.append(("peer:1", "💻 Connected Device · Camera"))
-        else:
-            from .remote.media_codec import list_linux_cameras
+        peer = drv.distinct_peer_profile(local) if hasattr(drv, "distinct_peer_profile") else None
 
-            host = socket.gethostname() or "Workstation"
-            cams = list_linux_cameras()
-            if cams:
-                for dev_path, cname in cams:
-                    options.append((f"local:{dev_path}", f"💻 {host} · {cname} ({dev_path})"))
+        options: list[tuple[str, str]] = []
+        for cid, clabel in local.cameras:
+            options.append((f"local:{cid}", f"{local.icon} {local.name} · {clabel}"))
+        if not options:
+            options.append(("local:front", f"{local.icon} {local.name} · Camera"))
+        if peer is not None:
+            if peer.cameras:
+                for cid, clabel in peer.cameras:
+                    options.append((f"peer:{cid}", f"{peer.icon} {peer.name} · {clabel}"))
             else:
-                options.append(("local:front", f"💻 {host} · Default Camera"))
-            if has_peer:
-                options.append(("peer:1", "📱 Connected Device · Front Camera"))
-                options.append(("peer:2", "📱 Connected Device · Back Camera"))
+                options.append(("peer:1", f"{peer.icon} {peer.name} · Camera"))
 
         if len(options) > 1 and hasattr(self.app, "ask_pick"):
             self.app.ask_pick(
@@ -1205,29 +1195,24 @@ class MediaScreen(Screen):
             self.query_one("#status", StatusBar).update(f"F7 Media · mic error: {exc}")
 
     def toggle_mic(self) -> None:
-        import os
-        import socket
-        import sys
+        from .remote.directory import local_device_profile
 
         if self._mic_mode is not None:
             self._stop_mic()
             self.query_one("#status", StatusBar).update("F7 Media · mic stopped (press A to play recording)")
             return
+        local = local_device_profile()
         drv = getattr(self.app, "_driver", None) if self.app is not None else None
-        is_android = (
-            "ANDROID_ROOT" in os.environ
-            or hasattr(sys, "getandroidapilevel")
-            or Path("/system/build.prop").exists()
-        )
-        local_lbl = "📱 This Phone · Microphone" if is_android else f"💻 {socket.gethostname() or 'Workstation'} · Microphone"
-        peer_lbl = "💻 Connected Device · Microphone" if is_android else "📱 Connected Device · Microphone"
-        if hasattr(drv, "on_request_peer_mic") and hasattr(self.app, "ask_pick"):
+        peer = drv.distinct_peer_profile(local) if hasattr(drv, "distinct_peer_profile") else None
+        options: list[tuple[str, str]] = [
+            ("local", f"{local.icon} {local.name} · Microphone"),
+        ]
+        if peer is not None:
+            options.append(("peer", f"{peer.icon} {peer.name} · Microphone"))
+        if len(options) > 1 and hasattr(self.app, "ask_pick"):
             self.app.ask_pick(
                 "Select Microphone Source",
-                [
-                    ("local", local_lbl),
-                    ("peer", peer_lbl),
-                ],
+                options,
                 lambda val: self._start_mic_source(val) if val else None,
             )
         else:

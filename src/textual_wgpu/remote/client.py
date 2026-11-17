@@ -108,7 +108,8 @@ class RemoteViewer:
             return False
         elif frame.op == Op.CAM_CTL:
             mode = frame.payload[0] if frame.payload else 0
-            self._handle_cam_ctl(mode)
+            cam_id = frame.payload[1:].decode("utf-8", errors="replace") if len(frame.payload) > 1 else ""
+            self._handle_cam_ctl(mode, cam_id)
             return False
         elif frame.op == Op.MIC_CTL:
             enabled = bool(frame.payload[0]) if frame.payload else False
@@ -125,10 +126,21 @@ class RemoteViewer:
             if self.state.width_scale != 1.0:
                 tw_fonts.configure(width_scale=self.state.width_scale)
             if self.transport is not None:
+                from .directory import local_device_profile
+
+                prof = local_device_profile()
                 self.transport.send(
                     Frame(
                         op=Op.CAPS,
-                        payload=encode_caps(has_gpu=True, vram_mb=1024, codecs="h264,hevc,av1"),
+                        payload=encode_caps(
+                            has_gpu=True,
+                            vram_mb=1024,
+                            codecs="h264,hevc,av1",
+                            device_id=prof.device_id,
+                            device_name=prof.name,
+                            device_kind=prof.kind,
+                            cameras=prof.cameras_spec(),
+                        ),
                         prio=Priority.P0_CONTROL,
                     ),
                 )
@@ -276,7 +288,7 @@ class RemoteViewer:
             except OSError:
                 pass
 
-    def _handle_cam_ctl(self, mode: int) -> None:
+    def _handle_cam_ctl(self, mode: int, cam_id: str = "") -> None:
         import threading
         import time
 
@@ -292,7 +304,9 @@ class RemoteViewer:
         try:
             from .media_codec import LocalCameraStreamer
 
-            cam = LocalCameraStreamer(facing=mode)
+            dev = cam_id if cam_id.startswith("/") else None
+            facing = 2 if (mode >= 2 or cam_id == "back") else 1
+            cam = LocalCameraStreamer(facing=facing, device=dev)
         except Exception:  # noqa: BLE001
             return
         self._cam_streamer = cam

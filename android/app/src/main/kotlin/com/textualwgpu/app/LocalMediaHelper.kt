@@ -18,11 +18,13 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaRecorder
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.provider.Settings
 import android.util.Log
 import android.view.Surface
 import java.io.ByteArrayOutputStream
@@ -68,6 +70,66 @@ object LocalMediaHelper {
     @JvmStatic
     fun setAppContext(ctx: Context) {
         appCtx = ctx.applicationContext
+    }
+
+    @JvmStatic
+    fun deviceId(ctx: Context): String {
+        val aid = try {
+            Settings.Secure.getString(ctx.contentResolver, Settings.Secure.ANDROID_ID).orEmpty()
+        } catch (_: Throwable) {
+            ""
+        }
+        return if (aid.isNotBlank()) "android-$aid" else "android-${Build.MODEL}"
+    }
+
+    @JvmStatic
+    fun deviceName(): String = Build.MODEL?.takeIf { it.isNotBlank() } ?: "Android Phone"
+
+    @JvmStatic
+    fun camerasSpec(ctx: Context): String {
+        val out = mutableListOf<String>()
+        try {
+            val mgr = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            var hasFront = false
+            var hasBack = false
+            for (id in mgr.cameraIdList) {
+                val facing = mgr.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING)
+                if (facing == CameraCharacteristics.LENS_FACING_FRONT) hasFront = true
+                if (facing == CameraCharacteristics.LENS_FACING_BACK) hasBack = true
+            }
+            if (hasFront) out.add("front=Front Camera")
+            if (hasBack) out.add("back=Back Camera")
+        } catch (_: Throwable) {
+        }
+        if (out.isEmpty()) {
+            out.add("front=Front Camera")
+            out.add("back=Back Camera")
+        }
+        return out.joinToString(";")
+    }
+
+    @JvmStatic
+    fun deviceProfileJson(): String {
+        val ctx = appCtx ?: LocalPythonHost.appContext
+        val id = if (ctx != null) deviceId(ctx) else "android-${deviceName()}"
+        val name = deviceName()
+        val cams = if (ctx != null) camerasSpec(ctx) else "front=Front Camera;back=Back Camera"
+        return org.json.JSONObject().apply {
+            put("id", id)
+            put("name", name)
+            put("kind", "android")
+            put("cameras", cams)
+        }.toString()
+    }
+
+    @JvmStatic
+    fun syncRustDeviceInfo(ctx: Context) {
+        val ac = ctx.applicationContext
+        setAppContext(ac)
+        try {
+            TwBridge.nativeSetDeviceInfo(deviceId(ac), deviceName(), "android", camerasSpec(ac))
+        } catch (_: Throwable) {
+        }
     }
 
     @JvmStatic

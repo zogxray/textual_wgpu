@@ -95,5 +95,6 @@ object TwBridge {
     )
     external fun nativeSendVideoNalu(ptr: Long, ptsUs: Long, flags: Int, data: ByteArray)
     external fun nativeSendAudioPcm(ptr: Long, sampleRate: Int, channels: Int, pcm: ByteArray)
+    external fun nativeSetDeviceInfo(deviceId: String, deviceName: String, deviceKind: String, camerasSpec: String)
     external fun nativeDisconnect(ptr: Long)
 }

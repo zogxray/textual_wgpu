@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import json
+import os
 import socket
 import struct
 import sys
@@ -437,3 +438,83 @@ def discover_lan_nodes(
             sock.close()
         except OSError:
             pass
+
+
+@dataclass(slots=True)
+class DeviceProfile:
+    """Real identity & media hardware advertised by each node (no 'if is_android' guessing)."""
+
+    device_id: str
+    name: str
+    kind: str = "desktop"  # "android" | "desktop"
+    cameras: list[tuple[str, str]] = field(default_factory=list)
+    has_mic: bool = True
+
+    @property
+    def icon(self) -> str:
+        return "📱" if self.kind == "android" else "💻"
+
+    def cameras_spec(self) -> str:
+        return ";".join(f"{cid}={label}" for cid, label in self.cameras)
+
+
+def parse_cameras_spec(spec: str) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for part in (spec or "").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" in part:
+            cid, _, label = part.partition("=")
+            out.append((cid.strip(), label.strip() or cid.strip()))
+        else:
+            out.append((part, part))
+    return out
+
+
+def _read_linux_machine_id() -> str:
+    for p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            val = Path(p).read_text(encoding="utf-8").strip()
+            if val:
+                return val
+        except OSError:
+            pass
+    return socket.gethostname() or "desktop"
+
+
+def local_device_profile() -> DeviceProfile:
+    """Discover real local device ID, human name, kind, and attached cameras."""
+    is_android = (
+        "ANDROID_ROOT" in os.environ
+        or hasattr(sys, "getandroidapilevel")
+        or Path("/system/build.prop").exists()
+    )
+    if is_android:
+        try:
+            from com.textualwgpu.app import LocalMediaHelper  # type: ignore[import-not-found]
+
+            raw = str(LocalMediaHelper.deviceProfileJson() or "{}")
+            data = json.loads(raw)
+            did = str(data.get("id") or "android")
+            name = str(data.get("name") or "Android Phone")
+            cams = parse_cameras_spec(str(data.get("cameras") or "front=Front Camera;back=Back Camera"))
+            return DeviceProfile(device_id=did, name=name, kind="android", cameras=cams)
+        except Exception:  # noqa: BLE001
+            return DeviceProfile(
+                device_id=f"android-{socket.gethostname() or 'phone'}",
+                name="Android Phone",
+                kind="android",
+                cameras=[("front", "Front Camera"), ("back", "Back Camera")],
+            )
+
+    from .media_codec import list_linux_cameras
+
+    host = socket.gethostname() or "Workstation"
+    cams = list_linux_cameras()
+    return DeviceProfile(
+        device_id=_read_linux_machine_id(),
+        name=host,
+        kind="desktop",
+        cameras=cams,
+    )

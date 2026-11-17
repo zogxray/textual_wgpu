@@ -343,15 +343,47 @@ def decode_vid_nalu(data: bytes) -> tuple[int, int, tuple[float, ...], bytes]:
     return unpacked[0], unpacked[1], unpacked[2:], data[NALU_HDR_STRUCT.size :]
 
 
-def encode_caps(*, has_gpu: bool, vram_mb: int, codecs: str = "h264,hevc,av1") -> bytes:
+def encode_caps(
+    *,
+    has_gpu: bool,
+    vram_mb: int,
+    codecs: str = "h264,hevc,av1",
+    device_id: str = "",
+    device_name: str = "",
+    device_kind: str = "",
+    cameras: str = "",
+) -> bytes:
     cb = codecs.encode("utf-8")[:65535]
-    return CAPS_STRUCT.pack(1 if has_gpu else 0, max(0, int(vram_mb)), len(cb)) + cb
+    out = bytearray(CAPS_STRUCT.pack(1 if has_gpu else 0, max(0, int(vram_mb)), len(cb)) + cb)
+    if device_id or device_name or device_kind or cameras:
+        out.extend(_pack_str(device_id, 255))
+        out.extend(_pack_str(device_name, 255))
+        out.extend(_pack_str(device_kind, 63))
+        out.extend(_pack_str(cameras, 2047))
+    return bytes(out)
 
 
 def decode_caps(data: bytes) -> tuple[bool, int, str]:
     hg, vram, clen = CAPS_STRUCT.unpack_from(data, 0)
     off = CAPS_STRUCT.size
     return bool(hg), int(vram), data[off : off + clen].decode("utf-8", errors="replace")
+
+
+def decode_caps_full(data: bytes) -> tuple[bool, int, str, str, str, str, str]:
+    hg, vram, clen = CAPS_STRUCT.unpack_from(data, 0)
+    off = CAPS_STRUCT.size
+    codecs = data[off : off + clen].decode("utf-8", errors="replace")
+    off += clen
+    did = dname = dkind = cams = ""
+    if off + 2 <= len(data):
+        did, off = _unpack_str(data, off)
+    if off + 2 <= len(data):
+        dname, off = _unpack_str(data, off)
+    if off + 2 <= len(data):
+        dkind, off = _unpack_str(data, off)
+    if off + 2 <= len(data):
+        cams, off = _unpack_str(data, off)
+    return bool(hg), int(vram), codecs, did, dname, dkind, cams
 
 
 def encode_plane_rect(rect: tuple[int, int, int, int], *, kind: int, flags: int = 0) -> bytes:

@@ -26,6 +26,7 @@ from .protocol import (
     Priority,
     decode_audio_pcm,
     decode_caps,
+    decode_caps_full,
     decode_client_file,
     decode_fs_entries,
     decode_input_pointer,
@@ -145,6 +146,7 @@ class RemoteServerDriver(Driver):
         self._fs_req_t0: float = 0.0
         self._peer_cam_cb: Any = None
         self._peer_mic_cb: Any = None
+        self.peer_profile: Any = None
         self._frame_counter: int = 0
         self._last_order: list[str] | None = None
         self._last_bg: Any = None
@@ -287,11 +289,21 @@ class RemoteServerDriver(Driver):
         )
         self._draw_event.set()
 
-    def on_request_peer_camera(self, mode: int, callback: Any = None) -> None:
+    def distinct_peer_profile(self, local_profile: Any) -> Any:
+        """Return peer ``DeviceProfile`` only if it represents a different physical device."""
+        peer = self.peer_profile
+        if peer is None:
+            return None
+        if peer.device_id and local_profile.device_id and peer.device_id == local_profile.device_id:
+            return None
+        return peer
+
+    def on_request_peer_camera(self, mode: int, callback: Any = None, cam_id: str = "") -> None:
         self._peer_cam_cb = callback if mode else None
-        rlog("CAM", f"CAM_CTL -> peer mode={mode}")
+        rlog("CAM", f"CAM_CTL -> peer mode={mode} cam_id={cam_id!r}")
+        payload = bytes([int(mode) & 0xFF]) + (cam_id.encode("utf-8") if (mode and cam_id) else b"")
         self.transport.send(
-            Frame(op=Op.CAM_CTL, payload=bytes([int(mode) & 0xFF]), prio=Priority.P0_CONTROL),
+            Frame(op=Op.CAM_CTL, payload=payload, prio=Priority.P0_CONTROL),
             compress=False,
         )
         self._draw_event.set()
@@ -763,13 +775,22 @@ class RemoteServerDriver(Driver):
             from ..widgets.viewport3d import ClientCapabilities
             from ..widgets.video import Video
             from ..widgets.viewport3d import Viewport3D
+            from .directory import DeviceProfile, parse_cameras_spec
 
-            hg, vram, codecs = decode_caps(frame.payload)
+            hg, vram, codecs, did, dname, dkind, cams_spec = decode_caps_full(frame.payload)
             self.client_caps = ClientCapabilities(
                 has_gpu=hg,
                 vram_mb=vram,
                 codecs=tuple(c.strip() for c in codecs.split(",") if c.strip()),
             )
+            if did or dname or dkind or cams_spec:
+                self.peer_profile = DeviceProfile(
+                    device_id=did,
+                    name=dname or did or "Peer",
+                    kind=dkind or "desktop",
+                    cameras=parse_cameras_spec(cams_spec),
+                )
+                rlog("NET", f"peer CAPS: id={did!r} name={dname!r} kind={dkind!r} cams={cams_spec!r}")
             self._last_plane_rect.clear()
             root = self.app._ensure_screen() if hasattr(self.app, "_ensure_screen") else self.app.screen
             if root is not None and any(isinstance(w, (Viewport3D, Video)) for w in root._walk(root)):

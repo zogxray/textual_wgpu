@@ -775,13 +775,31 @@ pub fn decode_fs_entries(data: &[u8]) -> Result<(String, Vec<FsEntry>), ProtoErr
 }
 
 pub fn encode_caps(has_gpu: bool, vram_mb: u32, codecs: &str) -> Vec<u8> {
+    encode_caps_with_device(has_gpu, vram_mb, codecs, "", "", "", "")
+}
+
+pub fn encode_caps_with_device(
+    has_gpu: bool,
+    vram_mb: u32,
+    codecs: &str,
+    device_id: &str,
+    device_name: &str,
+    device_kind: &str,
+    cameras: &str,
+) -> Vec<u8> {
     let cb = codecs.as_bytes();
     let clen = cb.len().min(65535);
-    let mut out = Vec::with_capacity(7 + clen);
+    let mut out = Vec::with_capacity(7 + clen + 64);
     out.push(if has_gpu { 1 } else { 0 });
     out.extend_from_slice(&vram_mb.to_le_bytes());
     out.extend_from_slice(&(clen as u16).to_le_bytes());
     out.extend_from_slice(&cb[..clen]);
+    if !device_id.is_empty() || !device_name.is_empty() || !device_kind.is_empty() || !cameras.is_empty() {
+        push_str16(&mut out, device_id, 255);
+        push_str16(&mut out, device_name, 255);
+        push_str16(&mut out, device_kind, 63);
+        push_str16(&mut out, cameras, 2047);
+    }
     out
 }
 

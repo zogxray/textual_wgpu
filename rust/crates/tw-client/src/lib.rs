@@ -1,5 +1,5 @@
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -7,12 +7,81 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tw_proto::{
     decode_app_list, decode_audio_pcm, decode_launch_status, decode_vid_nalu, encode_audio_pcm,
-    encode_caps, encode_client_file, encode_fs_entries, encode_input_pointer, encode_input_wheel,
-    encode_launch_app, encode_resize, encode_vid_nalu, unpack_header, AppEntry, Frame,
-    FrameReassembler, FsEntry, Op, Priority, PriorityMux, HEADER_SIZE, VID_CODEC_MASK,
+    encode_caps_with_device, encode_client_file, encode_fs_entries, encode_input_pointer,
+    encode_input_wheel, encode_launch_app, encode_resize, encode_vid_nalu, unpack_header, AppEntry,
+    Frame, FrameReassembler, FsEntry, Op, Priority, PriorityMux, HEADER_SIZE, VID_CODEC_MASK,
     VID_FLAG_KEYFRAME, VID_ROT_MASK, VID_ROT_SHIFT,
 };
 use tw_render::SceneState;
+
+#[derive(Debug, Clone)]
+pub struct LocalDeviceInfo {
+    pub device_id: String,
+    pub device_name: String,
+    pub device_kind: String,
+    pub cameras: String,
+}
+
+static LOCAL_DEVICE_INFO: OnceLock<RwLock<LocalDeviceInfo>> = OnceLock::new();
+
+fn default_local_device_info() -> LocalDeviceInfo {
+    let device_id = ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+        .iter()
+        .find_map(|p| std::fs::read_to_string(p).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| "desktop".into())
+        });
+    let device_name = std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "Workstation".into());
+    let mut cams = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/sys/class/video4linux") {
+        let mut nodes: Vec<String> = rd
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.starts_with("video"))
+            .collect();
+        nodes.sort();
+        for node in nodes {
+            let idx = std::fs::read_to_string(format!("/sys/class/video4linux/{node}/index"))
+                .unwrap_or_else(|_| "0".into());
+            if idx.trim() != "0" {
+                continue;
+            }
+            let dev = format!("/dev/{node}");
+            if !std::path::Path::new(&dev).exists() {
+                continue;
+            }
+            let cname = std::fs::read_to_string(format!("/sys/class/video4linux/{node}/name"))
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| node.clone());
+            cams.push(format!("{dev}={cname}"));
+        }
+    }
+    LocalDeviceInfo {
+        device_id,
+        device_name,
+        device_kind: "desktop".into(),
+        cameras: cams.join(";"),
+    }
+}
+
+pub fn set_local_device_info(info: LocalDeviceInfo) {
+    let lock = LOCAL_DEVICE_INFO.get_or_init(|| RwLock::new(default_local_device_info()));
+    if let Ok(mut g) = lock.write() {
+        *g = info;
+    }
+}
+
+pub fn get_local_device_info() -> LocalDeviceInfo {
+    let lock = LOCAL_DEVICE_INFO.get_or_init(|| RwLock::new(default_local_device_info()));
+    lock.read().map(|g| g.clone()).unwrap_or_else(|_| default_local_device_info())
+}
 
 #[derive(Clone)]
 pub struct ClientHandle {
@@ -118,7 +187,7 @@ pub struct ClientCallbacks {
     pub on_launch_status: Arc<dyn Fn(bool, &str, &str) + Send + Sync>,
     pub on_fs_list: Arc<dyn Fn(&str) + Send + Sync>,
     pub on_fs_get: Arc<dyn Fn(&str) + Send + Sync>,
-    pub on_cam_ctl: Arc<dyn Fn(u8) + Send + Sync>,
+    pub on_cam_ctl: Arc<dyn Fn(u8, &str) + Send + Sync>,
     pub on_mic_ctl: Arc<dyn Fn(u8) + Send + Sync>,
 }
 
@@ -136,7 +205,7 @@ impl Default for ClientCallbacks {
             on_launch_status: Arc::new(|_, _, _| {}),
             on_fs_list: Arc::new(|_| {}),
             on_fs_get: Arc::new(|_| {}),
-            on_cam_ctl: Arc::new(|_| {}),
+            on_cam_ctl: Arc::new(|_, _| {}),
             on_mic_ctl: Arc::new(|_| {}),
         }
     }
@@ -365,9 +434,18 @@ fn dispatch_incoming_frame(
     cbs: &ClientCallbacks,
 ) {
     if frame.op == Op::Hello {
+        let info = get_local_device_info();
         let _ = tx_caps.send(Frame::new(
             Op::Caps,
-            encode_caps(true, 1024, "hevc,h264,av1"),
+            encode_caps_with_device(
+                true,
+                1024,
+                "hevc,h264,av1",
+                &info.device_id,
+                &info.device_name,
+                &info.device_kind,
+                &info.cameras,
+            ),
             Priority::P0Control,
         ));
     }
@@ -398,7 +476,12 @@ fn dispatch_incoming_frame(
         }
         Op::CamCtl => {
             let mode = frame.payload.first().copied().unwrap_or(0);
-            (cbs.on_cam_ctl)(mode);
+            let cam_id = if frame.payload.len() > 1 {
+                String::from_utf8_lossy(&frame.payload[1..]).into_owned()
+            } else {
+                String::new()
+            };
+            (cbs.on_cam_ctl)(mode, &cam_id);
         }
         Op::MicCtl => {
             let mode = frame.payload.first().copied().unwrap_or(0);

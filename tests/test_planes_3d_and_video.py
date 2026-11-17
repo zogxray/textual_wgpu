@@ -220,7 +220,9 @@ async def test_client_file_upload_and_media_screen_file_loading(monkeypatch, tmp
                 break
         assert app.mode_key == "media"
 
-        # Press O -> unified FilePickerModal opens with Local + Connected Device roots!
+        from textual_wgpu.remote.directory import DeviceProfile
+
+        # Press O -> unified FilePickerModal opens; when peer == same device, NO duplicate self-entry!
         png_buf = io.BytesIO()
         PilImage.new("RGBA", (64, 48), (12, 180, 240, 255)).save(png_buf, format="PNG")
         peer_file_path = tmp_path / "sample_upload.png"
@@ -228,6 +230,24 @@ async def test_client_file_upload_and_media_screen_file_loading(monkeypatch, tmp
         monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
         (tmp_path / "Downloads").mkdir(exist_ok=True)
 
+        await asyncio.sleep(0.05)  # allow CAPS from viewer to arrive
+        await viewer.send_key("o")
+        for _ in range(20):
+            if getattr(app, "_open_file", None) is not None:
+                break
+            await asyncio.sleep(0.02)
+        modal_same = getattr(app, "_open_file", None)
+        assert modal_same is not None
+        assert not any(e[0] == "peer_dir" for e in modal_same["entries"])
+        app._open_file_cancel()
+
+        # Now peer has a distinct device_id ("moto g75 5G") -> appears cleanly with real name!
+        drv.peer_profile = DeviceProfile(
+            device_id="android-remote-1",
+            name="moto g75 5G",
+            kind="android",
+            cameras=[("front", "Front Camera"), ("back", "Back Camera")],
+        )
         await viewer.send_key("o")
         for _ in range(20):
             if getattr(app, "_open_file", None) is not None:
@@ -237,6 +257,7 @@ async def test_client_file_upload_and_media_screen_file_loading(monkeypatch, tmp
         assert modal is not None and modal.get("unified") is True
         entries = modal["entries"]
         peer_idx = next(i for i, e in enumerate(entries) if e[0] == "peer_dir")
+        assert "moto g75 5G" in entries[peer_idx][2]
         modal["index"] = peer_idx
         app._open_file_activate()
 
@@ -333,7 +354,7 @@ async def test_remote_camera_and_mic_control_routing(tmp_path: Path):
 
     cam_cmds: list[int] = []
     mic_cmds: list[bool] = []
-    viewer._handle_cam_ctl = lambda mode: cam_cmds.append(mode)  # type: ignore[method-assign]
+    viewer._handle_cam_ctl = lambda mode, cam_id="": cam_cmds.append(mode)  # type: ignore[method-assign]
     viewer._handle_mic_ctl = lambda en: mic_cmds.append(en)  # type: ignore[method-assign]
 
     await drv.start()
@@ -410,6 +431,7 @@ async def test_remote_camera_and_mic_control_routing(tmp_path: Path):
 def test_camera_source_discovery_adapts_to_host_os(monkeypatch):
     from textual_wgpu.demo import build_demo_app
     from textual_wgpu.geometry import Rect
+    from textual_wgpu.remote.directory import DeviceProfile, local_device_profile
     from textual_wgpu.remote.media_codec import list_linux_cameras
 
     cams = list_linux_cameras()
@@ -422,18 +444,42 @@ def test_camera_source_discovery_adapts_to_host_os(monkeypatch):
     scr = app._ensure_screen()
     scr.layout(Rect(0, 0, 960, 600))
 
-    # Simulate Android host -> toggle_camera offers Phone Front + Back
+    # Simulate Android host with a distinct Workstation peer -> uses real names, no duplicate self
     monkeypatch.setenv("ANDROID_ROOT", "/system")
 
     class _FakeDrv:
-        def on_request_peer_camera(self, *_a):
+        def __init__(self, peer):
+            self.peer_profile = peer
+
+        def distinct_peer_profile(self, local):
+            if self.peer_profile.device_id == local.device_id:
+                return None
+            return self.peer_profile
+
+        def on_request_peer_camera(self, *_a, **_kw):
             pass
 
-    app._driver = _FakeDrv()
+    ws_peer = DeviceProfile(
+        device_id="ws-1",
+        name="vpavlov-workstation",
+        kind="desktop",
+        cameras=[("/dev/video0", "HD Webcam")],
+    )
+    app._driver = _FakeDrv(ws_peer)
     scr.toggle_camera()
     assert app._pick is not None
     keys = [o[0] for o in app._pick["options"]]
-    assert "local:front" in keys and "local:back" in keys and "peer:1" in keys
+    labels = [o[1] for o in app._pick["options"]]
+    assert "local:front" in keys and "local:back" in keys and "peer:/dev/video0" in keys
+    assert any("vpavlov-workstation" in lbl for lbl in labels)
+    app._pick = None
+
+    # Same device_id as peer (e.g. Phone viewing LocalPythonHost) -> omits duplicate peer!
+    local_prof = local_device_profile()
+    app._driver = _FakeDrv(local_prof)
+    scr.toggle_camera()
+    assert app._pick is not None
+    assert not any(o[0].startswith("peer:") for o in app._pick["options"])
     app._pick = None
 
     # Verify rotation flag encoding and clean pause cleanup

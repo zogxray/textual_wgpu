@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .client import RemoteViewer
-from .directory import AppEntry, NodeEntry, NodeRegistry, discover_local_apps
+from .directory import AppEntry, DeviceProfile, NodeEntry, NodeRegistry, discover_local_apps, local_device_profile
 from .protocol import Frame, Op, Priority
 from .recorder import DrawRecorder, RemoteSceneState, StyleInterner, apply_remote_frame, replay_ops
 from .server_driver import RemoteServerDriver

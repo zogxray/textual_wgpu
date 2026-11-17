@@ -605,14 +605,18 @@ fn main() {
                 }
             });
         }),
-        on_cam_ctl: Arc::new(move |mode| {
+        on_cam_ctl: Arc::new(move |mode, cam_id| {
             stop_audio(&cam_ctl_slot);
             if mode == 0 {
                 eprintln!("[tw-cam] stopped");
                 return;
             }
             let Some(ch) = client_for_cam.lock().ok().and_then(|g| g.clone()) else { return };
-            let cam_dev = find_v4l2_capture_device();
+            let cam_dev = if cam_id.starts_with('/') && std::path::Path::new(cam_id).exists() {
+                cam_id.to_string()
+            } else {
+                find_v4l2_capture_device()
+            };
             eprintln!("[tw-cam] starting {cam_dev} (mode={mode})");
             if let Ok(mut child) = Command::new("ffmpeg")
                 .args([

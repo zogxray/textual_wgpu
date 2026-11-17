@@ -64,7 +64,10 @@ mod android_jni {
         AndroidDisplayHandle, AndroidNdkWindowHandle, RawDisplayHandle, RawWindowHandle,
     };
     use std::ptr::NonNull;
-    use tw_client::{spawn_ssh_session_cbs, spawn_tcp_session_cbs, ClientCallbacks, SshConfig};
+    use tw_client::{
+        set_local_device_info, spawn_ssh_session_cbs, spawn_tcp_session_cbs, ClientCallbacks,
+        LocalDeviceInfo, SshConfig,
+    };
     use tw_proto::{DrawOp, FsEntry, RECT_FLAG_FILL, RECT_FLAG_OUTLINE};
     use tw_render::render_mesh_rgba;
 
@@ -200,7 +203,7 @@ mod android_jni {
             on_fs_get: Arc::new(move |req_path| {
                 call_str(&vm_fg, &cb_fg, "onFsGet", req_path);
             }),
-            on_cam_ctl: Arc::new(move |mode| {
+            on_cam_ctl: Arc::new(move |mode, _cam_id| {
                 if let Ok(mut env) = vm_cc.attach_current_thread() {
                     if env.call_method(cb_cc.as_obj(), "onCamCtl", "(I)V", &[(mode as jint).into()]).is_err() {
                         let _ = env.exception_clear();
@@ -902,6 +905,23 @@ mod android_jni {
         if let Some(c) = &sess.client {
             c.send_audio_pcm(sample_rate.max(8000) as u32, channels.max(1) as u8, &bytes);
         }
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_textualwgpu_app_TwBridge_nativeSetDeviceInfo(
+        mut env: JNIEnv,
+        _cls: JClass,
+        device_id: JString,
+        device_name: JString,
+        device_kind: JString,
+        cameras_spec: JString,
+    ) {
+        set_local_device_info(LocalDeviceInfo {
+            device_id: jstr(&mut env, &device_id),
+            device_name: jstr(&mut env, &device_name),
+            device_kind: jstr(&mut env, &device_kind),
+            cameras: jstr(&mut env, &cameras_spec),
+        });
     }
 
     #[no_mangle]

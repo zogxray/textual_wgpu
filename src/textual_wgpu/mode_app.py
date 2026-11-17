@@ -706,27 +706,21 @@ class ModeApp(App):
     def _open_file_reload(self) -> None:
         assert self._open_file is not None
         if self._open_file.get("source_mode") == "devices":
-            import os
-            import socket
-            import sys
+            from .remote.directory import local_device_profile
 
-            host_lbl = socket.gethostname() or "This Device"
+            local = local_device_profile()
             entries: list[tuple[str, str, str]] = []
-            is_android = (
-                "ANDROID_ROOT" in os.environ
-                or hasattr(sys, "getandroidapilevel")
-                or Path("/system/build.prop").exists()
-            )
-            if is_android:
-                entries.append(("android_dir", "", "📱 This Phone (Downloads / Media)/"))
+            if local.kind == "android":
+                entries.append(("android_dir", "", f"{local.icon} {local.name} (Downloads / Media)/"))
             else:
                 dl = Path.home() / "Downloads"
                 if dl.is_dir():
-                    entries.append(("dir", str(dl), f"💻 {host_lbl} · Downloads/"))
-                entries.append(("dir", str(Path.home()), f"💻 {host_lbl} · Home/"))
+                    entries.append(("dir", str(dl), f"{local.icon} {local.name} · Downloads/"))
+                entries.append(("dir", str(Path.home()), f"{local.icon} {local.name} · Home/"))
             drv = getattr(self, "_driver", None)
-            if hasattr(drv, "on_request_peer_fs_list"):
-                entries.append(("peer_dir", "", "🌐 Connected Device (Downloads / Media)/"))
+            peer = drv.distinct_peer_profile(local) if hasattr(drv, "distinct_peer_profile") else None
+            if peer is not None:
+                entries.append(("peer_dir", "", f"{peer.icon} {peer.name} (Downloads / Media)/"))
             self._open_file["entries"] = entries
             self._open_file["index"] = min(self._open_file["index"], max(0, len(entries) - 1))
             self._open_file["path_value"] = "Select device…"
