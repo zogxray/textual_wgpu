@@ -1,15 +1,117 @@
 package com.textualwgpu.app
 
-import android.media.AudioFormat
+import android.content.ContentUris
+import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.net.Uri
+import android.os.Environment
+import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.util.Log
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 object LocalMediaHelper {
+
+    data class FsItem(val isDir: Boolean, val name: String, val path: String, val size: Long)
+
+    @JvmStatic
+    fun listMediaFolder(ctx: Context, reqPath: String): List<FsItem> {
+        if (reqPath.isBlank()) {
+            return listOf(
+                FsItem(true, "Downloads", "Download", 0L),
+                FsItem(true, "Pictures", "Pictures", 0L),
+                FsItem(true, "Movies", "Movies", 0L),
+                FsItem(true, "Music", "Music", 0L),
+                FsItem(true, "DCIM", "DCIM", 0L),
+                FsItem(false, "[System File Picker…]", "__picker__", 0L),
+            )
+        }
+        val byName = LinkedHashMap<String, FsItem>()
+        // 1) Query MediaStore for matching relative path (works cleanly on Android 10-15 scoped storage)
+        val collections = listOf(
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI,
+            MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+        )
+        val proj = arrayOf(
+            MediaStore.MediaColumns._ID,
+            MediaStore.MediaColumns.DISPLAY_NAME,
+            MediaStore.MediaColumns.SIZE,
+            MediaStore.MediaColumns.RELATIVE_PATH,
+        )
+        val sel = "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?"
+        val selArgs = arrayOf("$reqPath%")
+        for (colUri in collections) {
+            try {
+                ctx.contentResolver.query(
+                    colUri,
+                    proj,
+                    sel,
+                    selArgs,
+                    "${MediaStore.MediaColumns.DATE_MODIFIED} DESC",
+                )?.use { cur ->
+                    val idIdx = cur.getColumnIndex(MediaStore.MediaColumns._ID)
+                    val nameIdx = cur.getColumnIndex(MediaStore.MediaColumns.DISPLAY_NAME)
+                    val sizeIdx = cur.getColumnIndex(MediaStore.MediaColumns.SIZE)
+                    while (cur.moveToNext()) {
+                        val id = if (idIdx >= 0) cur.getLong(idIdx) else continue
+                        val name = if (nameIdx >= 0) cur.getString(nameIdx).orEmpty() else continue
+                        if (name.isBlank() || byName.containsKey(name)) continue
+                        val sz = if (sizeIdx >= 0) cur.getLong(sizeIdx) else 0L
+                        val itemUri = ContentUris.withAppendedId(colUri, id).toString()
+                        byName[name] = FsItem(false, name, itemUri, sz)
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        // 2) Also check public external directory directly if accessible
+        try {
+            val dir = File(Environment.getExternalStorageDirectory(), reqPath)
+            val files = dir.listFiles()
+            if (files != null) {
+                for (f in files.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))) {
+                    if (f.name.startsWith(".")) continue
+                    if (!byName.containsKey(f.name)) {
+                        byName[f.name] = FsItem(f.isDirectory, f.name, f.absolutePath, if (f.isDirectory) 0L else f.length())
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+        }
+        val out = byName.values.toMutableList()
+        out.add(FsItem(false, "[System File Picker…]", "__picker__", 0L))
+        return out
+    }
+
+    @JvmStatic
+    fun readMediaFile(ctx: Context, pathOrUri: String): Pair<String, ByteArray>? {
+        return try {
+            if (pathOrUri.startsWith("content://")) {
+                val uri = Uri.parse(pathOrUri)
+                var name = "media.bin"
+                ctx.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                    val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0 && c.moveToFirst()) name = c.getString(idx) ?: name
+                }
+                val bytes = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return null
+                name to bytes
+            } else {
+                val f = File(pathOrUri)
+                if (!f.isFile) return null
+                f.name to f.readBytes()
+            }
+        } catch (t: Throwable) {
+            Log.e("LocalMediaHelper", "readMediaFile failed ($pathOrUri)", t)
+            null
+        }
+    }
 
     class VideoSession(path: String) {
         private val extractor = MediaExtractor()

@@ -24,6 +24,7 @@ from .protocol import (
     decode_put_blob,
     encode_caps,
     encode_client_file,
+    encode_fs_entries,
     encode_input_pointer,
     encode_input_wheel,
     encode_launch_app,
@@ -90,6 +91,14 @@ class RemoteViewer:
         elif frame.op == Op.OPEN_CLIENT_FILE:
             accept = frame.payload.decode("utf-8", errors="replace")
             self._handle_client_file_request(accept)
+            return False
+        elif frame.op == Op.FS_LIST:
+            req_path = frame.payload.decode("utf-8", errors="replace")
+            self._handle_fs_list(req_path)
+            return False
+        elif frame.op == Op.FS_GET:
+            req_path = frame.payload.decode("utf-8", errors="replace")
+            self._handle_fs_get(req_path)
             return False
         elif frame.op == Op.APP_LIST:
             self.peer_apps = decode_app_list(frame.payload)
@@ -194,6 +203,64 @@ class RemoteViewer:
                     self.transport.send(frame, compress=False)
 
         threading.Thread(target=_pick, daemon=True).start()
+
+    def _send_remote_frame(self, frame: Frame, *, compress: bool = True) -> None:
+        if self.transport is None:
+            return
+        if self._aloop is not None and self._aloop.is_running():
+            self._aloop.call_soon_threadsafe(
+                asyncio.ensure_future,
+                self.transport.send_now(frame, compress=compress),
+            )
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.transport.send_now(frame, compress=compress))
+        except RuntimeError:
+            self.transport.send(frame, compress=compress)
+
+    def _handle_fs_list(self, req_path: str) -> None:
+        entries: list[tuple[bool, str, str, int]] = []
+        if not req_path:
+            for label in ("Downloads", "Pictures", "Videos", "Music", "Home"):
+                p = Path.home() if label == "Home" else (Path.home() / label)
+                if p.is_dir():
+                    entries.append((True, label, str(p), 0))
+            if not entries:
+                entries.append((True, "Home", str(Path.home()), 0))
+        else:
+            p = Path(req_path).expanduser()
+            if p.is_dir():
+                try:
+                    items = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+                    for item in items:
+                        if item.name.startswith("."):
+                            continue
+                        try:
+                            sz = 0 if item.is_dir() else item.stat().st_size
+                        except OSError:
+                            sz = 0
+                        entries.append((item.is_dir(), item.name, str(item), sz))
+                except OSError:
+                    pass
+        self._send_remote_frame(
+            Frame(op=Op.FS_ENTRIES, payload=encode_fs_entries(req_path, entries), prio=Priority.P0_CONTROL),
+        )
+
+    def _handle_fs_get(self, req_path: str) -> None:
+        if req_path == "__picker__":
+            self._handle_client_file_request("*/*")
+            return
+        p = Path(req_path).expanduser()
+        if p.is_file():
+            try:
+                data = p.read_bytes()
+                self._send_remote_frame(
+                    Frame(op=Op.CLIENT_FILE_DATA, payload=encode_client_file(p.name, data), prio=Priority.P3_BULK),
+                    compress=False,
+                )
+            except OSError:
+                pass
 
     def _play_local_audio(self, sample_rate: int, channels: int, pcm: bytes) -> None:
         import shutil

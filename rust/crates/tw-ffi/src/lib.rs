@@ -57,7 +57,7 @@ impl RemoteSession {
 #[cfg(target_os = "android")]
 mod android_jni {
     use super::*;
-    use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString};
+    use jni::objects::{GlobalRef, JByteArray, JClass, JLongArray, JObject, JObjectArray, JString};
     use jni::sys::{jfloat, jint, jlong};
     use jni::{JNIEnv, JavaVM};
     use raw_window_handle::{
@@ -65,7 +65,7 @@ mod android_jni {
     };
     use std::ptr::NonNull;
     use tw_client::{spawn_ssh_session_cbs, spawn_tcp_session_cbs, ClientCallbacks, SshConfig};
-    use tw_proto::{DrawOp, RECT_FLAG_FILL, RECT_FLAG_OUTLINE};
+    use tw_proto::{DrawOp, FsEntry, RECT_FLAG_FILL, RECT_FLAG_OUTLINE};
     use tw_render::render_mesh_rgba;
 
     fn build_callbacks(vm: Arc<JavaVM>, cb_ref: Arc<GlobalRef>) -> ClientCallbacks {
@@ -87,6 +87,10 @@ mod android_jni {
         let cb_al = Arc::clone(&cb_ref);
         let vm_ls = Arc::clone(&vm);
         let cb_ls = Arc::clone(&cb_ref);
+        let vm_fl = Arc::clone(&vm);
+        let cb_fl = Arc::clone(&cb_ref);
+        let vm_fg = Arc::clone(&vm);
+        let cb_fg = Arc::clone(&cb_ref);
 
         ClientCallbacks {
             on_commit: Arc::new(move || call_void(&vm_r, &cb_r, "onRedraw")),
@@ -185,6 +189,12 @@ mod android_jni {
                         }
                     }
                 }
+            }),
+            on_fs_list: Arc::new(move |req_path| {
+                call_str(&vm_fl, &cb_fl, "onFsList", req_path);
+            }),
+            on_fs_get: Arc::new(move |req_path| {
+                call_str(&vm_fg, &cb_fg, "onFsGet", req_path);
             }),
         }
     }
@@ -794,6 +804,46 @@ mod android_jni {
         let arg_s = jstr(&mut env, &args);
         if let Some(c) = &sess.client {
             c.launch_app(&aid, &arg_s);
+        }
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_textualwgpu_app_TwBridge_nativeSendFsEntries(
+        mut env: JNIEnv,
+        _cls: JClass,
+        ptr: jlong,
+        req_path: JString,
+        is_dirs: JByteArray,
+        names: JObjectArray,
+        paths: JObjectArray,
+        sizes: JLongArray,
+    ) {
+        if ptr == 0 {
+            return;
+        }
+        let sess = unsafe { &*(ptr as *mut RemoteSession) };
+        let req = jstr(&mut env, &req_path);
+        let Ok(dirs) = env.convert_byte_array(&is_dirs) else { return };
+        let n = dirs.len();
+        let mut sz_buf = vec![0i64; n];
+        if n > 0 && env.get_long_array_region(&sizes, 0, &mut sz_buf).is_err() {
+            return;
+        }
+        let mut entries = Vec::with_capacity(n);
+        for i in 0..n {
+            let Ok(no) = env.get_object_array_element(&names, i as i32) else { continue };
+            let Ok(po) = env.get_object_array_element(&paths, i as i32) else { continue };
+            let ns = jstr(&mut env, &JString::from(no));
+            let ps = jstr(&mut env, &JString::from(po));
+            entries.push(FsEntry {
+                is_dir: dirs[i] != 0,
+                name: ns,
+                path: ps,
+                size: sz_buf[i].max(0) as u64,
+            });
+        }
+        if let Some(c) = &sess.client {
+            c.send_fs_entries(&req, &entries);
         }
     }
 

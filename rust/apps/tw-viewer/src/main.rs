@@ -7,7 +7,7 @@ use tw_client::{
     load_saved_nodes, spawn_command_session_cbs, spawn_tcp_session_cbs, ClientCallbacks,
     ClientHandle,
 };
-use tw_proto::{POINTER_DOWN, POINTER_MOVE, POINTER_UP, VID_CODEC_AV1, VID_CODEC_HEVC};
+use tw_proto::{FsEntry, POINTER_DOWN, POINTER_MOVE, POINTER_UP, VID_CODEC_AV1, VID_CODEC_HEVC};
 use tw_render::{GpuCompositor, SceneState};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -412,6 +412,8 @@ fn main() {
     let st_for_vid = Arc::clone(&state_slot);
     let proxy_vid = proxy.clone();
     let client_for_file = Arc::clone(&client_slot);
+    let client_for_fsl = Arc::clone(&client_slot);
+    let client_for_fsg = Arc::clone(&client_slot);
 
     let cbs = ClientCallbacks {
         on_commit: Arc::new(move || {
@@ -458,6 +460,81 @@ fn main() {
                             }
                         }
                     }
+                }
+            });
+        }),
+        on_fs_list: Arc::new(move |req_path| {
+            let Some(ch) = client_for_fsl.lock().ok().and_then(|g| g.clone()) else {
+                return;
+            };
+            let mut entries = Vec::new();
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+            if req_path.is_empty() {
+                for label in ["Downloads", "Pictures", "Videos", "Music", "Home"] {
+                    let p = if label == "Home" {
+                        std::path::PathBuf::from(&home)
+                    } else {
+                        std::path::PathBuf::from(&home).join(label)
+                    };
+                    if p.is_dir() {
+                        entries.push(FsEntry {
+                            is_dir: true,
+                            name: label.to_string(),
+                            path: p.to_string_lossy().into_owned(),
+                            size: 0,
+                        });
+                    }
+                }
+            } else if let Ok(rd) = std::fs::read_dir(req_path) {
+                for item in rd.flatten() {
+                    let name = item.file_name().to_string_lossy().into_owned();
+                    if name.starts_with('.') {
+                        continue;
+                    }
+                    let Ok(meta) = item.metadata() else { continue };
+                    entries.push(FsEntry {
+                        is_dir: meta.is_dir(),
+                        name,
+                        path: item.path().to_string_lossy().into_owned(),
+                        size: if meta.is_dir() { 0 } else { meta.len() },
+                    });
+                }
+                entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+            }
+            ch.send_fs_entries(req_path, &entries);
+        }),
+        on_fs_get: Arc::new(move |req_path| {
+            let Some(ch) = client_for_fsg.lock().ok().and_then(|g| g.clone()) else {
+                return;
+            };
+            let req = req_path.to_string();
+            std::thread::spawn(move || {
+                if req == "__picker__" {
+                    if let Ok(out) = Command::new("zenity")
+                        .args(["--file-selection", "--title=Pick media file"])
+                        .output()
+                    {
+                        if out.status.success() {
+                            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                            if !p.is_empty() {
+                                if let Ok(bytes) = std::fs::read(&p) {
+                                    let name = std::path::Path::new(&p)
+                                        .file_name()
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| "media.bin".into());
+                                    ch.send_client_file(&name, &bytes);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                if let Ok(bytes) = std::fs::read(&req) {
+                    let name = std::path::Path::new(&req)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "media.bin".into());
+                    ch.send_client_file(&name, &bytes);
                 }
             });
         }),

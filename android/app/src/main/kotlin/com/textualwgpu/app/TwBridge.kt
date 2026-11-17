@@ -12,6 +12,8 @@ interface TwCallback {
     fun onOpenClientFile(accept: String)
     fun onAppList(ids: Array<String>, names: Array<String>, descriptions: Array<String>, kinds: Array<String>)
     fun onLaunchStatus(ok: Boolean, appId: String, message: String)
+    fun onFsList(reqPath: String)
+    fun onFsGet(pathOrUri: String)
 }
 
 object TwBridge {
@@ -81,5 +83,13 @@ object TwBridge {
     external fun nativeSendClientFile(ptr: Long, name: String, data: ByteArray)
     external fun nativeListApps(ptr: Long)
     external fun nativeLaunchApp(ptr: Long, appId: String, args: String)
+    external fun nativeSendFsEntries(
+        ptr: Long,
+        reqPath: String,
+        isDirs: ByteArray,
+        names: Array<String>,
+        paths: Array<String>,
+        sizes: LongArray,
+    )
     external fun nativeDisconnect(ptr: Long)
 }

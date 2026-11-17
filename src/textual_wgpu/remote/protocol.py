@@ -83,6 +83,7 @@ class Op(IntEnum):
     HELLO = 0x01
     CAPS = 0x02
     RESIZE = 0x03
+    FS_GET = 0x04
     INPUT_KEY = 0x10
     INPUT_CHAR = 0x11
     INPUT_POINTER = 0x12
@@ -95,6 +96,8 @@ class Op(IntEnum):
     APP_LIST = 0x19
     LAUNCH_APP = 0x1A
     LAUNCH_STATUS = 0x1B
+    FS_LIST = 0x1C
+    FS_ENTRIES = 0x1D
     PING = 0x1E
     PONG = 0x1F
 
@@ -449,3 +452,32 @@ def decode_launch_status(data: bytes) -> tuple[bool, str, str]:
     app_id, off = _unpack_str(data, 1)
     msg, _ = _unpack_str(data, off) if off + 2 <= len(data) else ("", off)
     return ok, app_id, msg
+
+
+def encode_fs_entries(req_path: str, entries: list[tuple[bool, str, str, int]]) -> bytes:
+    out = bytearray(_pack_str(req_path, 1023))
+    out.extend(struct.pack("<H", min(65535, len(entries))))
+    for is_dir, name, full_path, size in entries[:65535]:
+        out.extend(struct.pack("<B", 1 if is_dir else 0))
+        out.extend(_pack_str(name, 511))
+        out.extend(_pack_str(full_path, 1023))
+        out.extend(struct.pack("<Q", max(0, int(size))))
+    return bytes(out)
+
+
+def decode_fs_entries(data: bytes) -> tuple[str, list[tuple[bool, str, str, int]]]:
+    if len(data) < 4:
+        return "", []
+    req_path, off = _unpack_str(data, 0)
+    (count,) = struct.unpack_from("<H", data, off)
+    off += 2
+    out: list[tuple[bool, str, str, int]] = []
+    for _ in range(count):
+        is_dir = bool(data[off])
+        off += 1
+        name, off = _unpack_str(data, off)
+        full_path, off = _unpack_str(data, off)
+        (size,) = struct.unpack_from("<Q", data, off)
+        off += 8
+        out.append((is_dir, name, full_path, int(size)))
+    return req_path, out

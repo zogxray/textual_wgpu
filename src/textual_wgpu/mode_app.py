@@ -462,6 +462,8 @@ class ModeApp(App):
         kind: str = "file",
         must_exist: bool = True,
         ok_label: str = "Add",
+        unified_devices: bool = False,
+        peer_file_callback: Callable[[str, bytes], None] | None = None,
     ) -> None:
         """DirectoryTree + path field modal.
 
@@ -501,6 +503,10 @@ class ModeApp(App):
             "scroll": 0,
             "focus": "list",  # path | list | ok | cancel
             "callback": callback,
+            "unified": bool(unified_devices),
+            "source_mode": "devices" if unified_devices else "local",
+            "peer_stack": [],
+            "peer_file_callback": peer_file_callback,
         }
         self._open_file_reload()
         self.request_draw()
@@ -691,10 +697,34 @@ class ModeApp(App):
 
     def _open_file_reload(self) -> None:
         assert self._open_file is not None
+        if self._open_file.get("source_mode") == "devices":
+            import os
+            import socket
+
+            host_lbl = socket.gethostname() or "This Device"
+            entries: list[tuple[str, str, str]] = []
+            if "ANDROID_ROOT" in os.environ:
+                entries.append(("android_dir", "", "📱 This Phone (Downloads / Media)/"))
+            else:
+                dl = Path.home() / "Downloads"
+                if dl.is_dir():
+                    entries.append(("dir", str(dl), f"💻 {host_lbl} · Downloads/"))
+                entries.append(("dir", str(Path.home()), f"💻 {host_lbl} · Home/"))
+            drv = getattr(self, "_driver", None)
+            if hasattr(drv, "on_request_peer_fs_list"):
+                entries.append(("peer_dir", "", "🌐 Connected Device (Downloads / Media)/"))
+            self._open_file["entries"] = entries
+            self._open_file["index"] = min(self._open_file["index"], max(0, len(entries) - 1))
+            self._open_file["path_value"] = "Select device…"
+            self._open_file_ensure_visible()
+            return
+
         folder: Path = self._open_file["folder"]
         suf: set[str] = self._open_file["suffixes"]
         kind = self._open_file.get("kind") or "file"
-        entries: list[tuple[str, str, str]] = []
+        entries = []
+        if self._open_file.get("unified"):
+            entries.append(("devices_root", "", "↑ ..  (Switch Device)"))
         if folder.parent != folder:
             entries.append(("up", str(folder.parent), f"↑ ..  ({folder.parent})"))
         try:
@@ -719,6 +749,73 @@ class ModeApp(App):
         elif kind == "file" and self._open_file.get("path_value") in ("", None):
             self._open_file["path_value"] = str(folder) + "/"
         self._open_file_ensure_visible()
+
+    def _open_file_load_peer_dir(self, req_path: str) -> None:
+        if self._open_file is None:
+            return
+        drv = getattr(self, "_driver", None)
+        if not hasattr(drv, "on_request_peer_fs_list"):
+            return
+        self._open_file["source_mode"] = "peer"
+        self._open_file["path_value"] = f"remote://{req_path or 'root'}"
+        self._open_file["entries"] = [
+            ("peer_up", "", "↑ ..  (Back)"),
+            ("info", "", "  Loading…"),
+        ]
+        self._open_file["index"] = 0
+        self._open_file["scroll"] = 0
+        suf: set[str] = self._open_file["suffixes"]
+
+        def _on_entries(rpath: str, raw_entries: list[tuple[bool, str, str, int]]) -> None:
+            modal = self._open_file
+            if modal is None or modal.get("source_mode") != "peer":
+                return
+            out: list[tuple[str, str, str]] = [("peer_up", "", "↑ ..  (Back)")]
+            for is_dir, name, fpath, size in raw_entries:
+                if is_dir:
+                    out.append(("peer_dir", fpath, f"▸ {name}/"))
+                else:
+                    ext = Path(name).suffix.lower()
+                    if fpath == "__picker__" or not suf or ext in suf:
+                        kb = f" ({max(1, size // 1024)} KB)" if size > 0 else ""
+                        out.append(("peer_file", fpath, f"  {name}{kb}"))
+            modal["entries"] = out
+            modal["index"] = 0
+            modal["scroll"] = 0
+            self.request_draw()
+
+        drv.on_request_peer_fs_list(req_path, _on_entries)
+        self.request_draw()
+
+    def _open_file_load_android_dir(self, req_path: str) -> None:
+        if self._open_file is None:
+            return
+        self._open_file["source_mode"] = "android"
+        self._open_file["path_value"] = f"phone://{req_path or 'Media'}"
+        out: list[tuple[str, str, str]] = [("android_up", "", "↑ ..  (Back)")]
+        suf: set[str] = self._open_file["suffixes"]
+        try:
+            from com.textualwgpu.app import LocalMediaHelper, LocalPythonHost  # type: ignore[import-not-found]
+
+            ctx = LocalPythonHost.appContext
+            if ctx is not None:
+                for it in LocalMediaHelper.listMediaFolder(ctx, req_path):
+                    name = str(it.name)
+                    fpath = str(it.path)
+                    if it.isDir:
+                        out.append(("android_dir", fpath, f"▸ {name}/"))
+                    else:
+                        ext = Path(name).suffix.lower()
+                        if fpath == "__picker__" or not suf or ext in suf:
+                            sz = int(it.size)
+                            kb = f" ({max(1, sz // 1024)} KB)" if sz > 0 else ""
+                            out.append(("android_file", fpath, f"  {name}{kb}"))
+        except Exception:  # noqa: BLE001
+            out.append(("android_file", "__picker__", "  [System File Picker…]"))
+        self._open_file["entries"] = out
+        self._open_file["index"] = 0
+        self._open_file["scroll"] = 0
+        self.request_draw()
 
     def _open_file_ensure_visible(self) -> None:
         assert self._open_file is not None
@@ -818,8 +915,78 @@ class ModeApp(App):
         idx = int(self._open_file["index"])
         entry_kind, path_s, _label = entries[idx]
         kind = self._open_file.get("kind") or "file"
+        if entry_kind == "info":
+            return
+        if entry_kind == "devices_root":
+            self._open_file["source_mode"] = "devices"
+            self._open_file["index"] = 0
+            self._open_file["scroll"] = 0
+            self._open_file_reload()
+            return
+        if entry_kind == "peer_dir":
+            stack: list[str] = self._open_file.setdefault("peer_stack", [])
+            stack.append(path_s)
+            self._open_file_load_peer_dir(path_s)
+            return
+        if entry_kind == "peer_up":
+            stack = self._open_file.setdefault("peer_stack", [])
+            if stack:
+                stack.pop()
+            if not stack:
+                self._open_file["source_mode"] = "devices"
+                self._open_file["index"] = 0
+                self._open_file["scroll"] = 0
+                self._open_file_reload()
+            else:
+                self._open_file_load_peer_dir(stack[-1])
+            return
+        if entry_kind == "peer_file":
+            peer_cb = self._open_file.get("peer_file_callback")
+            self._open_file = None
+            self._end_modal()
+            drv = getattr(self, "_driver", None)
+            if hasattr(drv, "on_request_peer_fs_get") and callable(peer_cb):
+                drv.on_request_peer_fs_get(path_s, peer_cb)
+            return
+        if entry_kind == "android_dir":
+            stack = self._open_file.setdefault("peer_stack", [])
+            stack.append(path_s)
+            self._open_file_load_android_dir(path_s)
+            return
+        if entry_kind == "android_up":
+            stack = self._open_file.setdefault("peer_stack", [])
+            if stack:
+                stack.pop()
+            if not stack:
+                self._open_file["source_mode"] = "devices"
+                self._open_file["index"] = 0
+                self._open_file["scroll"] = 0
+                self._open_file_reload()
+            else:
+                self._open_file_load_android_dir(stack[-1])
+            return
+        if entry_kind == "android_file":
+            peer_cb = self._open_file.get("peer_file_callback")
+            self._open_file = None
+            self._end_modal()
+            if path_s == "__picker__":
+                if hasattr(self, "request_client_file") and callable(peer_cb):
+                    self.request_client_file(peer_cb, accept="*/*")
+                return
+            try:
+                from com.textualwgpu.app import LocalMediaHelper, LocalPythonHost  # type: ignore[import-not-found]
+
+                ctx = LocalPythonHost.appContext
+                if ctx is not None and callable(peer_cb):
+                    res = LocalMediaHelper.readMediaFile(ctx, path_s)
+                    if res is not None:
+                        peer_cb(str(res.first), bytes(res.second))
+            except Exception:  # noqa: BLE001
+                pass
+            return
         if entry_kind in ("dir", "up"):
             folder = Path(path_s)
+            self._open_file["source_mode"] = "local"
             self._open_file["folder"] = folder
             self._open_file["index"] = 0
             self._open_file["scroll"] = 0

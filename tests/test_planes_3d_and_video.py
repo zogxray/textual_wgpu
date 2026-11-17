@@ -220,7 +220,30 @@ async def test_client_file_upload_and_media_screen_file_loading(monkeypatch, tmp
                 break
         assert app.mode_key == "media"
 
-        # Trigger Client File (U) -> server sends OPEN_CLIENT_FILE -> client responds with PNG
+        # Press O -> unified FilePickerModal opens with Local + Connected Device roots!
+        await viewer.send_key("o")
+        for _ in range(20):
+            if getattr(app, "_open_file", None) is not None:
+                break
+            await asyncio.sleep(0.02)
+        modal = getattr(app, "_open_file", None)
+        assert modal is not None and modal.get("unified") is True
+        entries = modal["entries"]
+        peer_idx = next(i for i, e in enumerate(entries) if e[0] == "peer_dir")
+        modal["index"] = peer_idx
+        app._open_file_activate()
+
+        # Drain FS_LIST -> viewer responds with FS_ENTRIES -> modal populates peer folders!
+        for _ in range(25):
+            f = await asyncio.wait_for(viewer.transport.recv(), timeout=2.0)
+            assert f is not None
+            viewer.handle_frame(f)
+            if any(e[0] == "peer_dir" and e[1] != "" for e in (getattr(app, "_open_file", None) or {}).get("entries", [])):
+                break
+        assert any(e[0] == "peer_dir" for e in app._open_file["entries"])
+        app._open_file_cancel()
+
+        # Also test direct client file upload flow (U / system picker)
         await viewer.send_key("u")
         for _ in range(25):
             f = await asyncio.wait_for(viewer.transport.recv(), timeout=2.0)
@@ -246,14 +269,6 @@ async def test_client_file_upload_and_media_screen_file_loading(monkeypatch, tmp
             await asyncio.sleep(0.02)
         custom = getattr(app.screen, "_custom_photo", None)
         assert custom is not None and custom.name == "client_sample_upload.png"
-
-        # Also test Server File (O) opening FilePickerModal
-        await viewer.send_key("o")
-        for _ in range(20):
-            if getattr(app, "_open_file", None) is not None:
-                break
-            await asyncio.sleep(0.02)
-        assert getattr(app, "_open_file", None) is not None
     finally:
         await drv.stop()
         viewer.transport.close()

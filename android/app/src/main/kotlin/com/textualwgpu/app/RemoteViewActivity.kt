@@ -1,8 +1,10 @@
 package com.textualwgpu.app
 
+import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.media.AudioAttributes
 import android.media.AudioFormat
@@ -89,6 +91,7 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
         if (fullscreenMode) {
             applyImmersiveFullscreen()
         }
+        requestMediaPermissionsIfNeeded()
 
         val dp = resources.displayMetrics.density
         fun px(v: Int) = (v * dp).toInt()
@@ -524,6 +527,55 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
 
     override fun onLaunchStatus(ok: Boolean, appId: String, message: String) {
         onStatus(if (ok) "Launched $appId: $message" else "Launch $appId failed: $message")
+    }
+
+    override fun onFsList(reqPath: String) {
+        Thread {
+            if (sessionPtr == 0L) return@Thread
+            val items = LocalMediaHelper.listMediaFolder(applicationContext, reqPath)
+            val isDirs = ByteArray(items.size) { i -> if (items[i].isDir) 1.toByte() else 0.toByte() }
+            val names = Array(items.size) { i -> items[i].name }
+            val paths = Array(items.size) { i -> items[i].path }
+            val sizes = LongArray(items.size) { i -> items[i].size }
+            if (sessionPtr != 0L) {
+                TwBridge.nativeSendFsEntries(sessionPtr, reqPath, isDirs, names, paths, sizes)
+            }
+        }.start()
+    }
+
+    override fun onFsGet(pathOrUri: String) {
+        if (pathOrUri == "__picker__") {
+            onOpenClientFile("*/*")
+            return
+        }
+        Thread {
+            if (sessionPtr == 0L) return@Thread
+            onStatus("Loading ${pathOrUri.substringAfterLast('/')}…")
+            val res = LocalMediaHelper.readMediaFile(applicationContext, pathOrUri)
+            if (res != null && sessionPtr != 0L) {
+                val (name, bytes) = res
+                TwBridge.nativeSendClientFile(sessionPtr, name, bytes)
+                onStatus("Sent $name (${(bytes.size + 1023) / 1024} KB)")
+            } else {
+                onStatus("Failed to read $pathOrUri")
+            }
+        }.start()
+    }
+
+    private fun requestMediaPermissionsIfNeeded() {
+        val perms = if (Build.VERSION.SDK_INT >= 33) {
+            arrayOf(
+                Manifest.permission.READ_MEDIA_IMAGES,
+                Manifest.permission.READ_MEDIA_VIDEO,
+                Manifest.permission.READ_MEDIA_AUDIO,
+            )
+        } else {
+            arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
+        val missing = perms.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (missing.isNotEmpty()) {
+            requestPermissions(missing.toTypedArray(), 4101)
+        }
     }
 
     private fun queryFileName(uri: Uri): String? {

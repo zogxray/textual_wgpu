@@ -817,29 +817,25 @@ class MediaScreen(Screen):
         vid.push_rgba_frame(240, 144, _render_demo_video_frame(240, 144, 0.0))
         vid_box = Panel(vid, title="VIDEO · H.265/H.264 HW plane (V play/pause)", id="video-box")
 
-        btn_audio = Button("Play Synth Audio", id="btn-audio", variant="primary", on_press=self.toggle_audio)
+        btn_audio = Button("Play Audio", id="btn-audio", on_press=self.toggle_audio)
         btn_vid = Button("Pause Video", id="btn-video", on_press=self.toggle_video)
-        audio_btns = Horizontal(btn_audio, btn_vid, id="media-btns")
+        btn_open = Button("Open File (O)", id="btn-open-file", variant="primary", on_press=self.open_media_file)
+        audio_btns = Horizontal(btn_open, btn_audio, btn_vid, id="media-btns")
         audio_btns.layout_hint_h = 36
-        btn_srv = Button("Open Local (O)", id="btn-srv-file", on_press=self.pick_server_file)
-        btn_cli = Button("Open Viewer File (U)", id="btn-cli-file", on_press=self.pick_client_file)
-        file_btns = Horizontal(btn_srv, btn_cli, id="media-file-btns")
-        file_btns.layout_hint_h = 36
         digits = Digits("00.0s", id="audio-clock")
         bar = ProgressBar(100, id="audio-bar")
         spark = Sparkline(self._audio_env, id="audio-spark")
         spark.layout_hint_h = 26
-        audio_inner = Vertical(audio_btns, file_btns, digits, bar, spark, id="audio-inner")
-        audio_box = Panel(audio_inner, title="AUDIO & FILES · O local · U viewer (Downloads)", id="audio-box")
+        audio_inner = Vertical(audio_btns, digits, bar, spark, id="audio-inner")
+        audio_box = Panel(audio_inner, title="MEDIA & AUDIO · O open file · V video · A audio", id="audio-box")
 
         right = Vertical(vid_box, audio_box, id="media-right")
         yield Horizontal(photo_box, right, id="main")
         yield KeyBar([
-            ("1/2/3", "Photo", None),
-            ("O", "Local File", lambda: self.pick_server_file()),
-            ("U", "Viewer File", lambda: self.pick_client_file()),
+            ("O", "Open File", lambda: self.open_media_file()),
             ("V/Space", "Video", lambda: self.toggle_video()),
             ("A", "Audio", lambda: self.toggle_audio()),
+            ("1/2/3", "Gallery", None),
             ("Tab", "Panel", lambda: _focus_next(self)),
             ("F1–F8", "Modes", None),
             ("Q", "Quit", lambda: _quit(self)),
@@ -875,16 +871,16 @@ class MediaScreen(Screen):
         self.query_one("#media-photo", RichText).update(self._build_photo_doc(), home=True)
         self.query_one("#status", StatusBar).update(f"F7 Media · photo={kind}")
 
-    def pick_server_file(self) -> None:
-        import os
+    def _on_peer_file_bytes(self, name: str, data: bytes) -> None:
+        if not data:
+            return
+        safe = Path(name or "media.bin").name
+        dst = _media_asset_dir() / f"client_{safe}"
+        dst.write_bytes(data)
+        self.load_media_file(dst)
 
-        if self.app is None:
-            return
-        # On Android sandbox (Chaquopy), open the native Android Downloads/Files picker directly.
-        if "ANDROID_ROOT" in os.environ and hasattr(self.app, "request_client_file"):
-            self.pick_client_file()
-            return
-        if not hasattr(self.app, "ask_open_file"):
+    def open_media_file(self) -> None:
+        if self.app is None or not hasattr(self.app, "ask_open_file"):
             return
         suffixes = (
             ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif",
@@ -896,26 +892,22 @@ class MediaScreen(Screen):
         self.app.ask_open_file(
             start_dir,
             lambda p: self.load_media_file(p) if p is not None else None,
-            title="Open Media File (Photo / Video / Audio)",
-            subtitle="Photo (.png .jpg .webp) · Video (.mp4 .mkv .webm) · Audio (.mp3 .wav .ogg .m4a)",
+            title="Open Media (Photo / Video / Audio)",
+            subtitle="Pick a device (Phone / Workstation) then select any image, video, or audio file",
             suffixes=suffixes,
             ok_label="Open",
+            unified_devices=True,
+            peer_file_callback=self._on_peer_file_bytes,
         )
+
+    def pick_server_file(self) -> None:
+        self.open_media_file()
 
     def pick_client_file(self) -> None:
         if self.app is None or not hasattr(self.app, "request_client_file"):
             return
-        self.query_one("#status", StatusBar).update("F7 Media · waiting for client file picker…")
-
-        def _uploaded(name: str, data: bytes) -> None:
-            if not data:
-                return
-            safe = Path(name or "client_media.bin").name
-            dst = _media_asset_dir() / f"client_{safe}"
-            dst.write_bytes(data)
-            self.load_media_file(dst)
-
-        self.app.request_client_file(_uploaded, accept="*/*")
+        self.query_one("#status", StatusBar).update("F7 Media · waiting for file picker…")
+        self.app.request_client_file(self._on_peer_file_bytes, accept="*/*")
 
     def load_media_file(self, path: Path) -> None:
         if not path.is_file():

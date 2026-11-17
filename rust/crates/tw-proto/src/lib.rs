@@ -82,6 +82,7 @@ pub enum Op {
     Hello = 0x01,
     Caps = 0x02,
     Resize = 0x03,
+    FsGet = 0x04,
     InputKey = 0x10,
     InputChar = 0x11,
     InputPointer = 0x12,
@@ -94,6 +95,8 @@ pub enum Op {
     AppList = 0x19,
     LaunchApp = 0x1A,
     LaunchStatus = 0x1B,
+    FsList = 0x1C,
+    FsEntries = 0x1D,
     Ping = 0x1E,
     Pong = 0x1F,
 
@@ -119,6 +122,7 @@ impl Op {
             0x01 => Ok(Self::Hello),
             0x02 => Ok(Self::Caps),
             0x03 => Ok(Self::Resize),
+            0x04 => Ok(Self::FsGet),
             0x10 => Ok(Self::InputKey),
             0x11 => Ok(Self::InputChar),
             0x12 => Ok(Self::InputPointer),
@@ -131,6 +135,8 @@ impl Op {
             0x19 => Ok(Self::AppList),
             0x1A => Ok(Self::LaunchApp),
             0x1B => Ok(Self::LaunchStatus),
+            0x1C => Ok(Self::FsList),
+            0x1D => Ok(Self::FsEntries),
             0x1E => Ok(Self::Ping),
             0x1F => Ok(Self::Pong),
             0x20 => Ok(Self::StyleDef),
@@ -699,6 +705,53 @@ pub fn decode_launch_status(data: &[u8]) -> Result<(bool, String, String), Proto
         String::new()
     };
     Ok((ok, id, msg))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsEntry {
+    pub is_dir: bool,
+    pub name: String,
+    pub path: String,
+    pub size: u64,
+}
+
+pub fn encode_fs_entries(req_path: &str, entries: &[FsEntry]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + entries.len() * 48);
+    push_str16(&mut out, req_path, 1023);
+    out.extend_from_slice(&(entries.len().min(65535) as u16).to_le_bytes());
+    for e in entries.iter().take(65535) {
+        out.push(if e.is_dir { 1 } else { 0 });
+        push_str16(&mut out, &e.name, 511);
+        push_str16(&mut out, &e.path, 1023);
+        out.extend_from_slice(&e.size.to_le_bytes());
+    }
+    out
+}
+
+pub fn decode_fs_entries(data: &[u8]) -> Result<(String, Vec<FsEntry>), ProtoError> {
+    let (req_path, mut off) = read_str16(data, 0)?;
+    if off + 2 > data.len() {
+        return Err(ProtoError::Truncated);
+    }
+    let count = ru16(data, off) as usize;
+    off += 2;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if off >= data.len() {
+            return Err(ProtoError::Truncated);
+        }
+        let is_dir = data[off] != 0;
+        off += 1;
+        let (name, o1) = read_str16(data, off)?;
+        let (path, o2) = read_str16(data, o1)?;
+        if o2 + 8 > data.len() {
+            return Err(ProtoError::Truncated);
+        }
+        let size = ru64(data, o2);
+        off = o2 + 8;
+        out.push(FsEntry { is_dir, name, path, size });
+    }
+    Ok((req_path, out))
 }
 
 pub fn encode_caps(has_gpu: bool, vram_mb: u32, codecs: &str) -> Vec<u8> {

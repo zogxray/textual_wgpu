@@ -11,9 +11,12 @@ object LocalPythonHost {
     const val PORT = 7420
     @Volatile
     private var started = false
+    @Volatile
+    var appContext: Context? = null
 
     @Synchronized
     fun ensureStarted(ctx: Context): Boolean {
+        appContext = ctx.applicationContext
         if (!Python.isStarted()) {
             Python.start(AndroidPlatform(ctx.applicationContext))
         }

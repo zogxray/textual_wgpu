@@ -22,6 +22,7 @@ from .protocol import (
     Priority,
     decode_caps,
     decode_client_file,
+    decode_fs_entries,
     decode_input_pointer,
     decode_input_wheel,
     decode_launch_app,
@@ -116,6 +117,7 @@ class RemoteServerDriver(Driver):
         self._last_plane_rect: dict[int, tuple[tuple[int, int, int, int], int]] = {}
         self._vid_encoders: dict[int, Any] = {}
         self._client_file_cb: Any = None
+        self._fs_list_cb: Any = None
         self.prefer_hw_video = True
         self.apps_path: Any = None
 
@@ -218,6 +220,28 @@ class RemoteServerDriver(Driver):
             Frame(
                 op=Op.OPEN_CLIENT_FILE,
                 payload=accept.encode("utf-8"),
+                prio=Priority.P0_CONTROL,
+            ),
+        )
+        self._draw_event.set()
+
+    def on_request_peer_fs_list(self, path: str, callback: Any) -> None:
+        self._fs_list_cb = callback
+        self.transport.send(
+            Frame(
+                op=Op.FS_LIST,
+                payload=path.encode("utf-8"),
+                prio=Priority.P0_CONTROL,
+            ),
+        )
+        self._draw_event.set()
+
+    def on_request_peer_fs_get(self, path: str, callback: Any) -> None:
+        self._client_file_cb = callback
+        self.transport.send(
+            Frame(
+                op=Op.FS_GET,
+                payload=path.encode("utf-8"),
                 prio=Priority.P0_CONTROL,
             ),
         )
@@ -621,6 +645,16 @@ class RemoteServerDriver(Driver):
                     cb(name, data)
                 except Exception as exc:  # noqa: BLE001
                     print(f"client_file callback error: {exc}", flush=True)
+                self.app.request_draw()
+        elif op == Op.FS_ENTRIES:
+            req_path, entries = decode_fs_entries(frame.payload)
+            cb = self._fs_list_cb
+            self._fs_list_cb = None
+            if callable(cb):
+                try:
+                    cb(req_path, entries)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"fs_entries callback error: {exc}", flush=True)
                 self.app.request_draw()
         elif op == Op.CAPS:
             from ..widgets.viewport3d import ClientCapabilities

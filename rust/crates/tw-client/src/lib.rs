@@ -7,9 +7,9 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tw_proto::{
     decode_app_list, decode_audio_pcm, decode_launch_status, decode_vid_nalu, encode_caps,
-    encode_client_file, encode_input_pointer, encode_input_wheel, encode_launch_app, encode_resize,
-    unpack_header, AppEntry, Frame, FrameReassembler, Op, Priority, PriorityMux, HEADER_SIZE,
-    VID_CODEC_MASK, VID_FLAG_KEYFRAME,
+    encode_client_file, encode_fs_entries, encode_input_pointer, encode_input_wheel,
+    encode_launch_app, encode_resize, unpack_header, AppEntry, Frame, FrameReassembler, FsEntry,
+    Op, Priority, PriorityMux, HEADER_SIZE, VID_CODEC_MASK, VID_FLAG_KEYFRAME,
 };
 use tw_render::SceneState;
 
@@ -63,6 +63,14 @@ impl ClientHandle {
         ));
     }
 
+    pub fn send_fs_entries(&self, req_path: &str, entries: &[FsEntry]) {
+        let _ = self.tx.send(Frame::new(
+            Op::FsEntries,
+            encode_fs_entries(req_path, entries),
+            Priority::P0Control,
+        ));
+    }
+
     pub fn list_apps(&self) {
         let _ = self.tx.send(Frame::new(Op::ListApps, Vec::new(), Priority::P0Control));
     }
@@ -91,6 +99,8 @@ pub struct ClientCallbacks {
     pub on_open_client_file: Arc<dyn Fn(&str) + Send + Sync>,
     pub on_app_list: Arc<dyn Fn(&[AppEntry]) + Send + Sync>,
     pub on_launch_status: Arc<dyn Fn(bool, &str, &str) + Send + Sync>,
+    pub on_fs_list: Arc<dyn Fn(&str) + Send + Sync>,
+    pub on_fs_get: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 impl Default for ClientCallbacks {
@@ -105,6 +115,8 @@ impl Default for ClientCallbacks {
             on_open_client_file: Arc::new(|_| {}),
             on_app_list: Arc::new(|_| {}),
             on_launch_status: Arc::new(|_, _, _| {}),
+            on_fs_list: Arc::new(|_| {}),
+            on_fs_get: Arc::new(|_| {}),
         }
     }
 }
@@ -352,6 +364,14 @@ fn dispatch_incoming_frame(
         Op::OpenClientFile => {
             let accept = String::from_utf8_lossy(&frame.payload).into_owned();
             (cbs.on_open_client_file)(&accept);
+        }
+        Op::FsList => {
+            let path = String::from_utf8_lossy(&frame.payload).into_owned();
+            (cbs.on_fs_list)(&path);
+        }
+        Op::FsGet => {
+            let path = String::from_utf8_lossy(&frame.payload).into_owned();
+            (cbs.on_fs_get)(&path);
         }
         Op::AppList => {
             if let Ok(apps) = decode_app_list(&frame.payload) {
