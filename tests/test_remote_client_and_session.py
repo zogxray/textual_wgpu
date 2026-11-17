@@ -196,7 +196,14 @@ async def test_tcp_session_persists_across_disconnect_and_reattach(tmp_path: Pat
         await _drain_viewer_commit(v2)
         assert app.mode_key == "editor"
         assert len(v2.state.layers) > 0
+
+        # Preemptive handoff: v3 connects WHILE v2 is still open -> v3 gets FRAME_COMMIT immediately!
+        tx3 = await spawn_tcp_transport("127.0.0.1", port)
+        v3 = RemoteViewer(tx3, size=(900, 560), cache_dir=tmp_path / "t3")
+        await _drain_viewer_commit(v3)
+        assert len(v3.state.layers) > 0
         tx2.close()
+        tx3.close()
     finally:
         app._running = False
         server_task.cancel()

@@ -32,7 +32,7 @@ import asyncio
 from textual_wgpu.demo import build_demo_app
 from textual_wgpu.remote.cli import serve_tcp_session
 
-asyncio.run(serve_tcp_session(build_demo_app(), host="127.0.0.1", port=$PORT))
+asyncio.run(serve_tcp_session(build_demo_app(), host="127.0.0.1", port=$PORT, advertise=False))
 """
                     py.getBuiltins().callAttr("exec", code, py.getModule("__main__")["__dict__"])
                 } catch (e: Throwable) {

@@ -426,7 +426,7 @@ class MainActivity : AppCompatActivity() {
                 putExtra("virt_h", if (virt) 720 else 0)
                 putExtra("show_keys", showKeys)
                 putExtra("fullscreen", fullscreen)
-                putExtra("reverse_port", if (sharePhone) LocalPythonHost.PORT else 0)
+                putExtra("reverse_port", if (sharePhone) 7422 else 0)
             },
         )
     }
@@ -545,7 +545,7 @@ class MainActivity : AppCompatActivity() {
             box.addView(this)
         }
         val shareCb = CheckBox(this).apply {
-            text = "Share Phone Demo over SSH (127.0.0.1:7420)"
+            text = "Share Phone Demo to Workstation (127.0.0.1:7422)"
             isChecked = prefs.getBoolean("share_phone", false)
             box.addView(this)
         }

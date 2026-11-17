@@ -86,6 +86,13 @@ async def _serve_stream_session(
     *,
     size: tuple[int, int],
 ) -> None:
+    prev_drv = drv_holder[0]
+    if prev_drv is not None:
+        # Preempt any stale/previous viewer so a newly connecting viewer attaches immediately.
+        prev_drv.transport.close()
+        if prev_drv._rx_task is not None and not prev_drv._rx_task.done():
+            prev_drv._rx_task.cancel()
+
     async with active_lock:
         tx = AsyncStreamTransport(reader, writer)
         drv = drv_holder[0]

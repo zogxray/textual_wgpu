@@ -216,6 +216,7 @@ pub struct SshConfig {
     pub key_passphrase: Option<String>,
     pub remote_cmd: String,
     pub reverse_forward_port: Option<u16>,
+    pub reverse_local_port: Option<u16>,
     pub direct_tcpip_port: Option<u16>,
 }
 
@@ -524,7 +525,7 @@ pub fn spawn_ssh_session_cbs(
             on_status(&format!("Connecting to {}:{}…", cfg.host, cfg.port));
             let r_cfg = Arc::new(russh::client::Config::default());
             let handler = SshClientHandler {
-                reverse_local_port: cfg.reverse_forward_port,
+                reverse_local_port: cfg.reverse_local_port.or(cfg.reverse_forward_port),
             };
             let mut session = match russh::client::connect(r_cfg, (cfg.host.as_str(), cfg.port), handler).await {
                 Ok(s) => s,
@@ -565,13 +566,7 @@ pub fn spawn_ssh_session_cbs(
                 return;
             }
 
-            if let Some(rport) = cfg.reverse_forward_port {
-                match session.tcpip_forward("127.0.0.1", rport as u32).await {
-                    Ok(_) => on_status(&format!("Tunnel 127.0.0.1:{rport} → phone ready")),
-                    Err(e) => on_status(&format!("Reverse tunnel err: {e}")),
-                }
-            }
-
+            // Try direct-tcpip FIRST before setting up reverse tcpip_forward so we never loop back to ourselves.
             let mut channel = if let Some(dport) = cfg.direct_tcpip_port.filter(|&p| p > 0) {
                 match session
                     .channel_open_direct_tcpip("127.0.0.1", dport as u32, "127.0.0.1", 0)
@@ -623,6 +618,13 @@ pub fn spawn_ssh_session_cbs(
                 on_status("Connected");
                 c
             };
+
+            if let Some(rport) = cfg.reverse_forward_port {
+                match session.tcpip_forward("127.0.0.1", rport as u32).await {
+                    Ok(_) => on_status(&format!("Phone demo shared at 127.0.0.1:{rport}")),
+                    Err(e) => on_status(&format!("Reverse tunnel err: {e}")),
+                }
+            }
 
             let mut mux = PriorityMux::new(4096, 2);
             let mut reasm = FrameReassembler::default();
