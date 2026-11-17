@@ -87,19 +87,28 @@ class MainActivity : AppCompatActivity() {
             maxLines = 4
             hint = "-----BEGIN OPENSSH PRIVATE KEY-----"
         }
+        val pyFindBody =
+            "for p in python3 \"\$HOME/.local/bin/python3\" \"\$HOME/.venv/bin/python\" \"\$HOME/venv/bin/python\" " +
+                "\"\$HOME/.local/share/pipx/venvs/textual-wgpu/bin/python\" " +
+                "\"\$HOME\"/*/venv/bin/python \"\$HOME\"/*/.venv/bin/python " +
+                "\"\$HOME\"/*/*/venv/bin/python \"\$HOME\"/*/*/.venv/bin/python " +
+                "\"\$HOME\"/*/*/*/venv/bin/python \"\$HOME\"/*/*/*/.venv/bin/python; do " +
+                "[ -x \"\$p\" ] || command -v \"\$p\" >/dev/null 2>&1 || continue; " +
+                "\"\$p\" -c \"import textual_wgpu\" 2>/dev/null"
         val defaultDemoCmd =
-            "for p in python3 \"\$HOME/.venv/bin/python\" \"\$HOME/venv/bin/python\"; do " +
-                "\"\$p\" -c \"import textual_wgpu\" 2>/dev/null && " +
-                "exec env TEXTUAL_WGPU_REMOTE=stdio \"\$p\" -m textual_wgpu; " +
-            "done; echo \"textual_wgpu not found\" >&2; exit 1"
+            "sh -c '$pyFindBody && exec env TEXTUAL_WGPU_REMOTE=stdio \"\$p\" -m textual_wgpu; done; " +
+                "echo \"textual_wgpu not found\" >&2; exit 1'"
         val defaultModuleCmd = "exec env TEXTUAL_WGPU_REMOTE=stdio python3 -m my_app"
         val defaultSocketCmd =
-            "python3 -m textual_wgpu.remote.cli connect-socket --socket ~/.cache/textual-wgpu/app.sock"
+            "sh -c '$pyFindBody && exec \"\$p\" -m textual_wgpu.remote.cli connect-socket --socket ~/.cache/textual-wgpu/app.sock; done; " +
+                "echo \"textual_wgpu not found\" >&2; exit 1'"
 
         val savedCmd = prefs.getString("cmd", defaultDemoCmd) ?: defaultDemoCmd
+        val isLegacyDemo = savedCmd == "TEXTUAL_WGPU_REMOTE=stdio python3 -m textual_wgpu" ||
+            savedCmd.startsWith("for p in python3 \"\$HOME/.venv/bin/python\"")
         val cmdEt = field(
             "Remote Command",
-            if (savedCmd == "TEXTUAL_WGPU_REMOTE=stdio python3 -m textual_wgpu") defaultDemoCmd else savedCmd,
+            if (isLegacyDemo) defaultDemoCmd else savedCmd,
         )
 
         val presetRow = LinearLayout(this).apply {
@@ -309,7 +318,8 @@ class MainActivity : AppCompatActivity() {
                 val host = obj.optString("host", "127.0.0.1")
                 val port = obj.optInt("port", 22)
                 val user = obj.optString("user", "user")
-                val cmd = obj.optString("cmd", defaultDemoCmd)
+                val rawCmd = obj.optString("cmd", defaultDemoCmd)
+                val cmd = if (rawCmd.startsWith("for p in python3 \"\$HOME/.venv/bin/python\"")) defaultDemoCmd else rawCmd
                 val label = if (transport == "local_python") {
                     "[$role] $name · local://127.0.0.1:7420"
                 } else {
