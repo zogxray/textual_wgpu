@@ -325,3 +325,90 @@ def test_media_screen_loads_real_mp4_and_mp3_files(tmp_path: Path):
         assert len(aus) >= 1
     finally:
         scr._file_streamer.close()
+
+
+async def test_remote_camera_and_mic_control_routing(tmp_path: Path):
+    from textual_wgpu.demo import build_demo_app
+    from textual_wgpu.remote.protocol import encode_audio_pcm, encode_vid_nalu
+
+    s2c_r, s2c_w, c2s_r, c2s_w = _make_pipe_pair()
+    server_tx = AsyncStreamTransport(c2s_r, s2c_w)
+    client_tx = AsyncStreamTransport(s2c_r, c2s_w)
+    app = build_demo_app(start="media")
+    drv = RemoteServerDriver(app, server_tx, size=(960, 600))
+    viewer = RemoteViewer(client_tx, size=(960, 600), cache_dir=tmp_path / "cam_cache")
+
+    cam_cmds: list[int] = []
+    mic_cmds: list[bool] = []
+    viewer._handle_cam_ctl = lambda mode: cam_cmds.append(mode)  # type: ignore[method-assign]
+    viewer._handle_mic_ctl = lambda en: mic_cmds.append(en)  # type: ignore[method-assign]
+
+    await drv.start()
+    try:
+        while True:
+            f = await asyncio.wait_for(viewer.transport.recv(), timeout=2.0)
+            assert f is not None
+            if viewer.handle_frame(f):
+                break
+
+        scr = app.screen
+        scr._start_camera_source("peer_back")
+        for _ in range(15):
+            f = await asyncio.wait_for(viewer.transport.recv(), timeout=2.0)
+            assert f is not None
+            viewer.handle_frame(f)
+            if cam_cmds:
+                break
+        assert cam_cmds == [2]
+
+        # Simulate peer camera NALU arriving back at server -> server forwards it through Video plane
+        await viewer.transport.send_now(
+            Frame(
+                op=Op.VID_NALU,
+                payload=encode_vid_nalu(1234, 0x11, (), b"\x00\x00\x00\x01\x65CAM_IDR"),
+                prio=Priority.P2_MEDIA,
+                surf_id=1,
+            ),
+            compress=False,
+        )
+        got_cam_nalu = False
+        for _ in range(30):
+            f = await asyncio.wait_for(viewer.transport.recv(), timeout=2.0)
+            assert f is not None
+            if f.op == Op.VID_NALU:
+                from textual_wgpu.remote.protocol import decode_vid_nalu
+
+                _pts, _fl, _mat, raw = decode_vid_nalu(f.payload)
+                if raw == b"\x00\x00\x00\x01\x65CAM_IDR":
+                    got_cam_nalu = True
+                    break
+            viewer.handle_frame(f)
+        assert got_cam_nalu is True
+
+        scr._start_mic_source("peer")
+        for _ in range(15):
+            f = await asyncio.wait_for(viewer.transport.recv(), timeout=2.0)
+            assert f is not None
+            viewer.handle_frame(f)
+            if mic_cmds:
+                break
+        assert mic_cmds == [True]
+
+        await viewer.transport.send_now(
+            Frame(
+                op=Op.AUDIO_PCM,
+                payload=encode_audio_pcm(16000, 1, b"\x00\x20" * 400),
+                prio=Priority.P1_UI,
+            ),
+            compress=True,
+        )
+        for _ in range(20):
+            if len(scr._mic_buf) >= 800:
+                break
+            await asyncio.sleep(0.02)
+        assert len(scr._mic_buf) >= 800
+        scr._stop_camera()
+        scr._stop_mic()
+    finally:
+        await drv.stop()
+        viewer.transport.close()

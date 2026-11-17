@@ -83,6 +83,8 @@ pub enum Op {
     Caps = 0x02,
     Resize = 0x03,
     FsGet = 0x04,
+    CamCtl = 0x05,
+    MicCtl = 0x06,
     InputKey = 0x10,
     InputChar = 0x11,
     InputPointer = 0x12,
@@ -123,6 +125,8 @@ impl Op {
             0x02 => Ok(Self::Caps),
             0x03 => Ok(Self::Resize),
             0x04 => Ok(Self::FsGet),
+            0x05 => Ok(Self::CamCtl),
+            0x06 => Ok(Self::MicCtl),
             0x10 => Ok(Self::InputKey),
             0x11 => Ok(Self::InputChar),
             0x12 => Ok(Self::InputPointer),
@@ -244,11 +248,7 @@ pub fn compress_payload(raw: &[u8], allow: bool) -> (Vec<u8>, u8) {
     if !allow || raw.len() < 64 {
         return (raw.to_vec(), 0);
     }
-    if let Ok(comp) = zstd::bulk::compress(raw, 3) {
-        if comp.len() < raw.len() {
-            return (comp, FLAG_ZSTD);
-        }
-    }
+    // Use zlib (universally available in Python stdlib including Android Chaquopy).
     let mut enc = ZlibEncoder::new(Vec::new(), Compression::fast());
     if enc.write_all(raw).is_ok() {
         if let Ok(comp) = enc.finish() {
@@ -599,6 +599,24 @@ pub fn decode_audio_pcm(data: &[u8]) -> Result<(u32, u8, u8, &[u8]), ProtoError>
         return Err(ProtoError::Truncated);
     }
     Ok((ru32(data, 0), data[4], data[5], &data[6..]))
+}
+
+pub fn encode_vid_nalu(pts_us: u64, flags: u8, nalu: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(73 + nalu.len());
+    out.extend_from_slice(&pts_us.to_le_bytes());
+    out.push(flags);
+    out.extend_from_slice(&[0u8; 64]);
+    out.extend_from_slice(nalu);
+    out
+}
+
+pub fn encode_audio_pcm(sample_rate: u32, channels: u8, flags: u8, pcm: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(6 + pcm.len());
+    out.extend_from_slice(&sample_rate.max(8000).to_le_bytes());
+    out.push(channels.max(1));
+    out.push(flags);
+    out.extend_from_slice(pcm);
+    out
 }
 
 pub fn encode_client_file(name: &str, data: &[u8]) -> Vec<u8> {

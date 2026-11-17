@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
+import sys
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .. import fonts as tw_fonts
@@ -20,6 +24,7 @@ from .protocol import (
     Frame,
     Op,
     Priority,
+    decode_audio_pcm,
     decode_caps,
     decode_client_file,
     decode_fs_entries,
@@ -27,6 +32,7 @@ from .protocol import (
     decode_input_wheel,
     decode_launch_app,
     decode_resize,
+    decode_vid_nalu,
     encode_app_list,
     encode_audio_pcm,
     encode_buf_write,
@@ -87,6 +93,24 @@ def _is_layout_wrapper(widget: Any) -> bool:
     return type(widget).paint is Widget.paint or type(widget).paint.__qualname__.startswith("Container.")
 
 
+def rlog(tag: str, msg: str) -> None:
+    """Write lightweight debug/performance log to ~/.cache/textual-wgpu/remote.log and stderr."""
+    line = f"[{time.strftime('%H:%M:%S')}] [{tag}] {msg}"
+    if os.environ.get("TEXTUAL_WGPU_DEBUG", "").strip().lower() in ("1", "true", "yes"):
+        print(line, file=sys.stderr, flush=True)
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    try:
+        lp = Path.home() / ".cache" / "textual-wgpu" / "remote.log"
+        lp.parent.mkdir(parents=True, exist_ok=True)
+        if lp.exists() and lp.stat().st_size > 512 * 1024:
+            lp.write_text("", encoding="utf-8")
+        with lp.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
 class RemoteServerDriver(Driver):
     """Run an ``App`` / ``ModeApp`` headlessly and stream retained layers over a binary pipe."""
 
@@ -118,6 +142,10 @@ class RemoteServerDriver(Driver):
         self._vid_encoders: dict[int, Any] = {}
         self._client_file_cb: Any = None
         self._fs_list_cb: Any = None
+        self._fs_req_t0: float = 0.0
+        self._peer_cam_cb: Any = None
+        self._peer_mic_cb: Any = None
+        self._frame_counter: int = 0
         self.prefer_hw_video = True
         self.apps_path: Any = None
 
@@ -227,6 +255,8 @@ class RemoteServerDriver(Driver):
 
     def on_request_peer_fs_list(self, path: str, callback: Any) -> None:
         self._fs_list_cb = callback
+        self._fs_req_t0 = time.monotonic()
+        rlog("FS", f"FS_LIST -> peer path={path!r}")
         self.transport.send(
             Frame(
                 op=Op.FS_LIST,
@@ -238,12 +268,32 @@ class RemoteServerDriver(Driver):
 
     def on_request_peer_fs_get(self, path: str, callback: Any) -> None:
         self._client_file_cb = callback
+        self._fs_req_t0 = time.monotonic()
+        rlog("FS", f"FS_GET -> peer path={path!r}")
         self.transport.send(
             Frame(
                 op=Op.FS_GET,
                 payload=path.encode("utf-8"),
                 prio=Priority.P0_CONTROL,
             ),
+        )
+        self._draw_event.set()
+
+    def on_request_peer_camera(self, mode: int, callback: Any = None) -> None:
+        self._peer_cam_cb = callback if mode else None
+        rlog("CAM", f"CAM_CTL -> peer mode={mode}")
+        self.transport.send(
+            Frame(op=Op.CAM_CTL, payload=bytes([int(mode) & 0xFF]), prio=Priority.P0_CONTROL),
+            compress=False,
+        )
+        self._draw_event.set()
+
+    def on_request_peer_mic(self, enabled: bool, callback: Any = None) -> None:
+        self._peer_mic_cb = callback if enabled else None
+        rlog("MIC", f"MIC_CTL -> peer enabled={enabled}")
+        self.transport.send(
+            Frame(op=Op.MIC_CTL, payload=b"\x01" if enabled else b"\x00", prio=Priority.P0_CONTROL),
+            compress=False,
         )
         self._draw_event.set()
 
@@ -406,6 +456,7 @@ class RemoteServerDriver(Driver):
 
     async def emit_frame(self) -> int:
         """Record current frame and send all pending deltas; return bytes queued."""
+        t0 = time.monotonic()
         snap = self.record_frame()
         bytes_queued = 0
 
@@ -447,6 +498,10 @@ class RemoteServerDriver(Driver):
 
         await self.transport.flush()
         self._draw_pending = False
+        self._frame_counter += 1
+        dt_ms = (time.monotonic() - t0) * 1000.0
+        if dt_ms >= 20.0 or (self._frame_counter % 120) == 1:
+            rlog("PERF", f"emit_frame #{self._frame_counter}: dirty={len(snap['dirty'])} bytes={bytes_queued} dt={dt_ms:.1f}ms")
         return bytes_queued
 
     def _emit_planes(self) -> int:
@@ -597,14 +652,26 @@ class RemoteServerDriver(Driver):
 
     async def _rx_loop(self) -> None:
         while self.app._running:
-            frame = await self.transport.recv()
-            if frame is None:
+            try:
+                frame = await self.transport.recv()
+            except Exception as exc:  # noqa: BLE001
+                rlog("ERR", f"rx recv error: {exc}")
                 self.transport.close()
                 if not self.detach_on_eof:
                     self.app._running = False
                 self._draw_event.set()
                 break
-            await self._handle_frame(frame)
+            if frame is None:
+                rlog("NET", "peer EOF")
+                self.transport.close()
+                if not self.detach_on_eof:
+                    self.app._running = False
+                self._draw_event.set()
+                break
+            try:
+                await self._handle_frame(frame)
+            except Exception as exc:  # noqa: BLE001
+                rlog("ERR", f"handle_frame op={frame.op:#x} error: {exc}")
             if self._draw_pending:
                 await self.emit_frame()
 
@@ -638,24 +705,36 @@ class RemoteServerDriver(Driver):
             self.remote_clipboard = frame.payload.decode("utf-8", errors="replace")
         elif op == Op.CLIENT_FILE_DATA:
             name, data = decode_client_file(frame.payload)
+            dt_ms = (time.monotonic() - self._fs_req_t0) * 1000.0 if self._fs_req_t0 else 0.0
+            rlog("FS", f"CLIENT_FILE_DATA <- peer name={name!r} bytes={len(data)} dt={dt_ms:.1f}ms")
             cb = self._client_file_cb
             self._client_file_cb = None
             if callable(cb):
                 try:
                     cb(name, data)
                 except Exception as exc:  # noqa: BLE001
-                    print(f"client_file callback error: {exc}", flush=True)
+                    rlog("ERR", f"client_file callback error: {exc}")
                 self.app.request_draw()
         elif op == Op.FS_ENTRIES:
             req_path, entries = decode_fs_entries(frame.payload)
+            dt_ms = (time.monotonic() - self._fs_req_t0) * 1000.0 if self._fs_req_t0 else 0.0
+            rlog("FS", f"FS_ENTRIES <- peer path={req_path!r} items={len(entries)} dt={dt_ms:.1f}ms")
             cb = self._fs_list_cb
             self._fs_list_cb = None
             if callable(cb):
                 try:
                     cb(req_path, entries)
                 except Exception as exc:  # noqa: BLE001
-                    print(f"fs_entries callback error: {exc}", flush=True)
+                    rlog("ERR", f"fs_entries callback error: {exc}")
                 self.app.request_draw()
+        elif op == Op.VID_NALU:
+            pts_us, flags, _mat, raw = decode_vid_nalu(frame.payload)
+            if callable(self._peer_cam_cb):
+                self._peer_cam_cb(pts_us, flags, raw)
+        elif op == Op.AUDIO_PCM:
+            sr, ch, _fl, pcm = decode_audio_pcm(frame.payload)
+            if callable(self._peer_mic_cb):
+                self._peer_mic_cb(sr, ch, pcm)
         elif op == Op.CAPS:
             from ..widgets.viewport3d import ClientCapabilities
             from ..widgets.video import Video

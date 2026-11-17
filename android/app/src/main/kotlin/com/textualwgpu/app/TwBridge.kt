@@ -14,6 +14,8 @@ interface TwCallback {
     fun onLaunchStatus(ok: Boolean, appId: String, message: String)
     fun onFsList(reqPath: String)
     fun onFsGet(pathOrUri: String)
+    fun onCamCtl(mode: Int)
+    fun onMicCtl(mode: Int)
 }
 
 object TwBridge {
@@ -91,5 +93,7 @@ object TwBridge {
         paths: Array<String>,
         sizes: LongArray,
     )
+    external fun nativeSendVideoNalu(ptr: Long, ptsUs: Long, flags: Int, data: ByteArray)
+    external fun nativeSendAudioPcm(ptr: Long, sampleRate: Int, channels: Int, pcm: ByteArray)
     external fun nativeDisconnect(ptr: Long)
 }

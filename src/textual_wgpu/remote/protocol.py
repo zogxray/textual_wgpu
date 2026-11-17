@@ -84,6 +84,8 @@ class Op(IntEnum):
     CAPS = 0x02
     RESIZE = 0x03
     FS_GET = 0x04
+    CAM_CTL = 0x05
+    MIC_CTL = 0x06
     INPUT_KEY = 0x10
     INPUT_CHAR = 0x11
     INPUT_POINTER = 0x12

@@ -62,6 +62,15 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
     @Volatile
     private var activeTrack: AudioTrack? = null
     private val videoDecoders = ConcurrentHashMap<Int, VideoDecoderSlot>()
+    @Volatile
+    private var camPumpActive = false
+    @Volatile
+    private var micPumpActive = false
+    @Volatile
+    private var pendingCamMode = 0
+    @Volatile
+    private var pendingMicMode = 0
+    private var redrawCount = 0L
 
     private val openDocLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null && sessionPtr != 0L) {
@@ -345,12 +354,19 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
     override fun onRedraw() {
         mainHandler.post {
             if (sessionPtr != 0L) {
+                val t0 = System.nanoTime()
                 TwBridge.nativeRenderFrame(sessionPtr)
+                val dtMs = (System.nanoTime() - t0) / 1_000_000.0
+                redrawCount++
+                if (dtMs >= 16.0 || redrawCount == 1L || redrawCount % 180L == 0L) {
+                    TwLog.log("TwPerf", "frame #$redrawCount render=${"%.1f".format(dtMs)}ms")
+                }
             }
         }
     }
 
     override fun onStatus(msg: String) {
+        TwLog.log("TwNet", msg)
         mainHandler.post {
             statusTv.text = msg
             if (fullscreenMode) {
@@ -532,7 +548,10 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
     override fun onFsList(reqPath: String) {
         Thread {
             if (sessionPtr == 0L) return@Thread
+            val t0 = System.nanoTime()
             val items = LocalMediaHelper.listMediaFolder(applicationContext, reqPath)
+            val dtMs = (System.nanoTime() - t0) / 1_000_000.0
+            TwLog.log("TwFs", "onFsList('$reqPath') -> ${items.size} items (${"%.1f".format(dtMs)}ms)")
             val isDirs = ByteArray(items.size) { i -> if (items[i].isDir) 1.toByte() else 0.toByte() }
             val names = Array(items.size) { i -> items[i].name }
             val paths = Array(items.size) { i -> items[i].path }
@@ -550,16 +569,115 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
         }
         Thread {
             if (sessionPtr == 0L) return@Thread
+            val t0 = System.nanoTime()
             onStatus("Loading ${pathOrUri.substringAfterLast('/')}…")
             val res = LocalMediaHelper.readMediaFile(applicationContext, pathOrUri)
             if (res != null && sessionPtr != 0L) {
                 val (name, bytes) = res
                 TwBridge.nativeSendClientFile(sessionPtr, name, bytes)
+                val dtMs = (System.nanoTime() - t0) / 1_000_000.0
+                TwLog.log("TwFs", "onFsGet('$name') ${bytes.size}B (${"%.1f".format(dtMs)}ms)")
                 onStatus("Sent $name (${(bytes.size + 1023) / 1024} KB)")
             } else {
+                TwLog.err("TwFs", "Failed to read $pathOrUri")
                 onStatus("Failed to read $pathOrUri")
             }
         }.start()
+    }
+
+    override fun onCamCtl(mode: Int) {
+        camPumpActive = false
+        LocalMediaHelper.stopCamera()
+        if (mode <= 0) {
+            TwLog.log("TwCam", "Peer stopped camera")
+            return
+        }
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            pendingCamMode = mode
+            mainHandler.post { requestPermissions(arrayOf(Manifest.permission.CAMERA), 4102) }
+            return
+        }
+        startCameraPump(mode)
+    }
+
+    private fun startCameraPump(mode: Int) {
+        LocalMediaHelper.startCamera(applicationContext, mode)
+        camPumpActive = true
+        val t0 = System.nanoTime()
+        Thread({
+            while (camPumpActive && sessionPtr != 0L) {
+                val pkt = LocalMediaHelper.popCameraFrame()
+                if (pkt != null && pkt.size > 1 && sessionPtr != 0L) {
+                    val isKf = pkt[0].toInt() != 0
+                    val au = pkt.copyOfRange(1, pkt.size)
+                    val flags = TwBridge.VID_CODEC_H264 or (if (isKf) 0x01 else 0x00)
+                    val ptsUs = (System.nanoTime() - t0) / 1000L
+                    TwBridge.nativeSendVideoNalu(sessionPtr, ptsUs, flags, au)
+                } else {
+                    try {
+                        Thread.sleep(12)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                }
+            }
+        }, "tw-cam-tx").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    override fun onMicCtl(mode: Int) {
+        micPumpActive = false
+        LocalMediaHelper.stopMic()
+        if (mode <= 0) {
+            TwLog.log("TwMic", "Peer stopped mic")
+            return
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            pendingMicMode = mode
+            mainHandler.post { requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 4103) }
+            return
+        }
+        startMicPump()
+    }
+
+    private fun startMicPump() {
+        LocalMediaHelper.startMic(applicationContext, 16000)
+        micPumpActive = true
+        Thread({
+            while (micPumpActive && sessionPtr != 0L) {
+                val pcm = LocalMediaHelper.popMicChunk()
+                if (pcm != null && pcm.isNotEmpty() && sessionPtr != 0L) {
+                    TwBridge.nativeSendAudioPcm(sessionPtr, 16000, 1, pcm)
+                } else {
+                    try {
+                        Thread.sleep(20)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                }
+            }
+        }, "tw-mic-tx").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 4102 && grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED && pendingCamMode > 0) {
+            val m = pendingCamMode
+            pendingCamMode = 0
+            startCameraPump(m)
+        } else if (requestCode == 4103 && grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED && pendingMicMode > 0) {
+            pendingMicMode = 0
+            startMicPump()
+        }
     }
 
     private fun requestMediaPermissionsIfNeeded() {
@@ -756,6 +874,10 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
     override fun onDestroy() {
         super.onDestroy()
         onAudioStop()
+        camPumpActive = false
+        micPumpActive = false
+        LocalMediaHelper.stopCamera()
+        LocalMediaHelper.stopMic()
         for (slot in videoDecoders.values) {
             slot.close()
         }

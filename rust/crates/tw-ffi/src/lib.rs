@@ -91,6 +91,10 @@ mod android_jni {
         let cb_fl = Arc::clone(&cb_ref);
         let vm_fg = Arc::clone(&vm);
         let cb_fg = Arc::clone(&cb_ref);
+        let vm_cc = Arc::clone(&vm);
+        let cb_cc = Arc::clone(&cb_ref);
+        let vm_mc = Arc::clone(&vm);
+        let cb_mc = Arc::clone(&cb_ref);
 
         ClientCallbacks {
             on_commit: Arc::new(move || call_void(&vm_r, &cb_r, "onRedraw")),
@@ -195,6 +199,20 @@ mod android_jni {
             }),
             on_fs_get: Arc::new(move |req_path| {
                 call_str(&vm_fg, &cb_fg, "onFsGet", req_path);
+            }),
+            on_cam_ctl: Arc::new(move |mode| {
+                if let Ok(mut env) = vm_cc.attach_current_thread() {
+                    if env.call_method(cb_cc.as_obj(), "onCamCtl", "(I)V", &[(mode as jint).into()]).is_err() {
+                        let _ = env.exception_clear();
+                    }
+                }
+            }),
+            on_mic_ctl: Arc::new(move |mode| {
+                if let Ok(mut env) = vm_mc.attach_current_thread() {
+                    if env.call_method(cb_mc.as_obj(), "onMicCtl", "(I)V", &[(mode as jint).into()]).is_err() {
+                        let _ = env.exception_clear();
+                    }
+                }
             }),
         }
     }
@@ -844,6 +862,44 @@ mod android_jni {
         }
         if let Some(c) = &sess.client {
             c.send_fs_entries(&req, &entries);
+        }
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_textualwgpu_app_TwBridge_nativeSendVideoNalu(
+        env: JNIEnv,
+        _cls: JClass,
+        ptr: jlong,
+        pts_us: jlong,
+        flags: jint,
+        data: JByteArray,
+    ) {
+        if ptr == 0 {
+            return;
+        }
+        let sess = unsafe { &*(ptr as *mut RemoteSession) };
+        let Ok(bytes) = env.convert_byte_array(&data) else { return };
+        if let Some(c) = &sess.client {
+            c.send_video_nalu(pts_us.max(0) as u64, (flags & 0xFF) as u8, &bytes);
+        }
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_textualwgpu_app_TwBridge_nativeSendAudioPcm(
+        env: JNIEnv,
+        _cls: JClass,
+        ptr: jlong,
+        sample_rate: jint,
+        channels: jint,
+        pcm: JByteArray,
+    ) {
+        if ptr == 0 {
+            return;
+        }
+        let sess = unsafe { &*(ptr as *mut RemoteSession) };
+        let Ok(bytes) = env.convert_byte_array(&pcm) else { return };
+        if let Some(c) = &sess.client {
+            c.send_audio_pcm(sample_rate.max(8000) as u32, channels.max(1) as u8, &bytes);
         }
     }
 

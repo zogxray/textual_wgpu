@@ -795,6 +795,14 @@ class MediaScreen(Screen):
         self._video_playing = True
         self._video_phase = 0.0
         self._file_streamer: Any = None
+        self._cam_mode: str | None = None
+        self._mic_mode: str | None = None
+        self._mic_cap: Any = None
+        self._mic_env: list[float] = [0.08] * 48
+        self._mic_buf = bytearray()
+        self._mic_mon_buf = bytearray()
+        self._mic_monitor = False
+        self._mic_elapsed = 0.0
         self._audio_playing = False
         self._audio_elapsed = 0.0
         self._audio_proc: subprocess.Popen | None = None
@@ -815,32 +823,41 @@ class MediaScreen(Screen):
         vid = Video(id="media-video")
         vid.play()
         vid.push_rgba_frame(240, 144, _render_demo_video_frame(240, 144, 0.0))
-        vid_box = Panel(vid, title="VIDEO · H.265/H.264 HW plane (V play/pause)", id="video-box")
+        vid_box = Panel(vid, title="VIDEO / CAMERA · H.265/H.264 HW plane (V pause · C cam)", id="video-box")
 
-        btn_audio = Button("Play Audio", id="btn-audio", on_press=self.toggle_audio)
-        btn_vid = Button("Pause Video", id="btn-video", on_press=self.toggle_video)
         btn_open = Button("Open File (O)", id="btn-open-file", variant="primary", on_press=self.open_media_file)
-        audio_btns = Horizontal(btn_open, btn_audio, btn_vid, id="media-btns")
-        audio_btns.layout_hint_h = 36
+        btn_cam = Button("Camera (C)", id="btn-cam", on_press=self.toggle_camera)
+        btn_mic = Button("Mic (M)", id="btn-mic", on_press=self.toggle_mic)
+        row1 = Horizontal(btn_open, btn_cam, btn_mic, id="media-btns-1")
+        row1.layout_hint_h = 36
+
+        btn_audio = Button("Play Audio (A)", id="btn-audio", on_press=self.toggle_audio)
+        btn_vid = Button("Pause Video (V)", id="btn-video", on_press=self.toggle_video)
+        btn_mon = Button("Monitor: Off", id="btn-mon", on_press=self.toggle_mic_monitor)
+        row2 = Horizontal(btn_audio, btn_vid, btn_mon, id="media-btns-2")
+        row2.layout_hint_h = 36
+
         digits = Digits("00.0s", id="audio-clock")
         bar = ProgressBar(100, id="audio-bar")
         spark = Sparkline(self._audio_env, id="audio-spark")
         spark.layout_hint_h = 26
-        audio_inner = Vertical(audio_btns, digits, bar, spark, id="audio-inner")
-        audio_box = Panel(audio_inner, title="MEDIA & AUDIO · O open file · V video · A audio", id="audio-box")
+        audio_inner = Vertical(row1, row2, digits, bar, spark, id="audio-inner")
+        audio_box = Panel(audio_inner, title="MEDIA · O file · C camera · M mic · L monitor", id="audio-box")
 
         right = Vertical(vid_box, audio_box, id="media-right")
         yield Horizontal(photo_box, right, id="main")
         yield KeyBar([
             ("O", "Open File", lambda: self.open_media_file()),
-            ("V/Space", "Video", lambda: self.toggle_video()),
+            ("C", "Camera", lambda: self.toggle_camera()),
+            ("M", "Mic", lambda: self.toggle_mic()),
+            ("L", "Monitor", lambda: self.toggle_mic_monitor()),
+            ("V", "Video", lambda: self.toggle_video()),
             ("A", "Audio", lambda: self.toggle_audio()),
-            ("1/2/3", "Gallery", None),
             ("Tab", "Panel", lambda: _focus_next(self)),
             ("F1–F8", "Modes", None),
             ("Q", "Quit", lambda: _quit(self)),
         ])
-        yield StatusBar("F7 Media · H.265/H.264 video + native PNG + WAV/MP3 + server/client files", id="status")
+        yield StatusBar("F7 Media · Any-device Files, Camera & Mic + H.265/H.264", id="status")
 
     def _build_photo_doc(self) -> Text:
         path = self._custom_photo if (self._custom_photo and self._custom_photo.is_file()) else _ensure_demo_photo(self._photo_kind)
@@ -988,6 +1005,172 @@ class MediaScreen(Screen):
                 pass
             self._audio_proc = None
 
+    def _stop_camera(self) -> None:
+        if self._cam_mode == "peer":
+            drv = getattr(self.app, "_driver", None) if self.app is not None else None
+            if hasattr(drv, "on_request_peer_camera"):
+                drv.on_request_peer_camera(0, None)
+        if self._cam_mode == "local" and self._file_streamer is not None:
+            self._file_streamer.close()
+            self._file_streamer = None
+        self._cam_mode = None
+        try:
+            self.query_one("#btn-cam", Button).label = "Camera (C)"
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _start_camera_source(self, src: str) -> None:
+        self._stop_camera()
+        if self._file_streamer is not None:
+            self._file_streamer.close()
+            self._file_streamer = None
+        drv = getattr(self.app, "_driver", None) if self.app is not None else None
+        if src in ("peer_front", "peer_back") and hasattr(drv, "on_request_peer_camera"):
+            facing = 2 if src == "peer_back" else 1
+            vid = self.query_one("#media-video", Video)
+
+            def _on_peer_nalu(pts_us: int, flags: int, raw: bytes) -> None:
+                is_kf = bool(flags & 0x01)
+                cflag = flags & 0xF0
+                vid.push_packet(pts_us, raw, keyframe=is_kf, codec_flag=cflag)
+
+            drv.on_request_peer_camera(facing, _on_peer_nalu)
+            self._cam_mode = "peer"
+            self._video_playing = True
+            self.query_one("#btn-cam", Button).label = "Stop Cam (C)"
+            self.query_one("#status", StatusBar).update(
+                f"F7 Media · streaming connected device camera ({'back' if facing == 2 else 'front'})",
+            )
+            return
+        try:
+            from .remote.media_codec import LocalCameraStreamer
+
+            self._file_streamer = LocalCameraStreamer(facing=1)
+            self._cam_mode = "local"
+            self._video_playing = True
+            self.query_one("#btn-cam", Button).label = "Stop Cam (C)"
+            self.query_one("#btn-video", Button).label = "Pause Video (V)"
+            self.query_one("#status", StatusBar).update("F7 Media · streaming local camera")
+        except Exception as exc:  # noqa: BLE001
+            self.query_one("#status", StatusBar).update(f"F7 Media · camera error: {exc}")
+
+    def toggle_camera(self) -> None:
+        if self._cam_mode is not None:
+            self._stop_camera()
+            self.query_one("#status", StatusBar).update("F7 Media · camera stopped")
+            return
+        drv = getattr(self.app, "_driver", None) if self.app is not None else None
+        if hasattr(drv, "on_request_peer_camera") and hasattr(self.app, "ask_pick"):
+            self.app.ask_pick(
+                "Select Camera Source",
+                [
+                    ("local", "💻 Local Device Camera"),
+                    ("peer_front", "📱 Connected Device Camera (Front)"),
+                    ("peer_back", "📱 Connected Device Camera (Back)"),
+                ],
+                lambda val: self._start_camera_source(val) if val else None,
+            )
+        else:
+            self._start_camera_source("local")
+
+    def _stop_mic(self) -> None:
+        if self._mic_mode == "peer":
+            drv = getattr(self.app, "_driver", None) if self.app is not None else None
+            if hasattr(drv, "on_request_peer_mic"):
+                drv.on_request_peer_mic(False, None)
+        if self._mic_cap is not None:
+            self._mic_cap.close()
+            self._mic_cap = None
+        if self._mic_buf:
+            from .remote.media_codec import compute_pcm_envelope
+
+            pcm = bytes(self._mic_buf)
+            self._audio_pcm = pcm
+            self._audio_sr = 16000
+            self._audio_ch = 1
+            self._audio_env = compute_pcm_envelope(pcm)
+            self._audio_dur = max(0.2, len(pcm) / (16000 * 2))
+        self._mic_mode = None
+        try:
+            self.query_one("#btn-mic", Button).label = "Mic (M)"
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_mic_pcm(self, sr: int, ch: int, pcm: bytes) -> None:
+        from .remote.media_codec import pcm_rms_level
+
+        if not pcm:
+            return
+        self._mic_buf.extend(pcm)
+        if len(self._mic_buf) > 16000 * 2 * 15:
+            del self._mic_buf[: len(self._mic_buf) - 16000 * 2 * 15]
+        self._mic_elapsed += len(pcm) / max(1, sr * ch * 2)
+        rms = pcm_rms_level(pcm)
+        self._mic_env = self._mic_env[1:] + [round(max(0.06, rms), 3)]
+        try:
+            self.query_one("#audio-spark", Sparkline).data = list(self._mic_env)
+            self.query_one("#audio-bar", ProgressBar).progress = min(100.0, rms * 100.0)
+            self.query_one("#audio-clock", Digits).update(f"{self._mic_elapsed:04.1f}s")
+        except Exception:  # noqa: BLE001
+            pass
+        if self._mic_monitor and self.app is not None and hasattr(self.app, "play_audio_pcm"):
+            self._mic_mon_buf.extend(pcm)
+            if len(self._mic_mon_buf) >= int(sr * ch * 2 * 0.32):
+                chunk = bytes(self._mic_mon_buf)
+                self._mic_mon_buf.clear()
+                self.app.play_audio_pcm(chunk, sample_rate=sr, channels=ch)
+
+    def _start_mic_source(self, src: str) -> None:
+        self._stop_mic()
+        self._stop_audio_proc()
+        self._audio_playing = False
+        self._mic_buf.clear()
+        self._mic_mon_buf.clear()
+        self._mic_elapsed = 0.0
+        self._mic_env = [0.08] * 48
+        drv = getattr(self.app, "_driver", None) if self.app is not None else None
+        if src == "peer" and hasattr(drv, "on_request_peer_mic"):
+            drv.on_request_peer_mic(True, self._on_mic_pcm)
+            self._mic_mode = "peer"
+            self.query_one("#btn-mic", Button).label = "Stop Mic (M)"
+            self.query_one("#status", StatusBar).update("F7 Media · streaming connected device mic")
+            return
+        try:
+            from .remote.media_codec import LocalMicCapture
+
+            self._mic_cap = LocalMicCapture(sample_rate=16000, channels=1, chunk_ms=80)
+            self._mic_mode = "local"
+            self.query_one("#btn-mic", Button).label = "Stop Mic (M)"
+            self.query_one("#status", StatusBar).update("F7 Media · streaming local microphone")
+        except Exception as exc:  # noqa: BLE001
+            self.query_one("#status", StatusBar).update(f"F7 Media · mic error: {exc}")
+
+    def toggle_mic(self) -> None:
+        if self._mic_mode is not None:
+            self._stop_mic()
+            self.query_one("#status", StatusBar).update("F7 Media · mic stopped (press A to play recording)")
+            return
+        drv = getattr(self.app, "_driver", None) if self.app is not None else None
+        if hasattr(drv, "on_request_peer_mic") and hasattr(self.app, "ask_pick"):
+            self.app.ask_pick(
+                "Select Microphone Source",
+                [
+                    ("local", "💻 Local Device Microphone"),
+                    ("peer", "📱 Connected Device Microphone"),
+                ],
+                lambda val: self._start_mic_source(val) if val else None,
+            )
+        else:
+            self._start_mic_source("local")
+
+    def toggle_mic_monitor(self) -> None:
+        self._mic_monitor = not self._mic_monitor
+        self._mic_mon_buf.clear()
+        try:
+            self.query_one("#btn-mon", Button).label = "Monitor: On" if self._mic_monitor else "Monitor: Off"
+        except Exception:  # noqa: BLE001
+            pass
+
     def toggle_audio(self, *, play_os: bool = True) -> None:
         self._audio_playing = not self._audio_playing
         btn = self.query_one("#btn-audio", Button)
@@ -1006,7 +1189,7 @@ class MediaScreen(Screen):
             self.query_one("#status", StatusBar).update("F7 Media · playing audio")
         else:
             self._stop_audio_proc()
-            btn.label = "Play Synth Audio"
+            btn.label = "Play Audio (A)"
             self.query_one("#status", StatusBar).update("F7 Media · audio stopped")
 
     def on_screen_mount(self) -> None:
@@ -1016,9 +1199,14 @@ class MediaScreen(Screen):
     def _media_tick(self) -> None:
         if self.app is None or getattr(self.app, "mode_key", None) != "media":
             return
+        if self._mic_mode == "local" and self._mic_cap is not None:
+            for pcm in self._mic_cap.pop_chunks():
+                self._on_mic_pcm(self._mic_cap.sample_rate, self._mic_cap.channels, pcm)
         if self._video_playing:
             vid = self.query_one("#media-video", Video)
-            if self._file_streamer is not None:
+            if self._cam_mode == "peer":
+                pass  # frames pushed directly by _on_peer_nalu callback
+            elif self._file_streamer is not None:
                 is_remote = hasattr(getattr(self.app, "_driver", None), "on_audio_play")
                 if is_remote:
                     for au, is_kf in self._file_streamer.pop_aus():
@@ -1037,7 +1225,7 @@ class MediaScreen(Screen):
                 self._audio_playing = False
                 self._audio_elapsed = 0.0
                 self._stop_audio_proc()
-                self.query_one("#btn-audio", Button).label = "Play Synth Audio"
+                self.query_one("#btn-audio", Button).label = "Play Audio (A)"
             pct = min(100.0, (self._audio_elapsed / max(0.1, self._audio_dur)) * 100.0)
             self.query_one("#audio-clock", Digits).update(f"{self._audio_elapsed:04.1f}s")
             self.query_one("#audio-bar", ProgressBar).progress = pct
@@ -1059,6 +1247,15 @@ class MediaScreen(Screen):
             return True
         if key == "u":
             self.pick_client_file()
+            return True
+        if key == "c":
+            self.toggle_camera()
+            return True
+        if key == "m":
+            self.toggle_mic()
+            return True
+        if key == "l":
+            self.toggle_mic_monitor()
             return True
         if key in ("v", "space"):
             self.toggle_video()

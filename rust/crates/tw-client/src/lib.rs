@@ -6,10 +6,11 @@ use tokio::net::TcpStream;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tw_proto::{
-    decode_app_list, decode_audio_pcm, decode_launch_status, decode_vid_nalu, encode_caps,
-    encode_client_file, encode_fs_entries, encode_input_pointer, encode_input_wheel,
-    encode_launch_app, encode_resize, unpack_header, AppEntry, Frame, FrameReassembler, FsEntry,
-    Op, Priority, PriorityMux, HEADER_SIZE, VID_CODEC_MASK, VID_FLAG_KEYFRAME,
+    decode_app_list, decode_audio_pcm, decode_launch_status, decode_vid_nalu, encode_audio_pcm,
+    encode_caps, encode_client_file, encode_fs_entries, encode_input_pointer, encode_input_wheel,
+    encode_launch_app, encode_resize, encode_vid_nalu, unpack_header, AppEntry, Frame,
+    FrameReassembler, FsEntry, Op, Priority, PriorityMux, HEADER_SIZE, VID_CODEC_MASK,
+    VID_FLAG_KEYFRAME,
 };
 use tw_render::SceneState;
 
@@ -71,6 +72,22 @@ impl ClientHandle {
         ));
     }
 
+    pub fn send_video_nalu(&self, pts_us: u64, flags: u8, nalu: &[u8]) {
+        let _ = self.tx.send(Frame::new(
+            Op::VidNalu,
+            encode_vid_nalu(pts_us, flags, nalu),
+            Priority::P2Media,
+        ));
+    }
+
+    pub fn send_audio_pcm(&self, sample_rate: u32, channels: u8, pcm: &[u8]) {
+        let _ = self.tx.send(Frame::new(
+            Op::AudioPcm,
+            encode_audio_pcm(sample_rate, channels, 1, pcm),
+            Priority::P1Ui,
+        ));
+    }
+
     pub fn list_apps(&self) {
         let _ = self.tx.send(Frame::new(Op::ListApps, Vec::new(), Priority::P0Control));
     }
@@ -101,6 +118,8 @@ pub struct ClientCallbacks {
     pub on_launch_status: Arc<dyn Fn(bool, &str, &str) + Send + Sync>,
     pub on_fs_list: Arc<dyn Fn(&str) + Send + Sync>,
     pub on_fs_get: Arc<dyn Fn(&str) + Send + Sync>,
+    pub on_cam_ctl: Arc<dyn Fn(u8) + Send + Sync>,
+    pub on_mic_ctl: Arc<dyn Fn(u8) + Send + Sync>,
 }
 
 impl Default for ClientCallbacks {
@@ -117,6 +136,8 @@ impl Default for ClientCallbacks {
             on_launch_status: Arc::new(|_, _, _| {}),
             on_fs_list: Arc::new(|_| {}),
             on_fs_get: Arc::new(|_| {}),
+            on_cam_ctl: Arc::new(|_| {}),
+            on_mic_ctl: Arc::new(|_| {}),
         }
     }
 }
@@ -302,9 +323,11 @@ async fn pump_frame_stream<R, W>(
     let writer_task = tokio::spawn(async move {
         let mut mux = PriorityMux::new(4096, 2);
         while let Some(f) = rx.recv().await {
-            mux.push(f, true, false);
+            let comp = !matches!(f.op, Op::ClientFileData | Op::VidNalu | Op::PutBlob);
+            mux.push(f, comp, false);
             while let Ok(more) = rx.try_recv() {
-                mux.push(more, true, false);
+                let mc = !matches!(more.op, Op::ClientFileData | Op::VidNalu | Op::PutBlob);
+                mux.push(more, mc, false);
             }
             while let Some(pkt) = mux.pop_packet() {
                 if writer.write_all(&pkt).await.is_err() {
@@ -372,6 +395,14 @@ fn dispatch_incoming_frame(
         Op::FsGet => {
             let path = String::from_utf8_lossy(&frame.payload).into_owned();
             (cbs.on_fs_get)(&path);
+        }
+        Op::CamCtl => {
+            let mode = frame.payload.first().copied().unwrap_or(0);
+            (cbs.on_cam_ctl)(mode);
+        }
+        Op::MicCtl => {
+            let mode = frame.payload.first().copied().unwrap_or(0);
+            (cbs.on_mic_ctl)(mode);
         }
         Op::AppList => {
             if let Ok(apps) = decode_app_list(&frame.payload) {
@@ -657,9 +688,11 @@ pub fn spawn_ssh_session_cbs(
                 tokio::select! {
                     maybe_out = rx.recv() => {
                         let Some(f) = maybe_out else { break };
-                        mux.push(f, true, false);
+                        let comp = !matches!(f.op, Op::ClientFileData | Op::VidNalu | Op::PutBlob);
+                        mux.push(f, comp, false);
                         while let Ok(more) = rx.try_recv() {
-                            mux.push(more, true, false);
+                            let mc = !matches!(more.op, Op::ClientFileData | Op::VidNalu | Op::PutBlob);
+                            mux.push(more, mc, false);
                         }
                         while let Some(pkt) = mux.pop_packet() {
                             if channel.data(&pkt[..]).await.is_err() {

@@ -27,6 +27,8 @@ fn rust_client_drives_python_demo_over_stdio() {
     let app_list_cb = Arc::clone(&app_list);
     let launch_stat: Arc<Mutex<Option<(bool, String, String)>>> = Arc::new(Mutex::new(None));
     let launch_stat_cb = Arc::clone(&launch_stat);
+    let fs_reqs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fs_reqs_cb = Arc::clone(&fs_reqs);
     let cbs = ClientCallbacks {
         on_video_nalu: Arc::new(move |_sid, cflag, _pts, _kf, data| {
             nalus_cb.lock().unwrap().push((cflag, data.len()));
@@ -36,6 +38,9 @@ fn rust_client_drives_python_demo_over_stdio() {
         }),
         on_launch_status: Arc::new(move |ok, aid, msg| {
             *launch_stat_cb.lock().unwrap() = Some((ok, aid.to_string(), msg.to_string()));
+        }),
+        on_fs_list: Arc::new(move |req_path| {
+            fs_reqs_cb.lock().unwrap().push(req_path.to_string());
         }),
         ..Default::default()
     };
@@ -135,4 +140,27 @@ fn rust_client_drives_python_demo_over_stdio() {
     }
     let st_res = launch_stat.lock().unwrap().clone().unwrap();
     assert!(st_res.0 && st_res.1 == "demo:overview");
+
+    // Verify large FsEntries (>= 64B, zlib-compressed by tw-proto) decodes cleanly on Python without zstandard
+    let sample_entries: Vec<tw_proto::FsEntry> = (0..8)
+        .map(|i| tw_proto::FsEntry {
+            is_dir: i < 2,
+            name: format!("media_item_{i}.mp4"),
+            path: format!("/tmp/Downloads/media_item_{i}.mp4"),
+            size: 123456,
+        })
+        .collect();
+    client.send_fs_entries("", &sample_entries);
+    std::thread::sleep(Duration::from_millis(80));
+    // Server must still be alive and responsive to ping/app list after receiving compressed FsEntries!
+    app_list.lock().unwrap().clear();
+    client.list_apps();
+    let deadline_alive = Instant::now() + Duration::from_secs(3);
+    loop {
+        if !app_list.lock().unwrap().is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline_alive, "server died after receiving FsEntries (zstd vs zlib?)");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

@@ -554,6 +554,35 @@ class MainActivity : AppCompatActivity() {
             setText(prefs.getString("custom_cmd", "") ?: "")
             box.addView(this)
         }
+        val logsBtn = Button(this).apply {
+            text = "View Debug & Perf Logs"
+            isAllCaps = false
+            setOnClickListener {
+                val pyLogFile = java.io.File(cacheDir.parentFile, ".cache/textual-wgpu/remote.log")
+                val pyLogs = if (pyLogFile.isFile) pyLogFile.readText().takeLast(4000) else ""
+                val msg = buildString {
+                    append("=== Android Client / Perf Logs ===\n")
+                    append(TwLog.dump())
+                    if (pyLogs.isNotBlank()) {
+                        append("\n\n=== Local Python Server Logs ===\n")
+                        append(pyLogs)
+                    }
+                }
+                val tv = TextView(this@MainActivity).apply {
+                    text = msg
+                    textSize = 10f
+                    setTextIsSelectable(true)
+                    setPadding(px(12), px(8), px(12), px(8))
+                }
+                val sv = ScrollView(this@MainActivity).apply { addView(tv) }
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Debug & Performance Logs")
+                    .setView(sv)
+                    .setPositiveButton("Close", null)
+                    .show()
+            }
+            box.addView(this)
+        }
 
         AlertDialog.Builder(this)
             .setTitle("Display & Connection Settings")

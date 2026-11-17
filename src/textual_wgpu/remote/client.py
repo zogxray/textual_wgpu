@@ -22,6 +22,7 @@ from .protocol import (
     decode_audio_pcm,
     decode_launch_status,
     decode_put_blob,
+    encode_audio_pcm,
     encode_caps,
     encode_client_file,
     encode_fs_entries,
@@ -29,6 +30,7 @@ from .protocol import (
     encode_input_wheel,
     encode_launch_app,
     encode_resize,
+    encode_vid_nalu,
 )
 from .recorder import RemoteSceneState, apply_remote_frame
 from .transport import AsyncStreamTransport
@@ -60,6 +62,10 @@ class RemoteViewer:
         self._aloop: asyncio.AbstractEventLoop | None = None
         self.peer_apps: list[tuple[str, str, str, str]] = []
         self.last_launch_status: tuple[bool, str, str] | None = None
+        self._cam_streamer: Any = None
+        self._cam_stop = False
+        self._mic_cap: Any = None
+        self._mic_stop = False
 
     def _blob_path(self, hash16: bytes) -> Path:
         return self.cache_dir / f"{hash16.hex()}.png"
@@ -99,6 +105,14 @@ class RemoteViewer:
         elif frame.op == Op.FS_GET:
             req_path = frame.payload.decode("utf-8", errors="replace")
             self._handle_fs_get(req_path)
+            return False
+        elif frame.op == Op.CAM_CTL:
+            mode = frame.payload[0] if frame.payload else 0
+            self._handle_cam_ctl(mode)
+            return False
+        elif frame.op == Op.MIC_CTL:
+            enabled = bool(frame.payload[0]) if frame.payload else False
+            self._handle_mic_ctl(enabled)
             return False
         elif frame.op == Op.APP_LIST:
             self.peer_apps = decode_app_list(frame.payload)
@@ -261,6 +275,79 @@ class RemoteViewer:
                 )
             except OSError:
                 pass
+
+    def _handle_cam_ctl(self, mode: int) -> None:
+        import threading
+        import time
+
+        self._cam_stop = True
+        if self._cam_streamer is not None:
+            try:
+                self._cam_streamer.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._cam_streamer = None
+        if mode <= 0:
+            return
+        try:
+            from .media_codec import LocalCameraStreamer
+
+            cam = LocalCameraStreamer(facing=mode)
+        except Exception:  # noqa: BLE001
+            return
+        self._cam_streamer = cam
+        self._cam_stop = False
+
+        def _pump() -> None:
+            while not self._cam_stop and self._cam_streamer is cam:
+                aus = cam.pop_aus()
+                for au, is_kf in aus:
+                    fl = (0x01 if is_kf else 0x00) | (cam.codec_flag & 0xF0)
+                    vp = encode_vid_nalu(int(time.monotonic() * 1_000_000), fl, (), au)
+                    self._send_remote_frame(
+                        Frame(op=Op.VID_NALU, payload=vp, prio=Priority.P2_MEDIA, surf_id=1),
+                        compress=False,
+                    )
+                time.sleep(0.025)
+
+        threading.Thread(target=_pump, daemon=True).start()
+
+    def _handle_mic_ctl(self, enabled: bool) -> None:
+        import threading
+        import time
+
+        self._mic_stop = True
+        if self._mic_cap is not None:
+            try:
+                self._mic_cap.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._mic_cap = None
+        if not enabled:
+            return
+        try:
+            from .media_codec import LocalMicCapture
+
+            mic = LocalMicCapture(sample_rate=16000, channels=1, chunk_ms=80)
+        except Exception:  # noqa: BLE001
+            return
+        self._mic_cap = mic
+        self._mic_stop = False
+
+        def _pump() -> None:
+            while not self._mic_stop and self._mic_cap is mic:
+                for pcm in mic.pop_chunks():
+                    self._send_remote_frame(
+                        Frame(
+                            op=Op.AUDIO_PCM,
+                            payload=encode_audio_pcm(mic.sample_rate, mic.channels, pcm),
+                            prio=Priority.P1_UI,
+                        ),
+                        compress=True,
+                    )
+                time.sleep(0.03)
+
+        threading.Thread(target=_pump, daemon=True).start()
 
     def _play_local_audio(self, sample_rate: int, channels: int, pcm: bytes) -> None:
         import shutil

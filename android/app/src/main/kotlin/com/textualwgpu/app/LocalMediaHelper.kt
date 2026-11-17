@@ -1,19 +1,61 @@
 package com.textualwgpu.app
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.content.ContentUris
 import android.content.Context
+import android.content.pm.PackageManager
+import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraManager
+import android.media.AudioFormat
+import android.media.AudioRecord
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Environment
+import android.os.Handler
+import android.os.HandlerThread
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.util.Log
+import android.view.Surface
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.LinkedBlockingQueue
+
+object TwLog {
+    private val lines = ArrayDeque<String>(160)
+    private val fmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+
+    @Synchronized
+    fun log(tag: String, msg: String) {
+        Log.i(tag, msg)
+        val entry = "[${fmt.format(Date())}] [$tag] $msg"
+        if (lines.size >= 160) lines.removeFirst()
+        lines.addLast(entry)
+    }
+
+    @Synchronized
+    fun err(tag: String, msg: String, t: Throwable? = null) {
+        if (t != null) Log.e(tag, msg, t) else Log.e(tag, msg)
+        val entry = "[${fmt.format(Date())}] [ERR/$tag] $msg${if (t != null) ": ${t.message}" else ""}"
+        if (lines.size >= 160) lines.removeFirst()
+        lines.addLast(entry)
+    }
+
+    @Synchronized
+    fun dump(): String = if (lines.isEmpty()) "(no logs yet)" else lines.joinToString("\n")
+}
 
 object LocalMediaHelper {
 
@@ -342,5 +384,265 @@ object LocalMediaHelper {
             } catch (_: Throwable) {
             }
         }
+    }
+
+    // ── Camera2 + H.264 MediaCodec encoder (surface-to-NALU) ───────────────
+    private val camQueue = LinkedBlockingQueue<ByteArray>(32)
+    @Volatile
+    private var camActive = false
+    private var camDevice: CameraDevice? = null
+    private var camSession: CameraCaptureSession? = null
+    private var camEncoder: MediaCodec? = null
+    private var camInputSurface: Surface? = null
+    private var camBgThread: HandlerThread? = null
+    private var camDrainThread: Thread? = null
+
+    @JvmStatic
+    @SuppressLint("MissingPermission")
+    fun startCamera(ctx: Context, facing: Int = 1) {
+        stopCamera()
+        if (ctx.checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            TwLog.err("TwCam", "CAMERA permission not granted")
+            return
+        }
+        camActive = true
+        camQueue.clear()
+        val bgThread = HandlerThread("tw-cam-bg").apply { start() }
+        camBgThread = bgThread
+        val handler = Handler(bgThread.looper)
+
+        try {
+            val mgr = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val wantLens = if (facing >= 2) CameraCharacteristics.LENS_FACING_BACK else CameraCharacteristics.LENS_FACING_FRONT
+            var camId = mgr.cameraIdList.firstOrNull { id ->
+                mgr.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) == wantLens
+            } ?: mgr.cameraIdList.firstOrNull()
+            if (camId == null) {
+                TwLog.err("TwCam", "No camera device found")
+                stopCamera()
+                return
+            }
+
+            val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 640, 480).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                setInteger(MediaFormat.KEY_BIT_RATE, 1_000_000)
+                setInteger(MediaFormat.KEY_FRAME_RATE, 24)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            }
+            enc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            val surf = enc.createInputSurface()
+            enc.start()
+            camEncoder = enc
+            camInputSurface = surf
+
+            camDrainThread = Thread({
+                val info = MediaCodec.BufferInfo()
+                var spsPps: ByteArray? = null
+                var frameCount = 0L
+                while (camActive) {
+                    val idx = try {
+                        enc.dequeueOutputBuffer(info, 20_000)
+                    } catch (_: Throwable) {
+                        break
+                    }
+                    if (idx >= 0) {
+                        try {
+                            val buf = enc.getOutputBuffer(idx)
+                            if (buf != null && info.size > 0) {
+                                buf.position(info.offset)
+                                val arr = ByteArray(info.size)
+                                buf.get(arr)
+                                if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                                    spsPps = arr
+                                } else {
+                                    val isKf = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+                                    val au = if (isKf && spsPps != null) spsPps!! + arr else arr
+                                    val pkt = ByteArray(1 + au.size)
+                                    pkt[0] = if (isKf) 1 else 0
+                                    System.arraycopy(au, 0, pkt, 1, au.size)
+                                    if (!camQueue.offer(pkt)) {
+                                        camQueue.poll()
+                                        camQueue.offer(pkt)
+                                    }
+                                    frameCount++
+                                    if (frameCount == 1L || frameCount % 120L == 0L) {
+                                        TwLog.log("TwCam", "encoded frame #$frameCount (${au.size}B, kf=$isKf)")
+                                    }
+                                }
+                            }
+                        } finally {
+                            try {
+                                enc.releaseOutputBuffer(idx, false)
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                }
+            }, "tw-cam-enc").apply {
+                isDaemon = true
+                start()
+            }
+
+            mgr.openCamera(
+                camId,
+                object : CameraDevice.StateCallback() {
+                    override fun onOpened(camera: CameraDevice) {
+                        if (!camActive) {
+                            camera.close()
+                            return
+                        }
+                        camDevice = camera
+                        try {
+                            val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                                addTarget(surf)
+                            }
+                            @Suppress("DEPRECATION")
+                            camera.createCaptureSession(
+                                listOf(surf),
+                                object : CameraCaptureSession.StateCallback() {
+                                    override fun onConfigured(session: CameraCaptureSession) {
+                                        if (!camActive) {
+                                            session.close()
+                                            return
+                                        }
+                                        camSession = session
+                                        try {
+                                            session.setRepeatingRequest(req.build(), null, handler)
+                                            TwLog.log("TwCam", "Camera2 started id=$camId (640x480 H.264)")
+                                        } catch (t: Throwable) {
+                                            TwLog.err("TwCam", "setRepeatingRequest failed", t)
+                                        }
+                                    }
+
+                                    override fun onConfigureFailed(session: CameraCaptureSession) {
+                                        TwLog.err("TwCam", "Camera2 configure failed")
+                                    }
+                                },
+                                handler,
+                            )
+                        } catch (t: Throwable) {
+                            TwLog.err("TwCam", "createCaptureSession failed", t)
+                        }
+                    }
+
+                    override fun onDisconnected(camera: CameraDevice) {
+                        camera.close()
+                    }
+
+                    override fun onError(camera: CameraDevice, error: Int) {
+                        TwLog.err("TwCam", "Camera2 error=$error")
+                        camera.close()
+                    }
+                },
+                handler,
+            )
+        } catch (t: Throwable) {
+            TwLog.err("TwCam", "startCamera failed", t)
+            stopCamera()
+        }
+    }
+
+    @JvmStatic
+    fun popCameraFrame(): ByteArray? = camQueue.poll()
+
+    @JvmStatic
+    fun stopCamera() {
+        camActive = false
+        camDrainThread?.interrupt()
+        camDrainThread = null
+        try { camSession?.close() } catch (_: Throwable) {}
+        camSession = null
+        try { camDevice?.close() } catch (_: Throwable) {}
+        camDevice = null
+        try { camEncoder?.stop() } catch (_: Throwable) {}
+        try { camEncoder?.release() } catch (_: Throwable) {}
+        camEncoder = null
+        try { camInputSurface?.release() } catch (_: Throwable) {}
+        camInputSurface = null
+        try { camBgThread?.quitSafely() } catch (_: Throwable) {}
+        camBgThread = null
+        camQueue.clear()
+    }
+
+    // ── Android Microphone (AudioRecord 16kHz PCM16) ───────────────────────
+    private val micQueue = LinkedBlockingQueue<ByteArray>(32)
+    @Volatile
+    private var micActive = false
+    private var micThread: Thread? = null
+
+    @JvmStatic
+    @SuppressLint("MissingPermission")
+    fun startMic(ctx: Context, sampleRate: Int = 16000) {
+        stopMic()
+        if (ctx.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            TwLog.err("TwMic", "RECORD_AUDIO permission not granted")
+            return
+        }
+        val minBuf = AudioRecord.getMinBufferSize(
+            sampleRate,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+        ).coerceAtLeast(4096)
+        val rec = try {
+            AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                minBuf * 2,
+            )
+        } catch (t: Throwable) {
+            TwLog.err("TwMic", "AudioRecord init failed", t)
+            return
+        }
+        if (rec.state != AudioRecord.STATE_INITIALIZED) {
+            TwLog.err("TwMic", "AudioRecord not initialized")
+            rec.release()
+            return
+        }
+        micActive = true
+        micQueue.clear()
+        micThread = Thread({
+            val chunk = ByteArray(2560) // 80ms @ 16kHz mono s16le
+            try {
+                rec.startRecording()
+                TwLog.log("TwMic", "AudioRecord started sr=$sampleRate")
+                while (micActive) {
+                    var off = 0
+                    while (off < chunk.size && micActive) {
+                        val n = rec.read(chunk, off, chunk.size - off)
+                        if (n <= 0) break
+                        off += n
+                    }
+                    if (off == chunk.size) {
+                        val copy = chunk.copyOf()
+                        if (!micQueue.offer(copy)) {
+                            micQueue.poll()
+                            micQueue.offer(copy)
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                TwLog.err("TwMic", "mic read loop failed", t)
+            } finally {
+                try { rec.stop() } catch (_: Throwable) {}
+                try { rec.release() } catch (_: Throwable) {}
+            }
+        }, "tw-mic").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    @JvmStatic
+    fun popMicChunk(): ByteArray? = micQueue.poll()
+
+    @JvmStatic
+    fun stopMic() {
+        micActive = false
+        micThread?.interrupt()
+        micThread = null
+        micQueue.clear()
     }
 }

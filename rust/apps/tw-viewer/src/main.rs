@@ -7,7 +7,10 @@ use tw_client::{
     load_saved_nodes, spawn_command_session_cbs, spawn_tcp_session_cbs, ClientCallbacks,
     ClientHandle,
 };
-use tw_proto::{FsEntry, POINTER_DOWN, POINTER_MOVE, POINTER_UP, VID_CODEC_AV1, VID_CODEC_HEVC};
+use tw_proto::{
+    FsEntry, POINTER_DOWN, POINTER_MOVE, POINTER_UP, VID_CODEC_AV1, VID_CODEC_H264, VID_CODEC_HEVC,
+    VID_FLAG_KEYFRAME,
+};
 use tw_render::{GpuCompositor, SceneState};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -212,12 +215,17 @@ impl ApplicationHandler<UserEvent> for ViewerApp {
                     (&self.surface, &self.device, &self.queue, &mut self.compositor, &self.window)
                 {
                     if let Ok(frame) = surf.get_current_texture() {
+                        let t0 = std::time::Instant::now();
                         let view = frame.texture.create_view(&Default::default());
                         let st = self.client.state.lock().unwrap();
                         win.set_title(&st.title);
                         comp.render_state(dev, q, &view, &st, self.size);
                         drop(st);
                         frame.present();
+                        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                        if ms >= 16.0 {
+                            eprintln!("[tw-perf] gpu render_state {:.1}ms ({}x{})", ms, self.size.0, self.size.1);
+                        }
                     }
                 }
             }
@@ -414,6 +422,12 @@ fn main() {
     let client_for_file = Arc::clone(&client_slot);
     let client_for_fsl = Arc::clone(&client_slot);
     let client_for_fsg = Arc::clone(&client_slot);
+    let cam_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+    let cam_ctl_slot = Arc::clone(&cam_slot);
+    let client_for_cam = Arc::clone(&client_slot);
+    let mic_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+    let mic_ctl_slot = Arc::clone(&mic_slot);
+    let client_for_mic = Arc::clone(&client_slot);
 
     let cbs = ClientCallbacks {
         on_commit: Arc::new(move || {
@@ -534,9 +548,112 @@ fn main() {
                         .file_name()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "media.bin".into());
+                    eprintln!("[tw-fs] FS_GET sending {} ({} KB)", name, bytes.len() / 1024);
                     ch.send_client_file(&name, &bytes);
                 }
             });
+        }),
+        on_cam_ctl: Arc::new(move |mode| {
+            stop_audio(&cam_ctl_slot);
+            if mode == 0 {
+                eprintln!("[tw-cam] stopped");
+                return;
+            }
+            let Some(ch) = client_for_cam.lock().ok().and_then(|g| g.clone()) else { return };
+            eprintln!("[tw-cam] starting /dev/video0 (mode={mode})");
+            if let Ok(mut child) = Command::new("ffmpeg")
+                .args([
+                    "-y", "-loglevel", "error",
+                    "-f", "v4l2", "-framerate", "24", "-i", "/dev/video0",
+                    "-vf", "scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2",
+                    "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-tune", "zerolatency", "-g", "24", "-bf", "0", "-f", "h264", "pipe:1",
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                let Some(mut stdout) = child.stdout.take() else { return };
+                *cam_ctl_slot.lock().unwrap() = Some(child);
+                std::thread::spawn(move || {
+                    let mut buf: Vec<u8> = Vec::with_capacity(131072);
+                    let mut pending_hdr: Vec<u8> = Vec::new();
+                    let mut tmp = [0u8; 32768];
+                    let t_start = std::time::Instant::now();
+                    while let Ok(n) = stdout.read(&mut tmp) {
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        loop {
+                            let Some(p0) = buf.windows(4).position(|w| w == [0, 0, 0, 1]) else {
+                                break;
+                            };
+                            if p0 > 0 {
+                                buf.drain(..p0);
+                            }
+                            let Some(p1_rel) = buf[4..].windows(4).position(|w| w == [0, 0, 0, 1]) else {
+                                break;
+                            };
+                            let p1 = 4 + p1_rel;
+                            let nal: Vec<u8> = buf.drain(..p1).collect();
+                            if nal.len() < 5 {
+                                continue;
+                            }
+                            let ntype = nal[4] & 0x1F;
+                            if matches!(ntype, 1..=5) {
+                                let mut au = Vec::with_capacity(pending_hdr.len() + nal.len());
+                                au.extend_from_slice(&pending_hdr);
+                                au.extend_from_slice(&nal);
+                                let is_kf = ntype == 5 || !pending_hdr.is_empty();
+                                pending_hdr.clear();
+                                let fl = VID_CODEC_H264 | if is_kf { VID_FLAG_KEYFRAME } else { 0 };
+                                ch.send_video_nalu(t_start.elapsed().as_micros() as u64, fl, &au);
+                            } else {
+                                pending_hdr.extend_from_slice(&nal);
+                            }
+                        }
+                    }
+                });
+            }
+        }),
+        on_mic_ctl: Arc::new(move |mode| {
+            stop_audio(&mic_ctl_slot);
+            if mode == 0 {
+                eprintln!("[tw-mic] stopped");
+                return;
+            }
+            let Some(ch) = client_for_mic.lock().ok().and_then(|g| g.clone()) else { return };
+            eprintln!("[tw-mic] starting 16kHz mic capture");
+            let child_opt = Command::new("pw-record")
+                .args(["--format=s16", "--rate=16000", "--channels=1", "-"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .or_else(|_| {
+                    Command::new("parecord")
+                        .args(["--raw", "--format=s16le", "--rate=16000", "--channels=1"])
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::null())
+                        .spawn()
+                })
+                .or_else(|_| {
+                    Command::new("arecord")
+                        .args(["-q", "-t", "raw", "-f", "S16_LE", "-r", "16000", "-c", "1", "-"])
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::null())
+                        .spawn()
+                });
+            if let Ok(mut child) = child_opt {
+                let Some(mut stdout) = child.stdout.take() else { return };
+                *mic_ctl_slot.lock().unwrap() = Some(child);
+                std::thread::spawn(move || {
+                    let mut pcm = [0u8; 2560];
+                    while stdout.read_exact(&mut pcm).is_ok() {
+                        ch.send_audio_pcm(16000, 1, &pcm);
+                    }
+                });
+            }
         }),
         ..Default::default()
     };
@@ -626,4 +743,6 @@ fn main() {
     let mut app = ViewerApp::new(client, proxy);
     event_loop.run_app(&mut app).expect("run app");
     stop_audio(&audio_slot);
+    stop_audio(&cam_slot);
+    stop_audio(&mic_slot);
 }
