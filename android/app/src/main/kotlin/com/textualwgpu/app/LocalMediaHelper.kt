@@ -481,6 +481,8 @@ object LocalMediaHelper {
             }
 
             val chars = mgr.getCameraCharacteristics(camId)
+            val sensorOrient = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+            val rotIdx = (sensorOrient / 90) and 0x03
             val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             val sizes = map?.getOutputSizes(MediaCodec::class.java)
             val chosen = sizes
@@ -527,7 +529,7 @@ object LocalMediaHelper {
                                     val isKf = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
                                     val au = if (isKf && spsPps != null) spsPps!! + arr else arr
                                     val pkt = ByteArray(1 + au.size)
-                                    pkt[0] = if (isKf) 1 else 0
+                                    pkt[0] = ((if (isKf) 1 else 0) or (rotIdx shl 1)).toByte()
                                     System.arraycopy(au, 0, pkt, 1, au.size)
                                     if (!camQueue.offer(pkt)) {
                                         camQueue.poll()

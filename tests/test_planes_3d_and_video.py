@@ -435,3 +435,12 @@ def test_camera_source_discovery_adapts_to_host_os(monkeypatch):
     keys = [o[0] for o in app._pick["options"]]
     assert "local:front" in keys and "local:back" in keys and "peer:1" in keys
     app._pick = None
+
+    # Verify rotation flag encoding and clean pause cleanup
+    vid = scr.query_one("#media-video", Video)
+    vid.push_packet(0, b"\x00\x00\x00\x01\x65K", keyframe=True, codec_flag=0x10, rotation=3)
+    pkts = vid.drain_packets()
+    assert pkts[0].rotation == 3
+    scr._cam_mode = "peer"
+    scr.on_screen_pause()
+    assert scr._cam_mode is None and scr._mic_mode is None

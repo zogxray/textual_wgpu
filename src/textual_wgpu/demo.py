@@ -1035,8 +1035,9 @@ class MediaScreen(Screen):
             return
         is_remote = hasattr(getattr(self.app, "_driver", None), "on_audio_play")
         if is_remote:
+            rot = getattr(self._file_streamer, "rotation", 0)
             for au, is_kf in self._file_streamer.pop_aus():
-                vid.push_packet(0, au, keyframe=is_kf, codec_flag=self._file_streamer.codec_flag)
+                vid.push_packet(0, au, keyframe=is_kf, codec_flag=self._file_streamer.codec_flag, rotation=rot)
         else:
             frame = self._file_streamer.pop_rgba()
             if frame is not None:
@@ -1055,8 +1056,9 @@ class MediaScreen(Screen):
 
             def _on_peer_nalu(pts_us: int, flags: int, raw: bytes) -> None:
                 is_kf = bool(flags & 0x01)
+                rot = (flags >> 2) & 0x03
                 cflag = flags & 0xF0
-                vid.push_packet(pts_us, raw, keyframe=is_kf, codec_flag=cflag)
+                vid.push_packet(pts_us, raw, keyframe=is_kf, codec_flag=cflag, rotation=rot)
 
             drv.on_request_peer_camera(facing, _on_peer_nalu)
             self._cam_mode = "peer"
@@ -1264,6 +1266,19 @@ class MediaScreen(Screen):
         if self.app is not None and hasattr(self.app, "set_interval"):
             self._tick_handle = self.app.set_interval(0.05, self._media_tick)
 
+    def on_screen_pause(self) -> None:
+        self._stop_camera()
+        self._stop_mic()
+        if self._file_streamer is not None:
+            self._file_streamer.close()
+            self._file_streamer = None
+        if self._audio_playing:
+            self._audio_playing = False
+            self._stop_audio_proc()
+
+    def on_screen_unmount(self) -> None:
+        self.on_screen_pause()
+
     def _media_tick(self) -> None:
         if self.app is None or getattr(self.app, "mode_key", None) != "media":
             return
@@ -1277,8 +1292,9 @@ class MediaScreen(Screen):
             elif self._file_streamer is not None:
                 is_remote = hasattr(getattr(self.app, "_driver", None), "on_audio_play")
                 if is_remote:
+                    rot = getattr(self._file_streamer, "rotation", 0)
                     for au, is_kf in self._file_streamer.pop_aus():
-                        vid.push_packet(0, au, keyframe=is_kf, codec_flag=self._file_streamer.codec_flag)
+                        vid.push_packet(0, au, keyframe=is_kf, codec_flag=self._file_streamer.codec_flag, rotation=rot)
                 else:
                     frame = self._file_streamer.pop_rgba()
                     if frame is not None:

@@ -16,6 +16,7 @@ class VideoPacket:
     data: bytes
     keyframe: bool = False
     codec_flag: int = 0x10
+    rotation: int = 0
 
 
 class Video(Widget):
@@ -49,6 +50,7 @@ class Video(Widget):
         *,
         keyframe: bool = False,
         codec_flag: int = 0x10,
+        rotation: int = 0,
     ) -> None:
         """Queue a compressed bitstream packet (Stream-to-Render passthrough)."""
         self._packets.append(
@@ -57,6 +59,7 @@ class Video(Widget):
                 data=bytes(data),
                 keyframe=keyframe,
                 codec_flag=int(codec_flag),
+                rotation=int(rotation) & 0x03,
             ),
         )
         self.refresh()

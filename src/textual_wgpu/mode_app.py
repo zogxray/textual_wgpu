@@ -218,6 +218,14 @@ class ModeApp(App):
             return
         if 0 <= index < len(self._labels):
             prev = self.mode_index
+            if index != prev:
+                prev_key = self._labels[prev][0]
+                prev_scr = self._screens.get(prev_key)
+                if prev_scr is not None and hasattr(prev_scr, "on_screen_pause"):
+                    try:
+                        prev_scr.on_screen_pause()
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"on_screen_pause error: {exc}", flush=True)
             key = self._labels[index][0]
             was_cached = key in self._screens
             self.mode_index = index

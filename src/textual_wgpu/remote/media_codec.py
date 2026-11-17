@@ -757,6 +757,7 @@ class LocalCameraStreamer:
         self.height = int(height)
         self.fps = int(fps)
         self.facing = int(facing)
+        self.rotation = 0
         self._on_frame = on_frame
         self._aus: deque[tuple[bytes, bool]] = deque(maxlen=64)
         self._rgba_frames: deque[tuple[int, int, bytes]] = deque(maxlen=8)
@@ -822,7 +823,9 @@ class LocalCameraStreamer:
                 raw = bytes(pkt)
                 if len(raw) <= 1:
                     continue
-                is_kf = bool(raw[0])
+                hdr = raw[0]
+                is_kf = bool(hdr & 0x01)
+                self.rotation = (hdr >> 1) & 0x03
                 au = raw[1:]
                 with self._lock:
                     self._aus.append((au, is_kf))

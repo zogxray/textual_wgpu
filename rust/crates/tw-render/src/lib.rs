@@ -498,6 +498,12 @@ impl SceneState {
         e.size = (w, h);
     }
 
+    pub fn set_plane_rotation(&mut self, surf_id: u32, rot_idx: u8) {
+        if let Some(e) = self.planes.get_mut(&surf_id) {
+            e.flags = (e.flags & !0x0C) | ((rot_idx & 0x03) << 2);
+        }
+    }
+
     pub fn render_ui(&self, width: u32, height: u32) -> RgbaImage {
         let mut ui = RgbaImage::new_filled(width, height, self.bg_rgba);
         for lid in &self.order {
@@ -748,7 +754,7 @@ struct CompositorUniforms {
   bloom: f32,
   scanlines: f32,
   has_plane: f32,
-  _pad0: f32,
+  plane_rot: f32,
   plane_rect: vec4f,
   view_rect: vec4f,   // (u0, v0, u1, v1) visible virtual-canvas window into texture
 };
@@ -793,11 +799,20 @@ fn sample_composite(uv: vec2f) -> vec4f {
     let r = uni.plane_rect;
     if (uv.x >= r.x && uv.x <= r.z && uv.y >= r.y && uv.y <= r.w) {
       let puv = vec2f((uv.x - r.x) / max(1e-5, r.z - r.x), (uv.y - r.y) / max(1e-5, r.w - r.y));
+      var ruv = puv;
+      let rot = i32(round(uni.plane_rot));
+      if (rot == 1) {
+        ruv = vec2f(puv.y, 1.0 - puv.x);
+      } else if (rot == 2) {
+        ruv = vec2f(1.0 - puv.x, 1.0 - puv.y);
+      } else if (rot == 3) {
+        ruv = vec2f(1.0 - puv.y, puv.x);
+      }
       var pl: vec4f;
       if (uni.has_plane > 1.5) {
-        let yv = max(0.0, textureSample(y_tex, samp, puv).r - 0.062745);
-        let uu = textureSample(u_tex, samp, puv).r - 0.5;
-        let vv = textureSample(v_tex, samp, puv).r - 0.5;
+        let yv = max(0.0, textureSample(y_tex, samp, ruv).r - 0.062745);
+        let uu = textureSample(u_tex, samp, ruv).r - 0.5;
+        let vv = textureSample(v_tex, samp, ruv).r - 0.5;
         pl = vec4f(
           clamp(1.164 * yv + 1.596 * vv, 0.0, 1.0),
           clamp(1.164 * yv - 0.391 * uu - 0.813 * vv, 0.0, 1.0),
@@ -805,7 +820,7 @@ fn sample_composite(uv: vec2f) -> vec4f {
           1.0,
         );
       } else {
-        pl = textureSample(plane_tex, samp, puv);
+        pl = textureSample(plane_tex, samp, ruv);
       }
       let rgb = mix(pl.rgb, ui.rgb, ui.a);
       return vec4f(rgb, max(pl.a, ui.a));
@@ -927,7 +942,7 @@ struct UniformData {
     bloom: f32,
     scanlines: f32,
     has_plane: f32,
-    _pad0: f32,
+    plane_rot: f32,
     plane_rect: [f32; 4],
     view_rect: [f32; 4],
 }
@@ -1321,6 +1336,7 @@ impl GpuCompositor {
         }
 
         let mut uploaded_plane = false;
+        let mut plane_rot = 0.0f32;
         for pl in state.planes.values() {
             if let Some(yuv) = &pl.yuv {
                 let (pw, ph) = (yuv.width, yuv.height);
@@ -1367,6 +1383,7 @@ impl GpuCompositor {
                     );
                     self.has_plane = 2.0;
                     self.plane_rect_px = pl.rect;
+                    plane_rot = ((pl.flags >> 2) & 0x03) as f32;
                     uploaded_plane = true;
                     break;
                 }
@@ -1400,6 +1417,7 @@ impl GpuCompositor {
                 );
                 self.has_plane = 1.0;
                 self.plane_rect_px = pl.rect;
+                plane_rot = ((pl.flags >> 2) & 0x03) as f32;
                 uploaded_plane = true;
                 break;
             }
@@ -1412,7 +1430,7 @@ impl GpuCompositor {
             bloom: self.fx.0,
             scanlines: self.fx.1,
             has_plane: self.has_plane,
-            _pad0: 0.0,
+            plane_rot,
             plane_rect: [
                 self.plane_rect_px[0] as f32 / w as f32,
                 self.plane_rect_px[1] as f32 / h as f32,

@@ -252,6 +252,28 @@ fn pollster_block_on<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
+fn find_v4l2_capture_device() -> String {
+    if let Ok(rd) = std::fs::read_dir("/sys/class/video4linux") {
+        let mut names: Vec<String> = rd
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.starts_with("video"))
+            .collect();
+        names.sort();
+        for name in names {
+            let idx_path = format!("/sys/class/video4linux/{name}/index");
+            let idx = std::fs::read_to_string(&idx_path).unwrap_or_else(|_| "0".into());
+            if idx.trim() == "0" {
+                let dev = format!("/dev/{name}");
+                if std::path::Path::new(&dev).exists() {
+                    return dev;
+                }
+            }
+        }
+    }
+    "/dev/video0".to_string()
+}
+
 fn stop_audio(slot: &Arc<Mutex<Option<Child>>>) {
     if let Ok(mut guard) = slot.lock() {
         if let Some(mut ch) = guard.take() {
@@ -330,7 +352,7 @@ impl FfmpegDecoder {
                 "-flags", "low_delay", "-flush_packets", "1",
                 "-probesize", "32", "-analyzeduration", "0", "-threads", "1",
                 "-f", fmt, "-i", "pipe:0",
-                "-f", "image2pipe", "-vcodec", "pam", "-pix_fmt", "rgba", "pipe:1",
+                "-f", "yuv4mpegpipe", "-pix_fmt", "yuv420p", "pipe:1",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -340,41 +362,64 @@ impl FfmpegDecoder {
         let stdin = proc.stdin.take();
         let mut stdout = proc.stdout.take()?;
         std::thread::spawn(move || {
-            let mut buf: Vec<u8> = Vec::with_capacity(262144);
+            let mut buf: Vec<u8> = Vec::with_capacity(512 * 1024);
             let mut tmp = [0u8; 65536];
+            let mut w: u32 = 0;
+            let mut h: u32 = 0;
+            let mut got_stream_hdr = false;
             loop {
                 match stdout.read(&mut tmp) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => buf.extend_from_slice(&tmp[..n]),
                 }
-                loop {
-                    let Some(end_pos) = buf.windows(7).position(|w| w == b"ENDHDR\n") else {
-                        break;
-                    };
-                    let hdr_txt = String::from_utf8_lossy(&buf[..end_pos]);
-                    let mut w: u32 = 0;
-                    let mut h: u32 = 0;
-                    for ln in hdr_txt.lines() {
-                        if let Some(rest) = ln.strip_prefix("WIDTH ") {
-                            w = rest.trim().parse().unwrap_or(0);
-                        } else if let Some(rest) = ln.strip_prefix("HEIGHT ") {
-                            h = rest.trim().parse().unwrap_or(0);
+                if !got_stream_hdr {
+                    let Some(nl) = buf.iter().position(|&b| b == b'\n') else { continue };
+                    let hdr = String::from_utf8_lossy(&buf[..nl]);
+                    for tok in hdr.split_whitespace() {
+                        if let Some(ws) = tok.strip_prefix('W') {
+                            w = ws.parse().unwrap_or(0);
+                        } else if let Some(hs) = tok.strip_prefix('H') {
+                            h = hs.parse().unwrap_or(0);
                         }
                     }
-                    let body_start = end_pos + 7;
-                    if w == 0 || h == 0 {
-                        buf.drain(..body_start);
+                    buf.drain(..nl + 1);
+                    got_stream_hdr = true;
+                }
+                loop {
+                    let Some(nl) = buf.iter().position(|&b| b == b'\n') else { break };
+                    let line = &buf[..nl];
+                    if !line.starts_with(b"FRAME") {
+                        buf.drain(..nl + 1);
                         continue;
                     }
-                    let need = (w as usize) * (h as usize) * 4;
-                    if buf.len() < body_start + need {
+                    if w < 2 || h < 2 {
+                        buf.drain(..nl + 1);
+                        continue;
+                    }
+                    let y_len = (w as usize) * (h as usize);
+                    let uv_len = ((w as usize) / 2) * ((h as usize) / 2);
+                    let total = nl + 1 + y_len + uv_len * 2;
+                    if buf.len() < total {
                         break;
                     }
-                    let rgba = buf[body_start..body_start + need].to_vec();
-                    buf.drain(..body_start + need);
+                    let y_off = nl + 1;
+                    let u_off = y_off + y_len;
+                    let v_off = u_off + uv_len;
                     if let Ok(mut st) = state.lock() {
-                        st.push_decoded_plane(surf_id, w, h, rgba);
+                        st.push_decoded_yuv420(
+                            surf_id,
+                            w,
+                            h,
+                            &buf[y_off..u_off],
+                            &buf[u_off..v_off],
+                            &buf[v_off..v_off + uv_len],
+                            w as usize,
+                            (w as usize) / 2,
+                            (w as usize) / 2,
+                            1,
+                        );
                     }
+                    buf.drain(..total);
                     let _ = proxy.send_event(UserEvent::Redraw);
                 }
             }
@@ -567,11 +612,12 @@ fn main() {
                 return;
             }
             let Some(ch) = client_for_cam.lock().ok().and_then(|g| g.clone()) else { return };
-            eprintln!("[tw-cam] starting /dev/video0 (mode={mode})");
+            let cam_dev = find_v4l2_capture_device();
+            eprintln!("[tw-cam] starting {cam_dev} (mode={mode})");
             if let Ok(mut child) = Command::new("ffmpeg")
                 .args([
                     "-y", "-loglevel", "error",
-                    "-f", "v4l2", "-framerate", "24", "-i", "/dev/video0",
+                    "-f", "v4l2", "-framerate", "24", "-i", cam_dev.as_str(),
                     "-vf", "scale=640:360:force_original_aspect_ratio=decrease:force_divisible_by=2",
                     "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "ultrafast",
                     "-tune", "zerolatency", "-g", "24", "-bf", "0", "-f", "h264", "pipe:1",

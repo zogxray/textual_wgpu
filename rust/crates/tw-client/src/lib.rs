@@ -10,7 +10,7 @@ use tw_proto::{
     encode_caps, encode_client_file, encode_fs_entries, encode_input_pointer, encode_input_wheel,
     encode_launch_app, encode_resize, encode_vid_nalu, unpack_header, AppEntry, Frame,
     FrameReassembler, FsEntry, Op, Priority, PriorityMux, HEADER_SIZE, VID_CODEC_MASK,
-    VID_FLAG_KEYFRAME,
+    VID_FLAG_KEYFRAME, VID_ROT_MASK, VID_ROT_SHIFT,
 };
 use tw_render::SceneState;
 
@@ -418,6 +418,10 @@ fn dispatch_incoming_frame(
             if let Ok((pts, flags, _mat, raw)) = decode_vid_nalu(&frame.payload) {
                 let cflag = flags & VID_CODEC_MASK;
                 if cflag != 0 {
+                    let rot_idx = (flags & VID_ROT_MASK) >> VID_ROT_SHIFT;
+                    if let Ok(mut st) = state.lock() {
+                        st.set_plane_rotation(frame.surf_id, rot_idx);
+                    }
                     (cbs.on_video_nalu)(
                         frame.surf_id,
                         cflag,

@@ -203,6 +203,12 @@ class RemoteServerDriver(Driver):
             except Exception:  # noqa: BLE001
                 pass
         self._vid_encoders.clear()
+        scr = getattr(self.app, "screen", None)
+        if scr is not None and hasattr(scr, "on_screen_unmount"):
+            try:
+                scr.on_screen_unmount()
+            except Exception:  # noqa: BLE001
+                pass
         self.transport.close()
 
     def on_request_draw(self) -> None:
@@ -583,7 +589,8 @@ class RemoteServerDriver(Driver):
                     sent += len(p)
                 for pkt in w.drain_packets():
                     cflag = getattr(pkt, "codec_flag", 0x10) & 0xF0
-                    fl = (0x01 if pkt.keyframe else 0x00) | cflag
+                    rot = (getattr(pkt, "rotation", 0) & 0x03) << 2
+                    fl = (0x01 if pkt.keyframe else 0x00) | rot | cflag
                     vp = encode_vid_nalu(pkt.pts_us, fl, (), pkt.data)
                     self.transport.send(
                         Frame(op=Op.VID_NALU, payload=vp, prio=Priority.P2_MEDIA, surf_id=sid),
