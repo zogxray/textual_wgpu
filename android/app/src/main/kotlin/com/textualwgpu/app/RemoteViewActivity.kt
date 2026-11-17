@@ -358,7 +358,7 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
                 TwBridge.nativeRenderFrame(sessionPtr)
                 val dtMs = (System.nanoTime() - t0) / 1_000_000.0
                 redrawCount++
-                if (dtMs >= 16.0 || redrawCount == 1L || redrawCount % 180L == 0L) {
+                if (dtMs >= 25.0 || redrawCount == 1L || redrawCount % 300L == 0L) {
                     TwLog.log("TwPerf", "frame #$redrawCount render=${"%.1f".format(dtMs)}ms")
                 }
             }

@@ -143,10 +143,18 @@ object LocalMediaHelper {
                     if (idx >= 0 && c.moveToFirst()) name = c.getString(idx) ?: name
                 }
                 val bytes = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return null
+                if (bytes.size > 64 * 1024 * 1024) {
+                    TwLog.err("TwFs", "File too large (${bytes.size} bytes): $name")
+                    return null
+                }
                 name to bytes
             } else {
                 val f = File(pathOrUri)
                 if (!f.isFile) return null
+                if (f.length() > 64L * 1024L * 1024L) {
+                    TwLog.err("TwFs", "File too large (${f.length()} bytes): ${f.name}")
+                    return null
+                }
                 f.name to f.readBytes()
             }
         } catch (t: Throwable) {

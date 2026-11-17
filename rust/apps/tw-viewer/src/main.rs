@@ -478,6 +478,7 @@ fn main() {
             });
         }),
         on_fs_list: Arc::new(move |req_path| {
+            let t0 = std::time::Instant::now();
             let Some(ch) = client_for_fsl.lock().ok().and_then(|g| g.clone()) else {
                 return;
             };
@@ -515,6 +516,12 @@ fn main() {
                 }
                 entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
             }
+            eprintln!(
+                "[tw-fs] FS_LIST {:?} -> {} items ({:.1}ms)",
+                req_path,
+                entries.len(),
+                t0.elapsed().as_secs_f64() * 1000.0
+            );
             ch.send_fs_entries(req_path, &entries);
         }),
         on_fs_get: Arc::new(move |req_path| {

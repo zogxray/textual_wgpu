@@ -946,6 +946,14 @@ class ModeApp(App):
             self._end_modal()
             drv = getattr(self, "_driver", None)
             if hasattr(drv, "on_request_peer_fs_get") and callable(peer_cb):
+                try:
+                    from .widgets import StatusBar
+
+                    sb = self.screen.query_one("#status", StatusBar) if self.screen is not None else None
+                    if sb is not None:
+                        sb.update(f"Loading {label.strip()} from connected device…")
+                except Exception:  # noqa: BLE001
+                    pass
                 drv.on_request_peer_fs_get(path_s, peer_cb)
             return
         if entry_kind == "android_dir":
