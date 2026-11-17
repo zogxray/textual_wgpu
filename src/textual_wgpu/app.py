@@ -2546,8 +2546,11 @@ class App:
 
         try:
             from .remote.directory import record_python_executable
+            from .remote.media_hub import ensure_resource_service
 
             record_python_executable()
+            if "ANDROID_ROOT" not in os.environ:
+                ensure_resource_service()
         except Exception:  # noqa: BLE001
             pass
 

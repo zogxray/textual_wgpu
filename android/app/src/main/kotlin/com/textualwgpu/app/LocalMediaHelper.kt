@@ -507,22 +507,23 @@ object LocalMediaHelper {
         }
     }
 
-    // ── Multi-subscriber Camera2 + H.264 MediaCodec resource hub ───────────
-    private val camSubs = ConcurrentHashMap<Int, LinkedBlockingQueue<ByteArray>>()
+    // ── Independent per-camera Camera2 + H.264 MediaCodec resource hubs ───
+    private class CamSlot(val facing: Int) {
+        val subs = ConcurrentHashMap<Int, LinkedBlockingQueue<ByteArray>>()
+        @Volatile var active = false
+        @Volatile var lastKf: ByteArray? = null
+        var device: CameraDevice? = null
+        var session: CameraCaptureSession? = null
+        var encoder: MediaCodec? = null
+        var inputSurface: Surface? = null
+        var bgThread: HandlerThread? = null
+        var drainThread: Thread? = null
+    }
+
+    private val camSlots = ConcurrentHashMap<Int, CamSlot>()
+    private val camSubToFacing = ConcurrentHashMap<Int, Int>()
     private val camSubSeq = AtomicInteger(1)
     private val camLock = Any()
-    @Volatile
-    private var camActive = false
-    @Volatile
-    private var camFacing = 1
-    @Volatile
-    private var lastCamKf: ByteArray? = null
-    private var camDevice: CameraDevice? = null
-    private var camSession: CameraCaptureSession? = null
-    private var camEncoder: MediaCodec? = null
-    private var camInputSurface: Surface? = null
-    private var camBgThread: HandlerThread? = null
-    private var camDrainThread: Thread? = null
 
     @JvmStatic
     fun subscribeCamera(ctx: Context, facing: Int = 1): Int {
@@ -530,30 +531,32 @@ object LocalMediaHelper {
             TwLog.err("TwCam", "CAMERA permission not granted")
             return -1
         }
+        val normFacing = if (facing >= 2) 2 else 1
         synchronized(camLock) {
             val sid = camSubSeq.getAndIncrement()
+            val slot = camSlots.getOrPut(normFacing) { CamSlot(normFacing) }
             val q = LinkedBlockingQueue<ByteArray>(32)
-            camSubs[sid] = q
-            if (camActive && camFacing == facing) {
-                lastCamKf?.let { q.offer(it) }
-                TwLog.log("TwCam", "subscribeCamera #$sid reused active Camera2 (subs=${camSubs.size})")
+            slot.subs[sid] = q
+            camSubToFacing[sid] = normFacing
+            if (slot.active) {
+                slot.lastKf?.let { q.offer(it) }
+                TwLog.log("TwCam", "subscribeCamera #$sid reused facing=$normFacing (subs=${slot.subs.size})")
                 return sid
             }
-            if (camActive && camFacing != facing) {
-                stopCameraHardwareLocked()
-            }
-            startCameraHardwareLocked(ctx, facing)
-            TwLog.log("TwCam", "subscribeCamera #$sid started Camera2 facing=$facing (subs=${camSubs.size})")
+            startCamSlotLocked(ctx, slot)
+            TwLog.log("TwCam", "subscribeCamera #$sid started facing=$normFacing (subs=${slot.subs.size})")
             return sid
         }
     }
 
     @JvmStatic
     fun takeCameraFrame(subId: Int): ByteArray? {
-        val q = camSubs[subId] ?: return null
+        val facing = camSubToFacing[subId] ?: return null
+        val slot = camSlots[facing] ?: return null
+        val q = slot.subs[subId] ?: return null
         return try {
             val pkt = q.take()
-            if (pkt.isEmpty() || !camSubs.containsKey(subId)) null else pkt
+            if (pkt.isEmpty() || !slot.subs.containsKey(subId)) null else pkt
         } catch (_: InterruptedException) {
             null
         }
@@ -562,34 +565,36 @@ object LocalMediaHelper {
     @JvmStatic
     fun unsubscribeCamera(subId: Int) {
         synchronized(camLock) {
-            val q = camSubs.remove(subId)
+            val facing = camSubToFacing.remove(subId) ?: return
+            val slot = camSlots[facing] ?: return
+            val q = slot.subs.remove(subId)
             q?.clear()
             q?.offer(ByteArray(0))
-            if (camSubs.isEmpty() && camActive) {
-                stopCameraHardwareLocked()
-                TwLog.log("TwCam", "All camera subscribers left; Camera2 released")
+            if (slot.subs.isEmpty() && slot.active) {
+                stopCamSlotLocked(slot)
+                camSlots.remove(facing)
+                TwLog.log("TwCam", "All facing=$facing subscribers left; Camera2 released")
             }
         }
     }
 
     @SuppressLint("MissingPermission")
-    private fun startCameraHardwareLocked(ctx: Context, facing: Int) {
-        camActive = true
-        camFacing = facing
-        lastCamKf = null
-        val bgThread = HandlerThread("tw-cam-bg").apply { start() }
-        camBgThread = bgThread
+    private fun startCamSlotLocked(ctx: Context, slot: CamSlot) {
+        slot.active = true
+        slot.lastKf = null
+        val bgThread = HandlerThread("tw-cam-bg-${slot.facing}").apply { start() }
+        slot.bgThread = bgThread
         val handler = Handler(bgThread.looper)
 
         try {
             val mgr = ctx.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-            val wantLens = if (facing >= 2) CameraCharacteristics.LENS_FACING_BACK else CameraCharacteristics.LENS_FACING_FRONT
+            val wantLens = if (slot.facing >= 2) CameraCharacteristics.LENS_FACING_BACK else CameraCharacteristics.LENS_FACING_FRONT
             val camId = mgr.cameraIdList.firstOrNull { id ->
                 mgr.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) == wantLens
             } ?: mgr.cameraIdList.firstOrNull()
             if (camId == null) {
                 TwLog.err("TwCam", "No camera device found")
-                stopCameraHardwareLocked()
+                stopCamSlotLocked(slot)
                 return
             }
 
@@ -616,14 +621,14 @@ object LocalMediaHelper {
             enc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             val surf = enc.createInputSurface()
             enc.start()
-            camEncoder = enc
-            camInputSurface = surf
+            slot.encoder = enc
+            slot.inputSurface = surf
 
-            camDrainThread = Thread({
+            slot.drainThread = Thread({
                 val info = MediaCodec.BufferInfo()
                 var spsPps: ByteArray? = null
                 var frameCount = 0L
-                while (camActive) {
+                while (slot.active) {
                     val idx = try {
                         enc.dequeueOutputBuffer(info, 20_000)
                     } catch (_: Throwable) {
@@ -644,8 +649,8 @@ object LocalMediaHelper {
                                     val pkt = ByteArray(1 + au.size)
                                     pkt[0] = ((if (isKf) 1 else 0) or (rotIdx shl 1)).toByte()
                                     System.arraycopy(au, 0, pkt, 1, au.size)
-                                    if (isKf) lastCamKf = pkt
-                                    for (q in camSubs.values) {
+                                    if (isKf) slot.lastKf = pkt
+                                    for (q in slot.subs.values) {
                                         if (!q.offer(pkt)) {
                                             q.poll()
                                             q.offer(pkt)
@@ -653,7 +658,7 @@ object LocalMediaHelper {
                                     }
                                     frameCount++
                                     if (frameCount == 1L || frameCount % 120L == 0L) {
-                                        TwLog.log("TwCam", "encoded frame #$frameCount (${au.size}B, kf=$isKf, subs=${camSubs.size})")
+                                        TwLog.log("TwCam", "facing=${slot.facing} frame #$frameCount (${au.size}B, kf=$isKf, subs=${slot.subs.size})")
                                     }
                                 }
                             }
@@ -665,7 +670,7 @@ object LocalMediaHelper {
                         }
                     }
                 }
-            }, "tw-cam-enc").apply {
+            }, "tw-cam-enc-${slot.facing}").apply {
                 isDaemon = true
                 start()
             }
@@ -674,11 +679,11 @@ object LocalMediaHelper {
                 camId,
                 object : CameraDevice.StateCallback() {
                     override fun onOpened(camera: CameraDevice) {
-                        if (!camActive) {
+                        if (!slot.active) {
                             camera.close()
                             return
                         }
-                        camDevice = camera
+                        slot.device = camera
                         try {
                             val chars2 = mgr.getCameraCharacteristics(camId)
                             val ranges = chars2.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
@@ -696,21 +701,21 @@ object LocalMediaHelper {
                                 listOf(surf),
                                 object : CameraCaptureSession.StateCallback() {
                                     override fun onConfigured(session: CameraCaptureSession) {
-                                        if (!camActive) {
+                                        if (!slot.active) {
                                             session.close()
                                             return
                                         }
-                                        camSession = session
+                                        slot.session = session
                                         try {
                                             session.setRepeatingRequest(req.build(), null, handler)
-                                            TwLog.log("TwCam", "Camera2 started id=$camId (${encW}x${encH} H.264 fps=$bestRange)")
+                                            TwLog.log("TwCam", "Camera2 started id=$camId facing=${slot.facing} (${encW}x${encH} H.264 fps=$bestRange)")
                                         } catch (t: Throwable) {
                                             TwLog.err("TwCam", "setRepeatingRequest failed", t)
                                         }
                                     }
 
                                     override fun onConfigureFailed(session: CameraCaptureSession) {
-                                        TwLog.err("TwCam", "Camera2 configure failed")
+                                        TwLog.err("TwCam", "Camera2 configure failed facing=${slot.facing}")
                                     }
                                 },
                                 handler,
@@ -725,34 +730,34 @@ object LocalMediaHelper {
                     }
 
                     override fun onError(camera: CameraDevice, error: Int) {
-                        TwLog.err("TwCam", "Camera2 error=$error")
+                        TwLog.err("TwCam", "Camera2 facing=${slot.facing} error=$error")
                         camera.close()
                     }
                 },
                 handler,
             )
         } catch (t: Throwable) {
-            TwLog.err("TwCam", "startCamera failed", t)
-            stopCameraHardwareLocked()
+            TwLog.err("TwCam", "startCamSlot failed", t)
+            stopCamSlotLocked(slot)
         }
     }
 
-    private fun stopCameraHardwareLocked() {
-        camActive = false
-        camDrainThread?.interrupt()
-        camDrainThread = null
-        try { camSession?.close() } catch (_: Throwable) {}
-        camSession = null
-        try { camDevice?.close() } catch (_: Throwable) {}
-        camDevice = null
-        try { camEncoder?.stop() } catch (_: Throwable) {}
-        try { camEncoder?.release() } catch (_: Throwable) {}
-        camEncoder = null
-        try { camInputSurface?.release() } catch (_: Throwable) {}
-        camInputSurface = null
-        try { camBgThread?.quitSafely() } catch (_: Throwable) {}
-        camBgThread = null
-        lastCamKf = null
+    private fun stopCamSlotLocked(slot: CamSlot) {
+        slot.active = false
+        slot.drainThread?.interrupt()
+        slot.drainThread = null
+        try { slot.session?.close() } catch (_: Throwable) {}
+        slot.session = null
+        try { slot.device?.close() } catch (_: Throwable) {}
+        slot.device = null
+        try { slot.encoder?.stop() } catch (_: Throwable) {}
+        try { slot.encoder?.release() } catch (_: Throwable) {}
+        slot.encoder = null
+        try { slot.inputSurface?.release() } catch (_: Throwable) {}
+        slot.inputSurface = null
+        try { slot.bgThread?.quitSafely() } catch (_: Throwable) {}
+        slot.bgThread = null
+        slot.lastKf = null
     }
 
     // ── Multi-subscriber Android Microphone (AudioRecord 16kHz PCM16) ──────

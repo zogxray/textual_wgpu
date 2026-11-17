@@ -1010,7 +1010,7 @@ class MediaScreen(Screen):
             drv = getattr(self.app, "_driver", None) if self.app is not None else None
             if hasattr(drv, "on_request_peer_camera"):
                 drv.on_request_peer_camera(0, None)
-        if self._cam_mode == "local" and self._file_streamer is not None:
+        if self._cam_mode in ("local", "resource") and self._file_streamer is not None:
             self._file_streamer.close()
             self._file_streamer = None
         self._cam_mode = None
@@ -1027,7 +1027,7 @@ class MediaScreen(Screen):
             loop.call_soon_threadsafe(self._flush_local_cam)
 
     def _flush_local_cam(self) -> None:
-        if self._cam_mode != "local" or self._file_streamer is None or not self._video_playing:
+        if self._cam_mode not in ("local", "resource") or self._file_streamer is None or not self._video_playing:
             return
         try:
             vid = self.query_one("#media-video", Video)
@@ -1050,6 +1050,29 @@ class MediaScreen(Screen):
             self._file_streamer.close()
             self._file_streamer = None
         drv = getattr(self.app, "_driver", None) if self.app is not None else None
+        res_map = getattr(self, "_cam_resources", None) or {}
+        res_entry = res_map.get(src)
+        if res_entry is not None and res_entry.port > 0 and src.startswith("res:"):
+            try:
+                from .remote.media_hub import RemoteCameraSubscriber
+
+                is_remote = hasattr(drv, "on_audio_play")
+                self._file_streamer = RemoteCameraSubscriber(
+                    res_entry.host,
+                    res_entry.port,
+                    res_entry.resource_id,
+                    emit_rgba=not is_remote,
+                    on_frame=self._wake_cam_thread,
+                )
+                self._cam_mode = "resource"
+                self._video_playing = True
+                self.query_one("#btn-cam", Button).label = "Stop Cam (C)"
+                self.query_one("#btn-video", Button).label = "Pause Video (V)"
+                self.query_one("#status", StatusBar).update(f"F7 Media · streaming {res_entry.display_label()}")
+                return
+            except Exception as exc:  # noqa: BLE001
+                self.query_one("#status", StatusBar).update(f"F7 Media · camera error: {exc}")
+                return
         if src.startswith("peer") and hasattr(drv, "on_request_peer_camera"):
             cid = src.split(":", 1)[1] if ":" in src else ""
             facing = 2 if (src in ("peer_back", "peer:2") or cid == "back") else 1
@@ -1092,8 +1115,25 @@ class MediaScreen(Screen):
         except Exception as exc:  # noqa: BLE001
             self.query_one("#status", StatusBar).update(f"F7 Media · camera error: {exc}")
 
+    def start_camera_resource(self, res: Any) -> None:
+        local_id = None
+        try:
+            from .remote.directory import local_device_profile
+
+            local_id = local_device_profile().device_id
+        except Exception:  # noqa: BLE001
+            pass
+        if res.device_id == local_id:
+            key = f"local:{res.resource_id}"
+        elif res.port > 0:
+            key = f"res:{res.uid}"
+        else:
+            key = f"peer:{res.resource_id}"
+        self._cam_resources = {key: res}
+        self._start_camera_source(key)
+
     def toggle_camera(self) -> None:
-        from .remote.directory import local_device_profile
+        from .remote.directory import discover_all_resources, local_device_profile
 
         if self._cam_mode is not None:
             self._stop_camera()
@@ -1101,23 +1141,26 @@ class MediaScreen(Screen):
             return
         local = local_device_profile()
         drv = getattr(self.app, "_driver", None) if self.app is not None else None
-        peer = drv.distinct_peer_profile(local) if hasattr(drv, "distinct_peer_profile") else None
+        cam_resources = discover_all_resources(kind="camera", driver=drv)
 
         options: list[tuple[str, str]] = []
-        for cid, clabel in local.cameras:
-            options.append((f"local:{cid}", f"{local.icon} {local.name} · {clabel}"))
+        res_map: dict[str, Any] = {}
+        for res in cam_resources:
+            if res.device_id == local.device_id:
+                key = f"local:{res.resource_id}"
+            elif res.port > 0:
+                key = f"res:{res.uid}"
+            else:
+                key = f"peer:{res.resource_id}"
+            res_map[key] = res
+            options.append((key, res.display_label()))
         if not options:
             options.append(("local:front", f"{local.icon} {local.name} · Camera"))
-        if peer is not None:
-            if peer.cameras:
-                for cid, clabel in peer.cameras:
-                    options.append((f"peer:{cid}", f"{peer.icon} {peer.name} · {clabel}"))
-            else:
-                options.append(("peer:1", f"{peer.icon} {peer.name} · Camera"))
+        self._cam_resources = res_map
 
         if len(options) > 1 and hasattr(self.app, "ask_pick"):
             self.app.ask_pick(
-                "Select Camera Source",
+                "Select Independent Camera Resource",
                 options,
                 lambda val: self._start_camera_source(val) if val else None,
             )
@@ -1180,6 +1223,20 @@ class MediaScreen(Screen):
         self._mic_elapsed = 0.0
         self._mic_env = [0.08] * 48
         drv = getattr(self.app, "_driver", None) if self.app is not None else None
+        mic_map = getattr(self, "_mic_resources", None) or {}
+        res_entry = mic_map.get(src)
+        if res_entry is not None and res_entry.port > 0 and src.startswith("res:"):
+            try:
+                from .remote.media_hub import RemoteMicSubscriber
+
+                self._mic_cap = RemoteMicSubscriber(res_entry.host, res_entry.port, res_entry.resource_id)
+                self._mic_mode = "resource"
+                self.query_one("#btn-mic", Button).label = "Stop Mic (M)"
+                self.query_one("#status", StatusBar).update(f"F7 Media · streaming {res_entry.display_label()}")
+                return
+            except Exception as exc:  # noqa: BLE001
+                self.query_one("#status", StatusBar).update(f"F7 Media · mic error: {exc}")
+                return
         if src == "peer" and hasattr(drv, "on_request_peer_mic"):
             drv.on_request_peer_mic(True, self._on_mic_pcm)
             self._mic_mode = "peer"
@@ -1196,8 +1253,25 @@ class MediaScreen(Screen):
         except Exception as exc:  # noqa: BLE001
             self.query_one("#status", StatusBar).update(f"F7 Media · mic error: {exc}")
 
+    def start_mic_resource(self, res: Any) -> None:
+        local_id = None
+        try:
+            from .remote.directory import local_device_profile
+
+            local_id = local_device_profile().device_id
+        except Exception:  # noqa: BLE001
+            pass
+        if res.device_id == local_id:
+            key = "local"
+        elif res.port > 0:
+            key = f"res:{res.uid}"
+        else:
+            key = "peer"
+        self._mic_resources = {key: res}
+        self._start_mic_source(key)
+
     def toggle_mic(self) -> None:
-        from .remote.directory import local_device_profile
+        from .remote.directory import discover_all_resources, local_device_profile
 
         if self._mic_mode is not None:
             self._stop_mic()
@@ -1205,20 +1279,29 @@ class MediaScreen(Screen):
             return
         local = local_device_profile()
         drv = getattr(self.app, "_driver", None) if self.app is not None else None
-        peer = drv.distinct_peer_profile(local) if hasattr(drv, "distinct_peer_profile") else None
-        options: list[tuple[str, str]] = [
-            ("local", f"{local.icon} {local.name} · Microphone"),
-        ]
-        if peer is not None:
-            options.append(("peer", f"{peer.icon} {peer.name} · Microphone"))
+        mic_resources = discover_all_resources(kind="mic", driver=drv)
+        options: list[tuple[str, str]] = []
+        mic_map: dict[str, Any] = {}
+        for res in mic_resources:
+            if res.device_id == local.device_id:
+                key = "local"
+            elif res.port > 0:
+                key = f"res:{res.uid}"
+            else:
+                key = "peer"
+            mic_map[key] = res
+            options.append((key, res.display_label()))
+        if not options:
+            options.append(("local", f"{local.icon} {local.name} · Microphone"))
+        self._mic_resources = mic_map
         if len(options) > 1 and hasattr(self.app, "ask_pick"):
             self.app.ask_pick(
-                "Select Microphone Source",
+                "Select Independent Microphone Resource",
                 options,
                 lambda val: self._start_mic_source(val) if val else None,
             )
         else:
-            self._start_mic_source("local")
+            self._start_mic_source(options[0][0])
 
     def toggle_mic_monitor(self) -> None:
         self._mic_monitor = not self._mic_monitor
@@ -1269,7 +1352,7 @@ class MediaScreen(Screen):
     def _media_tick(self) -> None:
         if self.app is None or getattr(self.app, "mode_key", None) != "media":
             return
-        if self._mic_mode == "local" and self._mic_cap is not None:
+        if self._mic_mode in ("local", "resource") and self._mic_cap is not None:
             for pcm in self._mic_cap.pop_chunks():
                 self._on_mic_pcm(self._mic_cap.sample_rate, self._mic_cap.channels, pcm)
         if self._video_playing:
@@ -1345,12 +1428,15 @@ class MediaScreen(Screen):
 
 
 class NodesScreen(Screen):
-    """F8 · Network OS Directory: saved Workstation/Phone/Cloud nodes & zero-shell App Launcher."""
+    """F8 · Network OS Directory: saved nodes, independent cross-device resources & App Launcher."""
 
     DEFAULT_CSS = """
     #main { height: 1fr; }
-    #nodes-box { width: 1fr; }
-    #apps-box { width: 1fr; }
+    #nodes-col { width: 1fr; }
+    #nodes-box { height: 1fr; border: round $primary; }
+    #resources-box { height: 1fr; border: round $primary; }
+    #apps-box { width: 1fr; border: round $primary; }
+    #nodes-box:focus-within, #resources-box:focus-within, #apps-box:focus-within { border: round $accent; }
     """
 
     def __init__(self) -> None:
@@ -1359,9 +1445,19 @@ class NodesScreen(Screen):
 
         self._registry = NodeRegistry()
         self._apps = discover_local_apps()
+        self._resources: list[Any] = []
+
+    def _resource_option_label(self, res: Any) -> str:
+        ep = f"{res.host}:{res.port}" if getattr(res, "port", 0) else getattr(res, "source", "local")
+        return f"[{res.kind.upper():<6}] {res.display_label()}  ({res.resource_id} · {ep})"
 
     def compose(self):
         yield _mode_bar(self, "nodes")
+
+        drv = getattr(self.app, "_driver", None) if self.app is not None else None
+        from .remote.directory import discover_all_resources
+
+        self._resources = discover_all_resources(driver=drv)
 
         node_opts = [
             Option(f"[{n.role.upper()}] {n.name} — {n.endpoint_label()}", id=n.id)
@@ -1376,6 +1472,17 @@ class NodesScreen(Screen):
         nodes_inner = Vertical(node_btns, node_list, id="nodes-inner")
         nodes_box = Panel(nodes_inner, title="SAVED NODES · Workstation / Phone / Cloud", id="nodes-box")
 
+        res_opts = [Option(self._resource_option_label(r), id=r.uid) for r in self._resources]
+        res_list = OptionList(*res_opts, id="resources-list")
+        btn_res_refresh = Button("Refresh (R)", id="btn-res-refresh", on_press=self.refresh_apps)
+        btn_res_use = Button("Use Resource (U)", id="btn-res-use", variant="primary", on_press=self.use_selected_resource)
+        res_btns = Horizontal(btn_res_refresh, btn_res_use, id="res-btns")
+        res_btns.layout_hint_h = 36
+        res_inner = Vertical(res_btns, res_list, id="res-inner")
+        res_box = Panel(res_inner, title="SYSTEM RESOURCES · Independent Cameras / Mics / Files", id="resources-box")
+
+        left_col = Vertical(nodes_box, res_box, id="nodes-col")
+
         app_opts = [
             Option(f"{a.name} [{a.kind}] — {a.description}", id=a.app_id)
             for a in self._apps
@@ -1388,19 +1495,26 @@ class NodesScreen(Screen):
         apps_inner = Vertical(app_btns, app_list, id="apps-inner")
         apps_box = Panel(apps_inner, title="APP DIRECTORY · Browse & Launch Without Shell Commands", id="apps-box")
 
-        yield Horizontal(nodes_box, apps_box, id="main")
+        yield Horizontal(left_col, apps_box, id="main")
         yield KeyBar([
             ("Enter", "Launch App", lambda: self.launch_selected_app()),
+            ("U", "Use Resource", lambda: self.use_selected_resource()),
             ("R", "Refresh", lambda: self.refresh_apps()),
             ("W/P/C", "Add Node", None),
             ("Tab", "Panel", lambda: _focus_next(self)),
             ("F1–F8", "Modes", None),
             ("Q", "Quit", lambda: _quit(self)),
         ])
-        yield StatusBar("F8 Nodes & Apps · Network OS Directory (Workstation / Phone / Cloud)", id="status")
+        yield StatusBar(
+            f"F8 Directory · {len(self._resources)} independent resources · {len(self._apps)} apps",
+            id="status",
+        )
 
     def on_screen_mount(self) -> None:
         self.query_one("#apps-list", OptionList).focus()
+
+    def on_screen_resume(self) -> None:
+        self.refresh_apps()
 
     def _reload_node_list(self) -> None:
         nl = self.query_one("#nodes-list", OptionList)
@@ -1455,14 +1569,40 @@ class NodesScreen(Screen):
         )
 
     def refresh_apps(self) -> None:
-        from .remote.directory import discover_local_apps
+        from .remote.directory import discover_all_resources, discover_local_apps
 
+        drv = getattr(self.app, "_driver", None) if self.app is not None else None
         self._apps = discover_local_apps()
+        self._resources = discover_all_resources(driver=drv)
         al = self.query_one("#apps-list", OptionList)
         al.clear_options()
         for a in self._apps:
             al.add_option(Option(f"{a.name} [{a.kind}] — {a.description}", id=a.app_id))
-        self.query_one("#status", StatusBar).update(f"F8 Directory · {len(self._apps)} apps available")
+        rl = self.query_one("#resources-list", OptionList)
+        rl.clear_options()
+        for r in self._resources:
+            rl.add_option(Option(self._resource_option_label(r), id=r.uid))
+        self.query_one("#status", StatusBar).update(
+            f"F8 Directory · {len(self._resources)} independent resources · {len(self._apps)} apps",
+        )
+
+    def use_selected_resource(self) -> None:
+        rl = self.query_one("#resources-list", OptionList)
+        idx = rl.highlighted
+        if idx is None or idx < 0 or idx >= len(self._resources):
+            return
+        res = self._resources[idx]
+        if self.app is None or not hasattr(self.app, "switch_mode"):
+            return
+        self.app.switch_mode("media")
+        scr = getattr(self.app, "screen", None)
+        if isinstance(scr, MediaScreen):
+            if res.kind == "camera":
+                scr.start_camera_resource(res)
+            elif res.kind == "mic":
+                scr.start_mic_resource(res)
+            elif res.kind == "files":
+                scr.open_media_file()
 
     def launch_selected_app(self) -> None:
         al = self.query_one("#apps-list", OptionList)
@@ -1481,7 +1621,14 @@ class NodesScreen(Screen):
         if key == "r":
             self.refresh_apps()
             return True
+        if key == "u":
+            self.use_selected_resource()
+            return True
         if key == "enter":
+            rl = self.query_one("#resources-list", OptionList)
+            if self.app is not None and getattr(self.app, "_focus", None) is rl:
+                self.use_selected_resource()
+                return True
             self.launch_selected_app()
             return True
         if key == "w":

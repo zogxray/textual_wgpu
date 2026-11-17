@@ -53,8 +53,11 @@ async def run_stdio_server(app: Any, *, size: tuple[int, int] = (1100, 720)) -> 
 def run_app_remote(app: Any, spec: str) -> None:
     """Entry point used by ``App.run()`` when ``TEXTUAL_WGPU_REMOTE`` is set."""
     from .directory import record_python_executable
+    from .media_hub import ensure_resource_service
 
     record_python_executable()
+    if "ANDROID_ROOT" not in os.environ:
+        ensure_resource_service()
     s = (spec or "").strip()
     size = getattr(app, "SIZE", (1100, 720))
     if s in ("stdio", "1", "true"):
@@ -162,8 +165,11 @@ async def serve_tcp_session(
 ) -> None:
     """Keep ``app`` alive across client reconnects on a TCP port (default ``127.0.0.1:7420``)."""
     from .directory import LanPresenceBeacon, record_python_executable
+    from .media_hub import ensure_resource_service
 
     record_python_executable()
+    if "ANDROID_ROOT" not in os.environ:
+        ensure_resource_service()
     drv_holder: list[RemoteServerDriver | None] = [None]
     active_lock = asyncio.Lock()
 
@@ -228,6 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
     s_atcp.add_argument("port", nargs="?", type=int, default=7420)
 
     sub.add_parser("nodes", help="List saved Network OS nodes (Workstation, Phone, Cloud)")
+    sub.add_parser("resources", help="List all independent device resources (cameras, mics, files)")
 
     s_node = sub.add_parser("attach-node", help="Connect to a saved node by ID from nodes.json")
     s_node.add_argument("node_id", help="Node ID (e.g. workstation, phone, cloud)")
@@ -316,6 +323,13 @@ def main(argv: list[str] | None = None) -> int:
         reg = NodeRegistry()
         for n in reg.list_nodes():
             print(f"{n.id:<14} [{n.role:<11}] {n.name:<24} {n.endpoint_label()}")
+        return 0
+    if args.cmd == "resources":
+        from .directory import discover_all_resources
+
+        for r in discover_all_resources():
+            ep = f"{r.host}:{r.port}" if r.port else r.source
+            print(f"{r.icon} {r.device_name:<20} [{r.kind:<6}] {r.label:<28} id={r.resource_id} ({ep})")
         return 0
     if args.cmd == "attach-node":  # pragma: no cover
         from .directory import NodeRegistry

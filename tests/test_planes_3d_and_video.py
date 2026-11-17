@@ -557,3 +557,174 @@ def test_media_hub_fanout_and_two_simultaneous_camera_subscribers(tmp_path: Path
             finally:
                 s1.close()
                 s2.close()
+
+
+def test_independent_resource_servers_and_dual_app_camera_isolation(tmp_path: Path):
+    import socket
+    import time
+    from textual_wgpu.demo import build_demo_app
+    from textual_wgpu.remote.directory import DeviceProfile, discover_all_resources
+    from textual_wgpu.remote.media_hub import (
+        HUB_PKT_STRUCT,
+        RemoteCameraSubscriber,
+        RemoteMicSubscriber,
+        ResourceServer,
+        _BroadcastHub,
+        resource_fs_get,
+        resource_fs_list,
+    )
+
+    # Create two independent camera hubs (e.g. Phone Front & Workstation Webcam) + one mic hub
+    ws_cam_sock = tmp_path / "ws_cam.sock"
+    ph_front_sock = tmp_path / "ph_front.sock"
+    ph_back_sock = tmp_path / "ph_back.sock"
+    ph_mic_sock = tmp_path / "ph_mic.sock"
+    hub_ws = _BroadcastHub(ws_cam_sock, idle_timeout=5.0, startup_grace=5.0)
+    hub_pf = _BroadcastHub(ph_front_sock, idle_timeout=5.0, startup_grace=5.0)
+    hub_pb = _BroadcastHub(ph_back_sock, idle_timeout=5.0, startup_grace=5.0)
+    hub_pm = _BroadcastHub(ph_mic_sock, idle_timeout=5.0, startup_grace=5.0)
+    for h in (hub_ws, hub_pf, hub_pb, hub_pm):
+        h.start_accepting()
+
+    ws_files = tmp_path / "ws_files"
+    ph_files = tmp_path / "ph_files"
+    ws_files.mkdir()
+    ph_files.mkdir()
+    (ph_files / "phone_clip.bin").write_bytes(b"PHONE-MEDIA-BYTES")
+
+    def _connect_unix(p: Path) -> socket.socket:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(str(p))
+        return s
+
+    ws_prof = DeviceProfile("ws-dev-1", "Workstation", "desktop", [("/dev/video0", "HD Webcam")])
+    ph_prof = DeviceProfile("ph-dev-2", "Moto Phone", "android", [("front", "Front Camera"), ("back", "Back Camera")])
+
+    srv_ws = ResourceServer(
+        port=0,
+        profile_fn=lambda: ws_prof,
+        camera_connector=lambda _cid: _connect_unix(ws_cam_sock),
+        mic_connector=lambda: _connect_unix(ph_mic_sock),
+        fs_root=ws_files,
+    )
+    srv_ph = ResourceServer(
+        port=0,
+        profile_fn=lambda: ph_prof,
+        camera_connector=lambda cid: _connect_unix(ph_back_sock if cid == "back" else ph_front_sock),
+        mic_connector=lambda: _connect_unix(ph_mic_sock),
+        fs_root=ph_files,
+    )
+    p_ws = srv_ws.start()
+    p_ph = srv_ph.start()
+
+    try:
+        # 1) Unified cross-device resource discovery lists ALL independent cameras, mics, and files
+        all_res = discover_all_resources(ports=(p_ws, p_ph), include_local_fallback=False)
+        cams = [r for r in all_res if r.kind == "camera"]
+        assert [(r.device_id, r.resource_id) for r in cams] == [
+            ("ws-dev-1", "/dev/video0"),
+            ("ph-dev-2", "front"),
+            ("ph-dev-2", "back"),
+        ]
+        assert len([r for r in all_res if r.kind == "mic"]) == 2
+        assert len([r for r in all_res if r.kind == "files"]) == 2
+
+        # 2) File listing & transfer from Phone ResourceServer directly
+        roots = resource_fs_list("127.0.0.1", p_ph, "")
+        assert roots and roots[0][1] == "ph_files"
+        entries = resource_fs_list("127.0.0.1", p_ph, str(ph_files))
+        assert any(e[1] == "phone_clip.bin" for e in entries)
+        got = resource_fs_get("127.0.0.1", p_ph, str(ph_files / "phone_clip.bin"))
+        assert got == ("phone_clip.bin", b"PHONE-MEDIA-BYTES")
+
+        # 3) Independent dual-device previews: Android app views Phone Front, Workstation app switches
+        #    between Phone Front, Phone Back, and Workstation Webcam without affecting Android app!
+        ph_front_au = b"\x00\x00\x00\x01\x67\x42\x00\x1e\x00\x00\x00\x01\x65PH_FRONT"
+        ph_back_au = b"\x00\x00\x00\x01\x67\x42\x00\x1e\x00\x00\x00\x01\x65PH_BACK"
+        ws_au = b"\x00\x00\x00\x01\x67\x42\x00\x1e\x00\x00\x00\x01\x65WS_CAM"
+        hub_pf.publish(10, 0x11, ph_front_au, is_keyframe=True, codec_flag=0x10)
+        hub_pb.publish(10, 0x11, ph_back_au, is_keyframe=True, codec_flag=0x10)
+        hub_ws.publish(10, 0x11, ws_au, is_keyframe=True, codec_flag=0x10)
+
+        android_app = build_demo_app(start="media")
+        ws_app = build_demo_app(start="media")
+        android_scr = android_app._ensure_screen()
+        ws_scr = ws_app._ensure_screen()
+
+        # Both apps receive remote-style NALU streams independently
+        class _RemoteTag:
+            def on_audio_play(self, *_a, **_kw):
+                pass
+
+        android_app._driver = _RemoteTag()
+        ws_app._driver = _RemoteTag()
+
+        ph_front_res = next(r for r in cams if r.device_id == "ph-dev-2" and r.resource_id == "front")
+        ph_back_res = next(r for r in cams if r.device_id == "ph-dev-2" and r.resource_id == "back")
+        ws_cam_res = next(r for r in cams if r.device_id == "ws-dev-1")
+
+        try:
+            # Android app selects Phone Front camera
+            android_scr.start_camera_resource(ph_front_res)
+            # Workstation app ALSO selects Phone Front, then switches to Phone Back, then Workstation cam
+            ws_scr.start_camera_resource(ph_front_res)
+            ws_scr.start_camera_resource(ph_back_res)
+            ws_scr.start_camera_resource(ws_cam_res)
+
+            # Android app MUST still be subscribed to Phone Front and receiving PH_FRONT frames!
+            hub_pf.publish(20, 0x11, ph_front_au, is_keyframe=True, codec_flag=0x10)
+            hub_ws.publish(20, 0x11, ws_au, is_keyframe=True, codec_flag=0x10)
+
+            got_android = []
+            got_ws = []
+            for _ in range(30):
+                if android_scr._file_streamer is not None:
+                    got_android.extend(android_scr._file_streamer.pop_aus())
+                if ws_scr._file_streamer is not None:
+                    got_ws.extend(ws_scr._file_streamer.pop_aus())
+                if got_android and got_ws:
+                    break
+                time.sleep(0.02)
+
+            assert got_android and all(b"PH_FRONT" in au for au, _kf in got_android)
+            assert got_ws and all(b"WS_CAM" in au for au, _kf in got_ws)
+
+            # Stopping Workstation's camera leaves Android's camera preview completely untouched
+            ws_scr._stop_camera()
+            assert android_scr._cam_mode == "resource"
+            hub_pf.publish(30, 0x10, b"\x00\x00\x00\x01\x41PH_NEXT", is_keyframe=False, codec_flag=0x10)
+            got_after = []
+            for _ in range(25):
+                got_after.extend(android_scr._file_streamer.pop_aus())
+                if got_after:
+                    break
+                time.sleep(0.02)
+            assert any(b"PH_NEXT" in au for au, _kf in got_after)
+        finally:
+            android_scr.on_screen_pause()
+            ws_scr.on_screen_pause()
+
+        # 4) Verify RemoteMicSubscriber streams independently
+        mic_sub = RemoteMicSubscriber("127.0.0.1", p_ph, "default")
+        try:
+            time.sleep(0.05)
+            hub_pm.publish(10, 1, b"\x01\x02" * 160)
+            chunks = []
+            for _ in range(25):
+                chunks.extend(mic_sub.pop_chunks())
+                if chunks:
+                    break
+                time.sleep(0.02)
+            assert chunks and chunks[0] == b"\x01\x02" * 160
+        finally:
+            mic_sub.close()
+
+        # 5) Verify F8 NodesScreen renders System Resources panel (#resources-list)
+        nodes_app = build_demo_app(start="nodes")
+        nodes_scr = nodes_app._ensure_screen()
+        assert nodes_scr.query_one("#resources-list") is not None
+    finally:
+        srv_ws.close()
+        srv_ph.close()
+        for h in (hub_ws, hub_pf, hub_pb, hub_pm):
+            h.close()

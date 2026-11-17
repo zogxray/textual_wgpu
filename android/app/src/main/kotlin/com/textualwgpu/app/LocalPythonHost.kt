@@ -20,6 +20,7 @@ object LocalPythonHost {
         val ac = ctx.applicationContext
         appContext = ac
         LocalMediaHelper.setAppContext(ac)
+        LocalResourceServer.ensureStarted(ac)
         if (!Python.isStarted()) {
             Python.start(AndroidPlatform(ctx.applicationContext))
         }

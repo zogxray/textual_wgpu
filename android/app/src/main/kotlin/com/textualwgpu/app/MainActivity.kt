@@ -58,6 +58,7 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         LocalMediaHelper.syncRustDeviceInfo(applicationContext)
+        LocalResourceServer.ensureStarted(applicationContext)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL

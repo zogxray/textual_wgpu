@@ -510,6 +510,16 @@ fn main() {
     let mic_ctl_stop = Arc::clone(&mic_stop_slot);
     let client_for_mic = Arc::clone(&client_slot);
 
+    if std::net::TcpStream::connect(("127.0.0.1", 7423)).is_err() {
+        let py = find_hub_python();
+        let _ = Command::new(&py)
+            .args(["-m", "textual_wgpu.remote.media_hub", "--serve-resources"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+
     let cbs = ClientCallbacks {
         on_commit: Arc::new(move || {
             let _ = proxy_cb.send_event(UserEvent::Redraw);

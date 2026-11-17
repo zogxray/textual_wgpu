@@ -101,6 +101,7 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
             applyImmersiveFullscreen()
         }
         LocalMediaHelper.syncRustDeviceInfo(applicationContext)
+        LocalResourceServer.ensureStarted(applicationContext)
         requestMediaPermissionsIfNeeded()
 
         val dp = resources.displayMetrics.density

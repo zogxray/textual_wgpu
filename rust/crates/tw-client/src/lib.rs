@@ -361,12 +361,17 @@ impl russh::client::Handler for SshClientHandler {
         &mut self,
         channel: russh::Channel<russh::client::Msg>,
         _connected_address: &str,
-        _connected_port: u32,
+        connected_port: u32,
         _originator_address: &str,
         _originator_port: u32,
         _session: &mut russh::client::Session,
     ) -> Result<(), Self::Error> {
-        if let Some(port) = self.reverse_local_port {
+        let target_port = if (7424..=7427).contains(&connected_port) {
+            Some(7423u16)
+        } else {
+            self.reverse_local_port
+        };
+        if let Some(port) = target_port {
             tokio::spawn(async move {
                 if let Ok(mut local) = TcpStream::connect(("127.0.0.1", port)).await {
                     let mut stream = channel.into_stream();
@@ -764,6 +769,39 @@ pub fn spawn_ssh_session_cbs(
                 }
             }
 
+            // Expose local device Resource Service (127.0.0.1:7423) to remote peer at 7424..7427
+            for rport in 7424..=7427u32 {
+                if session.tcpip_forward("127.0.0.1", rport).await.is_ok() {
+                    break;
+                }
+            }
+            let session = Arc::new(session);
+            // Expose remote peer's Resource Service (127.0.0.1:7423) locally at 7424..7427
+            let mut res_listener = None;
+            for lport in 7424..=7427u16 {
+                if let Ok(l) = tokio::net::TcpListener::bind(("127.0.0.1", lport)).await {
+                    res_listener = Some(l);
+                    break;
+                }
+            }
+            let res_bridge_task = res_listener.map(|listener| {
+                let sess = Arc::clone(&session);
+                tokio::spawn(async move {
+                    while let Ok((mut local_sock, _)) = listener.accept().await {
+                        let s = Arc::clone(&sess);
+                        tokio::spawn(async move {
+                            if let Ok(ch) = s
+                                .channel_open_direct_tcpip("127.0.0.1", 7423, "127.0.0.1", 0)
+                                .await
+                            {
+                                let mut remote_stream = ch.into_stream();
+                                let _ = tokio::io::copy_bidirectional(&mut local_sock, &mut remote_stream).await;
+                            }
+                        });
+                    }
+                })
+            });
+
             let mut mux = PriorityMux::new(4096, 2);
             let mut reasm = FrameReassembler::default();
             let mut rx_buf: Vec<u8> = Vec::with_capacity(65536);
@@ -826,6 +864,10 @@ pub fn spawn_ssh_session_cbs(
                     }
                 }
             }
+            if let Some(t) = res_bridge_task {
+                t.abort();
+            }
+            drop(session);
             if !got_hello && !last_err.is_empty() {
                 on_status(&format!("Exited ({}): {}", exit_code.unwrap_or(1), last_err));
             } else if let Some(code) = exit_code.filter(|c| *c != 0) {

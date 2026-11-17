@@ -706,21 +706,28 @@ class ModeApp(App):
     def _open_file_reload(self) -> None:
         assert self._open_file is not None
         if self._open_file.get("source_mode") == "devices":
-            from .remote.directory import local_device_profile
+            from .remote.directory import discover_all_resources, local_device_profile
 
             local = local_device_profile()
-            entries: list[tuple[str, str, str]] = []
-            if local.kind == "android":
-                entries.append(("android_dir", "", f"{local.icon} {local.name} (Downloads / Media)/"))
-            else:
-                dl = Path.home() / "Downloads"
-                if dl.is_dir():
-                    entries.append(("dir", str(dl), f"{local.icon} {local.name} · Downloads/"))
-                entries.append(("dir", str(Path.home()), f"{local.icon} {local.name} · Home/"))
             drv = getattr(self, "_driver", None)
-            peer = drv.distinct_peer_profile(local) if hasattr(drv, "distinct_peer_profile") else None
-            if peer is not None:
-                entries.append(("peer_dir", "", f"{peer.icon} {peer.name} (Downloads / Media)/"))
+            file_resources = discover_all_resources(kind="files", driver=drv)
+            entries: list[tuple[str, str, str]] = []
+            res_endpoints: dict[str, tuple[str, int]] = {}
+            for res in file_resources:
+                if res.device_id == local.device_id:
+                    if local.kind == "android":
+                        entries.append(("android_dir", "", f"{local.icon} {local.name} (Downloads / Media)/"))
+                    else:
+                        dl = Path.home() / "Downloads"
+                        if dl.is_dir():
+                            entries.append(("dir", str(dl), f"{local.icon} {local.name} · Downloads/"))
+                        entries.append(("dir", str(Path.home()), f"{local.icon} {local.name} · Home/"))
+                elif res.port > 0:
+                    res_endpoints[res.uid] = (res.host, res.port)
+                    entries.append(("res_root", res.uid, f"{res.icon} {res.device_name} (Downloads / Media)/"))
+                else:
+                    entries.append(("peer_dir", "", f"{res.icon} {res.device_name} (Downloads / Media)/"))
+            self._open_file["res_endpoints"] = res_endpoints
             self._open_file["entries"] = entries
             self._open_file["index"] = min(self._open_file["index"], max(0, len(entries) - 1))
             self._open_file["path_value"] = "Select device…"
@@ -757,6 +764,56 @@ class ModeApp(App):
         elif kind == "file" and self._open_file.get("path_value") in ("", None):
             self._open_file["path_value"] = str(folder) + "/"
         self._open_file_ensure_visible()
+
+    def _open_file_load_resource_dir(self, host: str, port: int, req_path: str) -> None:
+        if self._open_file is None:
+            return
+        import threading
+
+        self._open_file["source_mode"] = "resource"
+        self._open_file["res_active"] = (host, int(port))
+        self._open_file["path_value"] = f"remote://{req_path or 'root'}"
+        self._open_file["entries"] = [
+            ("res_up", "", "↑ ..  (Back)"),
+            ("info", "", "  Loading…"),
+        ]
+        self._open_file["index"] = 0
+        self._open_file["scroll"] = 0
+        suf: set[str] = self._open_file["suffixes"]
+
+        def _worker() -> None:
+            from .remote.media_hub import resource_fs_list
+
+            raw_entries = resource_fs_list(host, port, req_path)
+
+            def _apply() -> None:
+                modal = self._open_file
+                if modal is None or modal.get("source_mode") != "resource":
+                    return
+                out: list[tuple[str, str, str]] = [("res_up", "", "↑ ..  (Back)")]
+                for is_dir, name, fpath, size in raw_entries:
+                    if is_dir:
+                        out.append(("res_dir", fpath, f"▸ {name}/"))
+                    else:
+                        ext = Path(name).suffix.lower()
+                        if not suf or ext in suf:
+                            kb = f" ({max(1, size // 1024)} KB)" if size > 0 else ""
+                            out.append(("res_file", fpath, f"  {name}{kb}"))
+                if len(out) == 1:
+                    out.append(("info", "", "  (Empty folder)"))
+                modal["entries"] = out
+                modal["index"] = 0
+                modal["scroll"] = 0
+                self.request_draw()
+
+            loop = getattr(self, "_loop", None)
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(_apply)
+            else:
+                _apply()
+
+        threading.Thread(target=_worker, daemon=True).start()
+        self.request_draw()
 
     def _open_file_load_peer_dir(self, req_path: str) -> None:
         if self._open_file is None:
@@ -935,6 +992,66 @@ class ModeApp(App):
             self._open_file["index"] = 0
             self._open_file["scroll"] = 0
             self._open_file_reload()
+            return
+        if entry_kind == "res_root":
+            ep = (self._open_file.get("res_endpoints") or {}).get(path_s)
+            if ep is not None:
+                self._open_file["res_stack"] = [""]
+                self._open_file_load_resource_dir(ep[0], ep[1], "")
+            return
+        if entry_kind == "res_dir":
+            ep = self._open_file.get("res_active")
+            if ep is not None:
+                stack = self._open_file.setdefault("res_stack", [])
+                stack.append(path_s)
+                self._open_file_load_resource_dir(ep[0], ep[1], path_s)
+            return
+        if entry_kind == "res_up":
+            ep = self._open_file.get("res_active")
+            stack = self._open_file.setdefault("res_stack", [])
+            if stack:
+                stack.pop()
+            if not stack or ep is None:
+                self._open_file["source_mode"] = "devices"
+                self._open_file["index"] = 0
+                self._open_file["scroll"] = 0
+                self._open_file_reload()
+            else:
+                self._open_file_load_resource_dir(ep[0], ep[1], stack[-1])
+            return
+        if entry_kind == "res_file":
+            import threading
+
+            ep = self._open_file.get("res_active")
+            peer_cb = self._open_file.get("peer_file_callback")
+            self._open_file = None
+            self._end_modal()
+            if ep is not None and callable(peer_cb):
+                try:
+                    from .widgets import StatusBar
+
+                    sb = self.screen.query_one("#status", StatusBar) if self.screen is not None else None
+                    if sb is not None:
+                        sb.update(f"Loading {label.strip()} from device…")
+                except Exception:  # noqa: BLE001
+                    pass
+
+                def _fetch() -> None:
+                    from .remote.media_hub import resource_fs_get
+
+                    res = resource_fs_get(ep[0], ep[1], path_s)
+                    if res is None:
+                        return
+                    name, data = res
+                    loop = getattr(self, "_loop", None)
+                    if loop is not None and loop.is_running():
+                        loop.call_soon_threadsafe(peer_cb, name, data)
+                        loop.call_soon_threadsafe(self.request_draw)
+                    else:
+                        peer_cb(name, data)
+                        self.request_draw()
+
+                threading.Thread(target=_fetch, daemon=True).start()
             return
         if entry_kind == "peer_dir":
             stack: list[str] = self._open_file.setdefault("peer_stack", [])

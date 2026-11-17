@@ -518,3 +518,203 @@ def local_device_profile() -> DeviceProfile:
         kind="desktop",
         cameras=cams,
     )
+
+
+@dataclass(slots=True)
+class ResourceEntry:
+    """An independent device resource (camera, mic, files) usable in any order by any app."""
+
+    device_id: str
+    device_name: str
+    device_kind: str  # "desktop" | "android"
+    icon: str
+    kind: str         # "camera" | "mic" | "files"
+    resource_id: str
+    label: str
+    host: str = "127.0.0.1"
+    port: int = 0
+    source: str = "resource_svc"  # "resource_svc" | "local" | "peer"
+
+    @property
+    def uid(self) -> str:
+        return f"{self.device_id}:{self.kind}:{self.resource_id}"
+
+    def display_label(self) -> str:
+        return f"{self.icon} {self.device_name} · {self.label}"
+
+
+def discover_all_resources(
+    kind: str | None = None,
+    *,
+    driver: Any = None,
+    ports: tuple[int, ...] | None = None,
+    probe_timeout: float = 0.18,
+    include_local_fallback: bool = True,
+) -> list[ResourceEntry]:
+    """Discover all independent resources across local and SSH-bridged devices."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from .media_hub import ALL_RESOURCE_PORTS, query_resource_server
+
+    target_ports = tuple(ports) if ports is not None else ALL_RESOURCE_PORTS
+    local = local_device_profile()
+    out: list[ResourceEntry] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def _probe(port: int) -> tuple[int, dict[str, Any] | None]:
+        return port, query_resource_server("127.0.0.1", port, timeout=probe_timeout)
+
+    results: list[tuple[int, dict[str, Any] | None]] = []
+    if target_ports:
+        with ThreadPoolExecutor(max_workers=min(8, len(target_ports))) as pool:
+            results = list(pool.map(_probe, target_ports))
+
+    # Prefer local resource service port (7423) before peer ports when deduplicating
+    for port, payload in results:
+        if not payload:
+            continue
+        dev = payload.get("device") or {}
+        did = str(dev.get("device_id") or f"tcp-{port}")
+        dname = str(dev.get("name") or did)
+        dkind = str(dev.get("kind") or "desktop")
+        icon = str(dev.get("icon") or ("📱" if dkind == "android" else "💻"))
+        for r in payload.get("resources") or ():
+            rkind = str(r.get("kind") or "")
+            rid = str(r.get("id") or "")
+            rlabel = str(r.get("label") or rid)
+            if not rkind or not rid:
+                continue
+            key = (did, rkind, rid)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                ResourceEntry(
+                    device_id=did,
+                    device_name=dname,
+                    device_kind=dkind,
+                    icon=icon,
+                    kind=rkind,
+                    resource_id=rid,
+                    label=rlabel,
+                    host="127.0.0.1",
+                    port=port,
+                    source="resource_svc",
+                ),
+            )
+
+    if include_local_fallback:
+        for cid, clabel in local.cameras:
+            key = (local.device_id, "camera", cid)
+            if key not in seen:
+                seen.add(key)
+                out.append(
+                    ResourceEntry(
+                        device_id=local.device_id,
+                        device_name=local.name,
+                        device_kind=local.kind,
+                        icon=local.icon,
+                        kind="camera",
+                        resource_id=cid,
+                        label=clabel,
+                        host="127.0.0.1",
+                        port=0,
+                        source="local",
+                    ),
+                )
+        if local.has_mic:
+            key = (local.device_id, "mic", "default")
+            if key not in seen:
+                seen.add(key)
+                out.append(
+                    ResourceEntry(
+                        device_id=local.device_id,
+                        device_name=local.name,
+                        device_kind=local.kind,
+                        icon=local.icon,
+                        kind="mic",
+                        resource_id="default",
+                        label="Microphone",
+                        host="127.0.0.1",
+                        port=0,
+                        source="local",
+                    ),
+                )
+        key = (local.device_id, "files", "fs")
+        if key not in seen:
+            seen.add(key)
+            out.append(
+                ResourceEntry(
+                    device_id=local.device_id,
+                    device_name=local.name,
+                    device_kind=local.kind,
+                    icon=local.icon,
+                    kind="files",
+                    resource_id="fs",
+                    label="Files & Media",
+                    host="127.0.0.1",
+                    port=0,
+                    source="local",
+                ),
+            )
+
+    peer = driver.distinct_peer_profile(local) if hasattr(driver, "distinct_peer_profile") else None
+    if peer is not None:
+        peer_cams = peer.cameras or [("1", "Camera")]
+        for cid, clabel in peer_cams:
+            key = (peer.device_id, "camera", cid)
+            if key not in seen:
+                seen.add(key)
+                out.append(
+                    ResourceEntry(
+                        device_id=peer.device_id,
+                        device_name=peer.name,
+                        device_kind=peer.kind,
+                        icon=peer.icon,
+                        kind="camera",
+                        resource_id=cid,
+                        label=clabel,
+                        host="",
+                        port=0,
+                        source="peer",
+                    ),
+                )
+        if peer.has_mic:
+            key = (peer.device_id, "mic", "default")
+            if key not in seen:
+                seen.add(key)
+                out.append(
+                    ResourceEntry(
+                        device_id=peer.device_id,
+                        device_name=peer.name,
+                        device_kind=peer.kind,
+                        icon=peer.icon,
+                        kind="mic",
+                        resource_id="default",
+                        label="Microphone",
+                        host="",
+                        port=0,
+                        source="peer",
+                    ),
+                )
+        key = (peer.device_id, "files", "fs")
+        if key not in seen:
+            seen.add(key)
+            out.append(
+                ResourceEntry(
+                    device_id=peer.device_id,
+                    device_name=peer.name,
+                    device_kind=peer.kind,
+                    icon=peer.icon,
+                    kind="files",
+                    resource_id="fs",
+                    label="Files & Media",
+                    host="",
+                    port=0,
+                    source="peer",
+                ),
+            )
+
+    if kind:
+        return [r for r in out if r.kind == kind]
+    return out
