@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tw_client::{spawn_command_session_cbs, ClientCallbacks};
-use tw_proto::{AppEntry, VID_CODEC_H264, VID_CODEC_HEVC};
+use tw_client::{spawn_command_session_cbs, spawn_tcp_session_cbs, ClientCallbacks};
+use tw_proto::{AppEntry, Frame, Op, Priority, PriorityMux, VID_CODEC_H264, VID_CODEC_HEVC};
 
 fn find_python() -> String {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -163,4 +163,86 @@ fn rust_client_drives_python_demo_over_stdio() {
         assert!(Instant::now() < deadline_alive, "server died after receiving FsEntries (zstd vs zlib?)");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn tcp_client_auto_connects_and_reconnects() {
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    // Reserve an unused ephemeral port, then drop it so the client starts BEFORE the server listens
+    let port = {
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+
+    let statuses: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let st_cb = Arc::clone(&statuses);
+    let cbs = ClientCallbacks {
+        on_status: Arc::new(move |s| st_cb.lock().unwrap().push(s.to_string())),
+        ..Default::default()
+    };
+
+    let (client, join) = spawn_tcp_session_cbs("127.0.0.1".into(), port, cbs).expect("spawn tcp");
+
+    // Client should wait cleanly without exiting while port is closed
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(!join.is_finished(), "tcp client should stay alive waiting to connect");
+
+    let hello_payload = |title: &str| -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&1.0f32.to_le_bytes());
+        p.extend_from_slice(&[0u8; 16]);
+        p.extend_from_slice(&(title.len() as u16).to_le_bytes());
+        p.extend_from_slice(title.as_bytes());
+        p
+    };
+
+    // 1st server comes online -> sends Hello -> disconnects
+    {
+        let srv = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let (mut conn, _) = srv.accept().unwrap();
+        let mut mux = PriorityMux::new(4096, 2);
+        mux.push(
+            Frame::new(Op::Hello, hello_payload("Session-1"), Priority::P0Control),
+            false,
+            false,
+        );
+        while let Some(pkt) = mux.pop_packet() {
+            conn.write_all(&pkt).unwrap();
+        }
+        conn.flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while client.state.lock().unwrap().title != "Session-1" {
+            assert!(Instant::now() < deadline, "timed out waiting for Session-1 Hello");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // Wait briefly for disconnect & reconnect loop, then bring 2nd server online
+    std::thread::sleep(Duration::from_millis(200));
+    {
+        let srv = TcpListener::bind(("127.0.0.1", port)).unwrap();
+        let (mut conn, _) = srv.accept().unwrap();
+        let mut mux = PriorityMux::new(4096, 2);
+        mux.push(
+            Frame::new(Op::Hello, hello_payload("Session-2"), Priority::P0Control),
+            false,
+            false,
+        );
+        while let Some(pkt) = mux.pop_packet() {
+            conn.write_all(&pkt).unwrap();
+        }
+        conn.flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while client.state.lock().unwrap().title != "Session-2" {
+            assert!(Instant::now() < deadline, "timed out waiting for Session-2 reconnect");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    drop(client);
+    let _ = join.join();
+    let st_list = statuses.lock().unwrap();
+    assert!(st_list.iter().filter(|s| s.starts_with("Connected (")).count() >= 2);
 }

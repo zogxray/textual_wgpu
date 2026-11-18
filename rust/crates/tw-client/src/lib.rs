@@ -383,53 +383,64 @@ impl russh::client::Handler for SshClientHandler {
     }
 }
 
-async fn pump_frame_stream<R, W>(
+async fn pump_frame_stream_mut<R, W>(
     mut reader: R,
     mut writer: W,
-    mut rx: mpsc::UnboundedReceiver<Frame>,
-    tx_caps: mpsc::UnboundedSender<Frame>,
-    state: Arc<Mutex<SceneState>>,
-    cbs: ClientCallbacks,
+    rx: &mut mpsc::UnboundedReceiver<Frame>,
+    tx_caps: &mpsc::WeakUnboundedSender<Frame>,
+    state: &Arc<Mutex<SceneState>>,
+    cbs: &ClientCallbacks,
 ) where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
 {
-    let writer_task = tokio::spawn(async move {
-        let mut mux = PriorityMux::new(4096, 2);
-        while let Some(f) = rx.recv().await {
-            let comp = !matches!(f.op, Op::ClientFileData | Op::VidNalu | Op::PutBlob);
-            mux.push(f, comp, false);
-            while let Ok(more) = rx.try_recv() {
-                let mc = !matches!(more.op, Op::ClientFileData | Op::VidNalu | Op::PutBlob);
-                mux.push(more, mc, false);
-            }
-            while let Some(pkt) = mux.pop_packet() {
-                if writer.write_all(&pkt).await.is_err() {
+    let mut mux = PriorityMux::new(4096, 2);
+    let mut reasm = FrameReassembler::default();
+    let mut rx_buf: Vec<u8> = Vec::with_capacity(65536);
+    let mut tmp = [0u8; 32768];
+    loop {
+        tokio::select! {
+            maybe_out = rx.recv() => {
+                let Some(f) = maybe_out else { break };
+                let comp = !matches!(f.op, Op::ClientFileData | Op::VidNalu | Op::PutBlob);
+                mux.push(f, comp, false);
+                while let Ok(more) = rx.try_recv() {
+                    let mc = !matches!(more.op, Op::ClientFileData | Op::VidNalu | Op::PutBlob);
+                    mux.push(more, mc, false);
+                }
+                while let Some(pkt) = mux.pop_packet() {
+                    if writer.write_all(&pkt).await.is_err() {
+                        return;
+                    }
+                }
+                if writer.flush().await.is_err() {
                     return;
                 }
             }
-            if writer.flush().await.is_err() {
-                return;
+            rd = reader.read(&mut tmp) => {
+                let Ok(n) = rd else { break };
+                if n == 0 {
+                    break;
+                }
+                rx_buf.extend_from_slice(&tmp[..n]);
+                while rx_buf.len() >= HEADER_SIZE {
+                    let hdr: [u8; HEADER_SIZE] = rx_buf[..HEADER_SIZE].try_into().unwrap();
+                    let (_vf, _p, _op, _sid, _seq, plen) = unpack_header(&hdr);
+                    let total = HEADER_SIZE + plen as usize;
+                    if rx_buf.len() < total {
+                        break;
+                    }
+                    let body = rx_buf[HEADER_SIZE..total].to_vec();
+                    rx_buf.drain(..total);
+                    if let Ok(Some(frame)) = reasm.feed(&hdr, &body) {
+                        if let Some(tx) = tx_caps.upgrade() {
+                            dispatch_incoming_frame(&frame, &tx, state, cbs);
+                        }
+                    }
+                }
             }
         }
-    });
-
-    let mut reasm = FrameReassembler::default();
-    let mut hdr = [0u8; HEADER_SIZE];
-    loop {
-        if reader.read_exact(&mut hdr).await.is_err() {
-            break;
-        }
-        let (_vf, _p, _op, _sid, _seq, plen) = unpack_header(&hdr);
-        let mut body = vec![0u8; plen as usize];
-        if !body.is_empty() && reader.read_exact(&mut body).await.is_err() {
-            break;
-        }
-        if let Ok(Some(frame)) = reasm.feed(&hdr, &body) {
-            dispatch_incoming_frame(&frame, &tx_caps, &state, &cbs);
-        }
     }
-    writer_task.abort();
 }
 
 fn dispatch_incoming_frame(
@@ -538,8 +549,8 @@ pub fn spawn_tcp_session_cbs(
 ) -> std::io::Result<(ClientHandle, std::thread::JoinHandle<()>)> {
     let state = Arc::new(Mutex::new(SceneState::default()));
     let state_bg = Arc::clone(&state);
-    let (tx, rx) = mpsc::unbounded_channel::<Frame>();
-    let tx_caps = tx.clone();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+    let tx_weak = tx.downgrade();
 
     let handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -547,18 +558,57 @@ pub fn spawn_tcp_session_cbs(
             .build()
             .expect("tokio runtime");
         rt.block_on(async move {
-            (cbs.on_status)(&format!("Connecting TCP {host}:{port}…"));
-            let stream = match TcpStream::connect((host.as_str(), port)).await {
-                Ok(s) => s,
-                Err(e) => {
-                    (cbs.on_status)(&format!("TCP connect failed: {e}"));
-                    return;
+            let mut ever_connected = false;
+            let mut announced_wait = false;
+            loop {
+                if tx_weak.strong_count() == 0 {
+                    break;
                 }
-            };
-            (cbs.on_status)(&format!("Connected ({host}:{port})"));
-            let (reader, writer) = stream.into_split();
-            pump_frame_stream(reader, writer, rx, tx_caps, state_bg, cbs.clone()).await;
-            (cbs.on_status)("Disconnected");
+                if !announced_wait {
+                    announced_wait = true;
+                    (cbs.on_status)(&format!("Waiting for TCP {host}:{port}…"));
+                    if let Ok(mut st) = state_bg.lock() {
+                        st.title = format!("textual-wgpu · Waiting for {host}:{port}…");
+                    }
+                    (cbs.on_commit)();
+                }
+                let stream = match TcpStream::connect((host.as_str(), port)).await {
+                    Ok(s) => s,
+                    Err(_) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
+                };
+                while rx.try_recv().is_ok() {}
+                if ever_connected {
+                    if let Ok(mut st) = state_bg.lock() {
+                        st.layers.clear();
+                        st.order.clear();
+                        st.planes.clear();
+                        st.buffers.clear();
+                        st.styles.clear();
+                    }
+                }
+                announced_wait = false;
+                (cbs.on_status)(&format!("Connected ({host}:{port})"));
+                let (reader, writer) = stream.into_split();
+                let t0 = std::time::Instant::now();
+                pump_frame_stream_mut(reader, writer, &mut rx, &tx_weak, &state_bg, &cbs).await;
+                if t0.elapsed() > std::time::Duration::from_millis(250) {
+                    ever_connected = true;
+                }
+                (cbs.on_audio_stop)();
+                if tx_weak.strong_count() == 0 {
+                    (cbs.on_status)("Disconnected");
+                    break;
+                }
+                (cbs.on_status)(&format!("Disconnected · reconnecting to {host}:{port}…"));
+                if let Ok(mut st) = state_bg.lock() {
+                    st.title = format!("textual-wgpu · Reconnecting {host}:{port}…");
+                }
+                (cbs.on_commit)();
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
         });
     });
 
@@ -930,8 +980,8 @@ pub fn spawn_command_session_cbs(
 ) -> std::io::Result<(ClientHandle, std::thread::JoinHandle<()>)> {
     let state = Arc::new(Mutex::new(SceneState::default()));
     let state_bg = Arc::clone(&state);
-    let (tx, rx) = mpsc::unbounded_channel::<Frame>();
-    let tx_caps = tx.clone();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+    let tx_weak = tx.downgrade();
 
     let handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -956,13 +1006,13 @@ pub fn spawn_command_session_cbs(
             };
             let stdout = child.stdout.take().unwrap();
             let stdin = child.stdin.take().unwrap();
-            pump_frame_stream(
+            pump_frame_stream_mut(
                 stdout,
                 stdin,
-                rx,
-                tx_caps,
-                state_bg,
-                cbs,
+                &mut rx,
+                &tx_weak,
+                &state_bg,
+                &cbs,
             )
             .await;
             let _ = child.kill().await;

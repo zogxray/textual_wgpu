@@ -23,6 +23,7 @@ use winit::window::{Window, WindowId};
 #[derive(Debug, Clone, Copy)]
 enum UserEvent {
     Redraw,
+    Connected,
 }
 
 struct ViewerApp {
@@ -133,7 +134,10 @@ impl ApplicationHandler<UserEvent> for ViewerApp {
         let _ = self.proxy.send_event(UserEvent::Redraw);
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: UserEvent) {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        if matches!(event, UserEvent::Connected) {
+            self.client.send_resize(self.size.0, self.size.1);
+        }
         if let Some(win) = &self.window {
             win.request_redraw();
         }
@@ -520,11 +524,22 @@ fn main() {
             .spawn();
     }
 
+    let dec_map_status = Arc::clone(&decoders);
+    let proxy_status = proxy.clone();
     let cbs = ClientCallbacks {
         on_commit: Arc::new(move || {
             let _ = proxy_cb.send_event(UserEvent::Redraw);
         }),
-        on_status: Arc::new(|status| eprintln!("[tw-viewer] {status}")),
+        on_status: Arc::new(move |status| {
+            eprintln!("[tw-viewer] {status}");
+            if status.starts_with("Connected (") {
+                let _ = proxy_status.send_event(UserEvent::Connected);
+            } else if status.starts_with("Disconnected") {
+                if let Ok(mut map) = dec_map_status.lock() {
+                    map.clear();
+                }
+            }
+        }),
         on_clipboard: Arc::new(|_| {}),
         on_audio: Arc::new(move |sr, ch, pcm| play_audio(&audio_play_slot, sr, ch, pcm)),
         on_audio_stop: Arc::new(move || stop_audio(&audio_stop_slot)),
