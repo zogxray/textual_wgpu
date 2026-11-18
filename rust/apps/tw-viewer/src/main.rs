@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io::{BufRead, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,6 +24,7 @@ use winit::window::{Window, WindowId};
 enum UserEvent {
     Redraw,
     Connected,
+    Focus,
 }
 
 struct ViewerApp {
@@ -137,6 +138,12 @@ impl ApplicationHandler<UserEvent> for ViewerApp {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         if matches!(event, UserEvent::Connected) {
             self.client.send_resize(self.size.0, self.size.1);
+        }
+        if matches!(event, UserEvent::Focus) {
+            if let Some(win) = &self.window {
+                win.set_visible(true);
+                win.focus_window();
+            }
         }
         if let Some(win) = &self.window {
             win.request_redraw();
@@ -277,6 +284,19 @@ fn find_v4l2_capture_device() -> String {
         }
     }
     "/dev/video0".to_string()
+}
+
+fn map_ctl_mode_to_key(raw: &str) -> Option<&'static str> {
+    if raw.contains("\"overview\"") { Some("f1") }
+    else if raw.contains("\"controls\"") { Some("f2") }
+    else if raw.contains("\"data\"") { Some("f3") }
+    else if raw.contains("\"editor\"") { Some("f4") }
+    else if raw.contains("\"themes\"") { Some("f5") }
+    else if raw.contains("\"planes\"") { Some("f6") }
+    else if raw.contains("\"media\"") { Some("f7") }
+    else if raw.contains("\"nodes\"") { Some("f8") }
+    else if raw.contains("\"composer\"") { Some("f9") }
+    else { None }
 }
 
 fn find_hub_python() -> String {
@@ -866,8 +886,46 @@ fn main() {
     *state_slot.lock().unwrap() = Some(Arc::clone(&client.state));
     *client_slot.lock().unwrap() = Some(client.clone());
 
+    let ctl_home = std::env::var("HOME").unwrap_or_default();
+    let ctl_sock_path = std::path::PathBuf::from(ctl_home).join(".cache/textual-wgpu/viewer_ctl.sock");
+    let _ = std::fs::remove_file(&ctl_sock_path);
+    let ctl_stop = Arc::new(AtomicBool::new(false));
+    let ctl_stop_bg = Arc::clone(&ctl_stop);
+    let ctl_client = client.clone();
+    let ctl_proxy = proxy.clone();
+    let ctl_sock_bg = ctl_sock_path.clone();
+    std::thread::spawn(move || {
+        let Ok(listener) = UnixListener::bind(&ctl_sock_bg) else { return };
+        let _ = listener.set_nonblocking(true);
+        while !ctl_stop_bg.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut conn, _)) => {
+                    let mut line = String::new();
+                    let _ = std::io::BufReader::new(&conn).read_line(&mut line);
+                    let trimmed = line.trim();
+                    let mut ok = true;
+                    if trimmed.contains("\"focus\"") {
+                        let _ = ctl_proxy.send_event(UserEvent::Focus);
+                    } else if let Some(key) = map_ctl_mode_to_key(trimmed) {
+                        ctl_client.send_key(key);
+                        let _ = ctl_proxy.send_event(UserEvent::Focus);
+                    } else {
+                        ok = false;
+                    }
+                    let _ = conn.write_all(if ok { b"{\"ok\":true}\n" } else { b"{\"ok\":false}\n" });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     let mut app = ViewerApp::new(client, proxy);
     event_loop.run_app(&mut app).expect("run app");
+    ctl_stop.store(true, Ordering::Relaxed);
+    let _ = std::fs::remove_file(&ctl_sock_path);
     stop_audio(&audio_slot);
     if let Ok(mut g) = cam_stop_slot.lock() {
         if let Some(f) = g.take() { f.store(true, Ordering::Relaxed); }

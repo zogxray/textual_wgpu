@@ -952,8 +952,9 @@ def test_meta_os_speaker_clipboard_ai_sessions_and_composer(tmp_path: Path):
         nscr.use_selected_resource()
         assert comp_app.mode_key == "composer"
 
-        # Ubuntu top-bar status panel snapshot & icon helper
-        from textual_wgpu.remote.tray import collect_status_snapshot, ensure_tray_icon
+        # Ubuntu top-bar status panel snapshot, icon & existing-window navigation
+        from textual_wgpu.app import _dispatch_ui_ctl_command
+        from textual_wgpu.remote.tray import collect_status_snapshot, ensure_tray_icon, _navigate_or_open
 
         icon_p = ensure_tray_icon()
         assert icon_p.is_file() and "<svg" in icon_p.read_text(encoding="utf-8")
@@ -961,6 +962,25 @@ def test_meta_os_speaker_clipboard_ai_sessions_and_composer(tmp_path: Path):
         assert len(snap.devices) == 2
         assert "peer" in snap.label_text() and "cam" in snap.label_text()
         assert snap.fingerprint() == collect_status_snapshot(ports=(p_ws, p_ph)).fingerprint()
+
+        # Verify ui_ctl dispatch switches mode & activates resources in-place without spawning a new window
+        assert _dispatch_ui_ctl_command(comp_app, {"op": "switch_mode", "mode": "media"})
+        assert comp_app.mode_key == "media"
+        assert _dispatch_ui_ctl_command(
+            comp_app,
+            {
+                "op": "use_resource",
+                "resource": {
+                    "device_id": "ws-1",
+                    "device_name": "Workstation",
+                    "kind": "ai",
+                    "id": "ollama:demo-vision",
+                    "label": "Local Vision LLM",
+                    "port": p_ws,
+                },
+            },
+        )
+        assert comp_app.mode_key == "composer"
     finally:
         broker.close_all()
         srv_ws.close()

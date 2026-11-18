@@ -84,6 +84,162 @@ class _ActionResult:
         return _done().__await__()
 
 
+def _dispatch_ui_ctl_command(app: Any, req: dict[str, Any]) -> bool:
+    op = str(req.get("op") or "")
+
+    def _raise_window() -> None:
+        try:
+            canvas = getattr(app, "_canvas", None)
+            win = getattr(canvas, "_window", None) if canvas is not None else None
+            if win is not None:
+                import glfw
+
+                glfw.show_window(win)
+                glfw.focus_window(win)
+        except Exception:  # noqa: BLE001
+            pass
+
+    if op == "focus":
+        app.call_from_thread(_raise_window)
+        return True
+
+    if op == "switch_mode":
+        mode = str(req.get("mode") or "").strip()
+        if not mode:
+            return False
+
+        def _do_switch() -> None:
+            _raise_window()
+            if hasattr(app, "switch_mode"):
+                app.switch_mode(mode)
+            app.request_draw()
+
+        app.call_from_thread(_do_switch)
+        return True
+
+    if op == "use_resource":
+        rdata = req.get("resource") or {}
+        if not isinstance(rdata, dict):
+            return False
+
+        def _do_res() -> None:
+            from .remote.directory import ResourceEntry
+
+            _raise_window()
+            res = ResourceEntry(
+                device_id=str(rdata.get("device_id") or ""),
+                device_name=str(rdata.get("device_name") or "Device"),
+                device_kind=str(rdata.get("device_kind") or "desktop"),
+                icon=str(rdata.get("icon") or "💻"),
+                kind=str(rdata.get("kind") or ""),
+                resource_id=str(rdata.get("id") or rdata.get("resource_id") or ""),
+                label=str(rdata.get("label") or ""),
+                host=str(rdata.get("host") or "127.0.0.1"),
+                port=int(rdata.get("port") or 0),
+                source="resource_svc" if int(rdata.get("port") or 0) > 0 else "local",
+            )
+            if not hasattr(app, "switch_mode"):
+                return
+            if res.kind in ("ai", "gpu", "clipboard"):
+                app.switch_mode("composer")
+                scr = getattr(app, "screen", None)
+                if hasattr(scr, "select_resource"):
+                    scr.select_resource(res)
+            else:
+                app.switch_mode("media")
+                scr = getattr(app, "screen", None)
+                if res.kind == "camera" and hasattr(scr, "start_camera_resource"):
+                    scr.start_camera_resource(res)
+                elif res.kind == "mic" and hasattr(scr, "start_mic_resource"):
+                    scr.start_mic_resource(res)
+                elif res.kind == "speaker" and hasattr(scr, "set_speaker_resource"):
+                    scr.set_speaker_resource(res)
+                elif res.kind == "files" and hasattr(scr, "open_media_file"):
+                    scr.open_media_file()
+            app.request_draw()
+
+        app.call_from_thread(_do_res)
+        return True
+    return False
+
+
+def _start_ui_ctl_server(app: Any) -> Any:
+    import json
+    import os
+    import socket
+    import threading
+    from pathlib import Path
+
+    if os.environ.get("PYTEST_CURRENT_TEST") or "ANDROID_ROOT" in os.environ:
+        return lambda: None
+    sock_path = Path.home() / ".cache" / "textual-wgpu" / "ui_ctl.sock"
+    sock_path.parent.mkdir(parents=True, exist_ok=True)
+    if sock_path.exists():
+        try:
+            sock_path.unlink()
+        except OSError:
+            pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        srv.bind(str(sock_path))
+        srv.listen(8)
+        srv.settimeout(0.25)
+    except OSError:
+        try:
+            srv.close()
+        except OSError:
+            pass
+        return lambda: None
+
+    closed = [False]
+
+    def _serve() -> None:
+        while not closed[0]:
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                conn.settimeout(1.0)
+                buf = bytearray()
+                while len(buf) < 65536:
+                    b = conn.recv(1)
+                    if not b or b == b"\n":
+                        break
+                    buf.extend(b)
+                req = json.loads(buf.decode("utf-8", errors="replace") or "{}")
+                ok = _dispatch_ui_ctl_command(app, req) if isinstance(req, dict) else False
+                conn.sendall(b'{"ok":true}\n' if ok else b'{"ok":false}\n')
+            except Exception:  # noqa: BLE001
+                try:
+                    conn.sendall(b'{"ok":false}\n')
+                except OSError:
+                    pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    threading.Thread(target=_serve, daemon=True).start()
+
+    def _stop() -> None:
+        closed[0] = True
+        try:
+            srv.close()
+        except OSError:
+            pass
+        try:
+            if sock_path.exists():
+                sock_path.unlink()
+        except OSError:
+            pass
+
+    return _stop
+
+
 class App:
     """Tiny Textual-flavoured shell.
 
@@ -2554,16 +2710,20 @@ class App:
         except Exception:  # noqa: BLE001
             pass
 
-        remote_spec = os.environ.get("TEXTUAL_WGPU_REMOTE", "").strip()
-        if remote_spec:
-            from .remote.cli import run_app_remote
+        stop_ctl = _start_ui_ctl_server(self)
+        try:
+            remote_spec = os.environ.get("TEXTUAL_WGPU_REMOTE", "").strip()
+            if remote_spec:
+                from .remote.cli import run_app_remote
 
-            run_app_remote(self, remote_spec)
-            return
+                run_app_remote(self, remote_spec)
+                return
 
-        from .driver import WgpuDriver
+            from .driver import WgpuDriver
 
-        WgpuDriver(self).run_blocking()
+            WgpuDriver(self).run_blocking()
+        finally:
+            stop_ctl()
 
     async def run_async(self, *, headless: bool = False, size: tuple[int, int] | None = None) -> None:
         """Asyncio-native entry — message pump + timers + workers on one loop."""

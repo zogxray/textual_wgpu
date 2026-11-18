@@ -234,6 +234,51 @@ def install_desktop_entries(*, autostart: bool = True) -> tuple[Path, Path | Non
     return app_desktop, auto_desktop
 
 
+def _send_unix_ctl(sock_name: str, req: dict[str, Any], timeout: float = 0.25) -> bool:
+    sock_path = cache_dir() / sock_name
+    if not sock_path.exists():
+        return False
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(str(sock_path))
+        s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+        buf = bytearray()
+        while len(buf) < 4096:
+            b = s.recv(1)
+            if not b or b == b"\n":
+                break
+            buf.extend(b)
+        if not buf:
+            return False
+        data = json.loads(buf.decode("utf-8", errors="replace"))
+        return bool(isinstance(data, dict) and data.get("ok"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def _navigate_or_open(start_mode: str = "overview", *, resource: dict[str, Any] | None = None) -> None:
+    if resource is not None:
+        if _send_unix_ctl("ui_ctl.sock", {"op": "use_resource", "resource": resource}):
+            return
+    if _send_unix_ctl("ui_ctl.sock", {"op": "switch_mode", "mode": start_mode}):
+        return
+    if _send_unix_ctl("viewer_ctl.sock", {"op": "switch_mode", "mode": start_mode}):
+        return
+    _spawn_app(start_mode)
+
+
+def _focus_or_spawn_viewer(host: str, port: int) -> None:
+    if port == PHONE_TUNNEL_PORT and _send_unix_ctl("viewer_ctl.sock", {"op": "focus"}):
+        return
+    _spawn_viewer(host, port)
+
+
 def _spawn_app(start_mode: str = "overview") -> None:
     py = find_app_python()
     env = dict(os.environ)
@@ -346,10 +391,12 @@ def run_tray() -> int:
     ind.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
     ind.set_title("textual-wgpu Meta-OS")
 
-    state: dict[str, Any] = {"fp": ""}
+    menu = Gtk.Menu()
+    state: dict[str, Any] = {"fp": "", "label": "", "menu_open": False, "pending": None}
 
-    def _build_menu(snap: TraySnapshot) -> Gtk.Menu:
-        menu = Gtk.Menu()
+    def _populate_menu(snap: TraySnapshot) -> None:
+        for child in list(menu.get_children()):
+            menu.remove(child)
 
         def _add_label(text: str) -> None:
             it = Gtk.MenuItem(label=text)
@@ -374,31 +421,55 @@ def run_tray() -> int:
                 for r in dev.resources:
                     rkind = str(r.get("kind") or "")
                     rlabel = str(r.get("label") or r.get("id") or rkind)
+                    res_payload = {
+                        "device_id": dev.device_id,
+                        "device_name": dev.name,
+                        "device_kind": dev.kind,
+                        "icon": dev.icon,
+                        "kind": rkind,
+                        "id": str(r.get("id") or ""),
+                        "label": rlabel,
+                        "host": "127.0.0.1",
+                        "port": dev.port,
+                    }
                     rit = Gtk.MenuItem(label=f"[{rkind.upper()}] {rlabel}")
                     if rkind == "speaker":
-                        rit.connect("activate", lambda *_a, p=dev.port: _test_speaker_chime(p))
+                        rit.connect(
+                            "activate",
+                            lambda *_a, p=dev.port, rp=res_payload: (
+                                _test_speaker_chime(p),
+                                _navigate_or_open("media", resource=rp),
+                            ),
+                        )
                     elif rkind == "clipboard":
-                        rit.connect("activate", lambda *_a, p=dev.port: _copy_clipboard_from_port(p))
+                        rit.connect(
+                            "activate",
+                            lambda *_a, p=dev.port, rp=res_payload: (
+                                _copy_clipboard_from_port(p),
+                                _navigate_or_open("composer", resource=rp),
+                            ),
+                        )
                     elif rkind in ("ai", "gpu"):
-                        rit.connect("activate", lambda *_a: _spawn_app("composer"))
+                        rit.connect("activate", lambda *_a, rp=res_payload: _navigate_or_open("composer", resource=rp))
                     elif rkind in ("camera", "mic", "files"):
-                        rit.connect("activate", lambda *_a: _spawn_app("media"))
+                        rit.connect("activate", lambda *_a, rp=res_payload: _navigate_or_open("media", resource=rp))
                     else:
-                        rit.connect("activate", lambda *_a: _spawn_app("nodes"))
+                        rit.connect("activate", lambda *_a: _navigate_or_open("nodes"))
                     sub.append(rit)
                 if dev.sessions:
                     sub.append(Gtk.SeparatorMenuItem())
                     for s in dev.sessions:
                         sit = Gtk.MenuItem(label=f"▶ Attach {s.get('name', s.get('app_id'))} (:{s.get('port')})")
-                        sit.connect("activate", lambda *_a, p=int(s.get("port") or 7420): _spawn_viewer("127.0.0.1", p))
+                        sit.connect("activate", lambda *_a, p=int(s.get("port") or 7420): _focus_or_spawn_viewer("127.0.0.1", p))
                         sub.append(sit)
                 menu.append(parent)
             menu.append(Gtk.SeparatorMenuItem())
 
-        _add_item("🖥 Open Meta-OS Demo (F1–F9)", lambda: _spawn_app("overview"))
-        _add_item("🧩 Open Composer · Eyes/Knowledge/Hands (F9)", lambda: _spawn_app("composer"))
-        _add_item("🎥 Open Media Studio · Multi-Cam/Audio (F7)", lambda: _spawn_app("media"))
-        _add_item("📱 Attach Phone Viewer (:7422 auto-reconnect)", lambda: _spawn_viewer("127.0.0.1", PHONE_TUNNEL_PORT))
+        _add_item("🖥 Open Meta-OS Demo (F1)", lambda: _navigate_or_open("overview"))
+        _add_item("🎥 Open Media Studio (F7)", lambda: _navigate_or_open("media"))
+        _add_item("🌐 Open Nodes & Resources (F8)", lambda: _navigate_or_open("nodes"))
+        _add_item("🧩 Open Composer · Eyes/Knowledge/Hands (F9)", lambda: _navigate_or_open("composer"))
+        _add_item("📱 Attach Phone Viewer (:7422)", lambda: _focus_or_spawn_viewer("127.0.0.1", PHONE_TUNNEL_PORT))
         menu.append(Gtk.SeparatorMenuItem())
         _add_item("▶ Start Local Resource Service (:7423)", _ensure_resource_service_bg)
         _add_item("⚙ Install Ubuntu Autostart", lambda: install_desktop_entries(autostart=True))
@@ -406,14 +477,32 @@ def run_tray() -> int:
         _add_item("Quit Status Panel", Gtk.main_quit)
 
         menu.show_all()
-        return menu
+
+    def _on_menu_show(*_a: Any) -> None:
+        state["menu_open"] = True
+
+    def _on_menu_hide(*_a: Any) -> None:
+        state["menu_open"] = False
+        pend = state.pop("pending", None)
+        if pend is not None:
+            _apply_snapshot(pend)
+
+    menu.connect("show", _on_menu_show)
+    menu.connect("hide", _on_menu_hide)
+    ind.set_menu(menu)
 
     def _apply_snapshot(snap: TraySnapshot) -> bool:
-        ind.set_label(snap.label_text(), "TW · 9 peers · 9 cam")
+        lbl = snap.label_text()
+        if lbl != state["label"]:
+            state["label"] = lbl
+            ind.set_label(lbl, "")
         fp = snap.fingerprint()
         if fp != state["fp"]:
+            if state["menu_open"] or menu.get_visible():
+                state["pending"] = snap
+                return False
             state["fp"] = fp
-            ind.set_menu(_build_menu(snap))
+            _populate_menu(snap)
         return False
 
     def _poll_loop() -> None:
