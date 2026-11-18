@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import shutil
@@ -424,6 +425,14 @@ def run_tray() -> int:
             os.execvpe(sys_py, [sys_py, str(Path(__file__).resolve())], env)
         raise
 
+    lock_file = (cache_dir() / "tray.lock").open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0
+    pid_path = cache_dir() / "tray.pid"
+    pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+
     icon_path = ensure_tray_icon()
     ind = AyatanaAppIndicator3.Indicator.new(
         "textual-wgpu-metaos",
@@ -578,7 +587,17 @@ def run_tray() -> int:
     initial = collect_status_snapshot(check_proc_listen=True)
     _apply_snapshot(initial)
     threading.Thread(target=_poll_loop, daemon=True).start()
-    Gtk.main()
+    try:
+        Gtk.main()
+    finally:
+        try:
+            pid_path.unlink()
+        except OSError:
+            pass
+        try:
+            lock_file.close()
+        except OSError:
+            pass
     return 0
 
 

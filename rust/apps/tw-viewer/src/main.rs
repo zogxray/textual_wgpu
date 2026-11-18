@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -300,12 +301,28 @@ fn map_ctl_mode_to_key(raw: &str) -> Option<&'static str> {
 }
 
 fn find_hub_python() -> String {
+    if let Ok(venv) = std::env::var("VIRTUAL_ENV") {
+        let p = std::path::PathBuf::from(venv).join("bin/python");
+        if p.exists() {
+            return p.to_string_lossy().into_owned();
+        }
+    }
     let home = std::env::var("HOME").unwrap_or_default();
-    let cached = std::path::PathBuf::from(home).join(".cache/textual-wgpu/python_bin");
+    let cached = std::path::PathBuf::from(&home).join(".cache/textual-wgpu/python_bin");
     if let Ok(p) = std::fs::read_to_string(cached) {
         let p = p.trim();
         if !p.is_empty() && std::path::Path::new(p).exists() {
             return p.to_string();
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for anc in exe.ancestors().take(6) {
+            for rel in ["venv/bin/python", ".venv/bin/python"] {
+                let cand = anc.join(rel);
+                if cand.exists() {
+                    return cand.to_string_lossy().into_owned();
+                }
+            }
         }
     }
     "python3".to_string()
@@ -538,10 +555,30 @@ fn main() {
         let py = find_hub_python();
         let _ = Command::new(&py)
             .args(["-m", "textual_wgpu.remote.media_hub", "--serve-resources"])
+            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn();
+    }
+    if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let pid_path = std::path::PathBuf::from(home).join(".cache/textual-wgpu/tray.pid");
+        let alive = std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map(|pid| std::path::PathBuf::from(format!("/proc/{pid}")).exists())
+            .unwrap_or(false);
+        if !alive {
+            let py = find_hub_python();
+            let _ = Command::new(&py)
+                .args(["-m", "textual_wgpu.remote.cli", "tray"])
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
     }
 
     let dec_map_status = Arc::clone(&decoders);
@@ -815,7 +852,7 @@ fn main() {
             spawn_tcp_session_cbs(node.host, node.port, cbs).expect("spawn node tcp")
         } else if node.transport == "local" {
             spawn_command_session_cbs(
-                "python3".into(),
+                find_hub_python(),
                 vec!["-m".into(), "textual_wgpu".into()],
                 vec![("TEXTUAL_WGPU_REMOTE".into(), "stdio".into())],
                 cbs,
@@ -855,7 +892,7 @@ fn main() {
     } else {
         let (program, cmd_args, envs) = if args.is_empty() {
             (
-                "python3".to_string(),
+                find_hub_python(),
                 vec!["-m".into(), "textual_wgpu".into()],
                 vec![("TEXTUAL_WGPU_REMOTE".into(), "stdio".into())],
             )
