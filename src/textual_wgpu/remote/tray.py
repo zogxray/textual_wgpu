@@ -334,7 +334,7 @@ def run_tray() -> int:
             src_root = str(Path(__file__).resolve().parents[2])
             prev_pp = env.get("PYTHONPATH", "")
             env["PYTHONPATH"] = f"{src_root}:{prev_pp}" if prev_pp else src_root
-            os.execvpe(sys_py, [sys_py, str(Path(__file__).resolve()), *sys.argv[1:]], env)
+            os.execvpe(sys_py, [sys_py, str(Path(__file__).resolve())], env)
         raise
 
     icon_path = ensure_tray_icon()
