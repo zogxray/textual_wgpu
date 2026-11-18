@@ -236,6 +236,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("nodes", help="List saved Network OS nodes (Workstation, Phone, Cloud)")
     sub.add_parser("resources", help="List all independent device resources (cameras, mics, files)")
+    s_tray = sub.add_parser("tray", help="Launch Ubuntu/GNOME top menu status panel")
+    s_tray.add_argument("--install-autostart", action="store_true", help="Install Ubuntu autostart desktop entry")
 
     s_node = sub.add_parser("attach-node", help="Connect to a saved node by ID from nodes.json")
     s_node.add_argument("node_id", help="Node ID (e.g. workstation, phone, cloud)")
@@ -340,6 +342,10 @@ def main(argv: list[str] | None = None) -> int:
             ep = f"{r.host}:{r.port}" if r.port else r.source
             print(f"{r.icon} {r.device_name:<20} [{r.kind:<6}] {r.label:<28} id={r.resource_id} ({ep})")
         return 0
+    if args.cmd == "tray":
+        from .tray import main as tray_main
+
+        return tray_main(["--install-autostart"] if args.install_autostart else [])
     if args.cmd == "attach-node":  # pragma: no cover
         from .directory import NodeRegistry
 

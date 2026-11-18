@@ -951,6 +951,16 @@ def test_meta_os_speaker_clipboard_ai_sessions_and_composer(tmp_path: Path):
         nscr.query_one("#resources-list", OptionList).highlighted = 1
         nscr.use_selected_resource()
         assert comp_app.mode_key == "composer"
+
+        # Ubuntu top-bar status panel snapshot & icon helper
+        from textual_wgpu.remote.tray import collect_status_snapshot, ensure_tray_icon
+
+        icon_p = ensure_tray_icon()
+        assert icon_p.is_file() and "<svg" in icon_p.read_text(encoding="utf-8")
+        snap = collect_status_snapshot(ports=(p_ws, p_ph))
+        assert len(snap.devices) == 2
+        assert "peer" in snap.label_text() and "cam" in snap.label_text()
+        assert snap.fingerprint() == collect_status_snapshot(ports=(p_ws, p_ph)).fingerprint()
     finally:
         broker.close_all()
         srv_ws.close()

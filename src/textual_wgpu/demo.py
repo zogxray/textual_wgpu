@@ -2541,7 +2541,10 @@ def build_demo_app(theme: Theme | None = None, *, start: str = "overview") -> Mo
 
 
 def main(theme: Theme | None = None) -> None:
-    build_demo_app(theme=theme).run()
+    import os
+
+    start = os.environ.get("TEXTUAL_WGPU_START", "").strip() or "overview"
+    build_demo_app(theme=theme, start=start).run()
 
 
 if __name__ == "__main__":
