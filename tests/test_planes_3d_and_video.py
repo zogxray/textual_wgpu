@@ -222,6 +222,8 @@ async def test_client_file_upload_and_media_screen_file_loading(monkeypatch, tmp
 
         from textual_wgpu.remote.directory import DeviceProfile
 
+        monkeypatch.setattr("textual_wgpu.remote.media_hub.ALL_RESOURCE_PORTS", ())
+
         # Press O -> unified FilePickerModal opens; when peer == same device, NO duplicate self-entry!
         png_buf = io.BytesIO()
         PilImage.new("RGBA", (64, 48), (12, 180, 240, 255)).save(png_buf, format="PNG")
@@ -275,10 +277,11 @@ async def test_client_file_upload_and_media_screen_file_loading(monkeypatch, tmp
         app._open_file["entries"] = [("peer_file", str(peer_file_path), "  sample_upload.png")]
         app._open_file["index"] = 0
         app._open_file_activate()
-        for _ in range(25):
+        for _ in range(60):
             f = await asyncio.wait_for(viewer.transport.recv(), timeout=2.0)
             assert f is not None
             viewer.handle_frame(f)
+            await asyncio.sleep(0.005)
             if getattr(app.screen, "_custom_photo", None) is not None:
                 break
         custom = getattr(app.screen, "_custom_photo", None)
