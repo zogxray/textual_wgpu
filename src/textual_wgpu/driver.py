@@ -250,12 +250,38 @@ class WgpuDriver(Driver):
         app._set_window_visible(True)
         try:
             import glfw
+            from PIL import Image, ImageDraw
 
             win = getattr(app._canvas, "_window", None)
             if win is not None:
                 glfw.set_window_focus_callback(
                     win, lambda _w, focused: app._emit_app_focus(bool(focused)),
                 )
+                # Render the Meta-OS mesh emblem so Ubuntu Dock & Alt+Tab show the same icon as the tray
+                sz = 64
+                im = Image.new("RGBA", (sz, sz), (0, 0, 0, 0))
+                dr = ImageDraw.Draw(im)
+                s = sz / 24.0
+                dr.rounded_rectangle(
+                    [round(2 * s), round(2 * s), round(22 * s), round(22 * s)],
+                    radius=round(5 * s),
+                    fill=(31, 27, 38, 255),
+                    outline=(212, 173, 114, 255),
+                    width=max(2, round(1.6 * s)),
+                )
+                dr.line([(round(8 * s), round(8.5 * s)), (round(16 * s), round(8.5 * s))], fill=(245, 240, 232, 255), width=max(2, round(1.3 * s)))
+                dr.line([(round(8 * s), round(8.5 * s)), (round(12 * s), round(16 * s))], fill=(245, 240, 232, 255), width=max(2, round(1.3 * s)))
+                dr.line([(round(16 * s), round(8.5 * s)), (round(12 * s), round(16 * s))], fill=(245, 240, 232, 255), width=max(2, round(1.3 * s)))
+                for cx, cy, rad, col in (
+                    (8.0, 8.5, 2.3, (212, 173, 114, 255)),
+                    (16.0, 8.5, 2.3, (124, 198, 254, 255)),
+                    (12.0, 16.0, 2.5, (154, 230, 180, 255)),
+                ):
+                    dr.ellipse(
+                        [round((cx - rad) * s), round((cy - rad) * s), round((cx + rad) * s), round((cy + rad) * s)],
+                        fill=col,
+                    )
+                glfw.set_window_icon(win, 1, [im])
         except Exception:  # noqa: BLE001
             pass
         from .events import Ready

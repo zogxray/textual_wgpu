@@ -92,6 +92,59 @@ fn map_named_key(n: NamedKey) -> Option<&'static str> {
     })
 }
 
+fn build_window_icon() -> Option<winit::window::Icon> {
+    let sz = 64usize;
+    let mut rgba = vec![0u8; sz * sz * 4];
+    let s = sz as f32 / 24.0;
+    let dist_seg = |px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32| -> f32 {
+        let vx = bx - ax;
+        let vy = by - ay;
+        let wx = px - ax;
+        let wy = py - ay;
+        let len2 = vx * vx + vy * vy;
+        let t = if len2 > 0.0 { (wx * vx + wy * vy) / len2 } else { 0.0 }.clamp(0.0, 1.0);
+        let dx = px - (ax + t * vx);
+        let dy = py - (ay + t * vy);
+        (dx * dx + dy * dy).sqrt()
+    };
+    for y in 0..sz {
+        for x in 0..sz {
+            let ux = (x as f32 + 0.5) / s;
+            let uy = (y as f32 + 0.5) / s;
+            // Rounded box [2, 22] x [2, 22] radius 5
+            let cx = ux.clamp(7.0, 17.0);
+            let cy = uy.clamp(7.0, 17.0);
+            let box_d = ((ux - cx).powi(2) + (uy - cy).powi(2)).sqrt() - 5.0;
+            if box_d > 0.8 {
+                continue;
+            }
+            let mut col: [u8; 4] = if box_d > -1.4 {
+                [212, 173, 114, 255] // #D4AD72 border
+            } else {
+                [31, 27, 38, 255] // #1F1B26 fill
+            };
+            let line_d = dist_seg(ux, uy, 8.0, 8.5, 16.0, 8.5)
+                .min(dist_seg(ux, uy, 8.0, 8.5, 12.0, 16.0))
+                .min(dist_seg(ux, uy, 16.0, 8.5, 12.0, 16.0));
+            if line_d <= 0.75 {
+                col = [245, 240, 232, 255]; // #F5F0E8
+            }
+            for (nx, ny, r, c) in [
+                (8.0f32, 8.5f32, 2.25f32, [212u8, 173, 114, 255]),
+                (16.0, 8.5, 2.25, [124, 198, 254, 255]),
+                (12.0, 16.0, 2.45, [154, 230, 180, 255]),
+            ] {
+                if ((ux - nx).powi(2) + (uy - ny).powi(2)).sqrt() <= r {
+                    col = c;
+                }
+            }
+            let idx = (y * sz + x) * 4;
+            rgba[idx..idx + 4].copy_from_slice(&col);
+        }
+    }
+    winit::window::Icon::from_rgba(rgba, sz as u32, sz as u32).ok()
+}
+
 impl ApplicationHandler<UserEvent> for ViewerApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -99,7 +152,8 @@ impl ApplicationHandler<UserEvent> for ViewerApp {
         }
         let attrs = Window::default_attributes()
             .with_title("textual-wgpu · Rust Viewer")
-            .with_inner_size(LogicalSize::new(1100.0, 720.0));
+            .with_inner_size(LogicalSize::new(1100.0, 720.0))
+            .with_window_icon(build_window_icon());
         let win = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let phys = win.inner_size();
         self.size = (phys.width.max(1), phys.height.max(1));

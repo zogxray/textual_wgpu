@@ -40,6 +40,14 @@ def ensure_tray_icon() -> Path:
     p = cache_dir() / "textual-wgpu-tray.svg"
     if not p.is_file() or p.read_text(encoding="utf-8") != _TRAY_SVG:
         p.write_text(_TRAY_SVG, encoding="utf-8")
+    icon_dir = Path.home() / ".local" / "share" / "icons" / "hicolor" / "scalable" / "apps"
+    try:
+        icon_dir.mkdir(parents=True, exist_ok=True)
+        hi = icon_dir / "textual-wgpu.svg"
+        if not hi.is_file() or hi.read_text(encoding="utf-8") != _TRAY_SVG:
+            hi.write_text(_TRAY_SVG, encoding="utf-8")
+    except OSError:
+        pass
     return p
 
 
@@ -244,6 +252,7 @@ def collect_status_snapshot(
 def install_desktop_entries(*, autostart: bool = True) -> tuple[Path, Path | None]:
     icon_path = ensure_tray_icon()
     py_sys = shutil.which("python3") or sys.executable
+    py_app = find_app_python()
     tray_script = str(Path(__file__).resolve())
     src_root = str(Path(__file__).resolve().parents[2])
     exec_tray = f"env PYTHONPATH={src_root} {py_sys} {tray_script}"
@@ -267,6 +276,46 @@ def install_desktop_entries(*, autostart: bool = True) -> tuple[Path, Path | Non
         ),
         encoding="utf-8",
     )
+
+    main_desktop = apps_dir / "textual-wgpu.desktop"
+    main_desktop.write_text(
+        "\n".join(
+            [
+                "[Desktop Entry]",
+                "Type=Application",
+                "Name=textual-wgpu",
+                "Comment=GPU-accelerated Meta-OS UI & Cross-Device Resource Studio",
+                f"Exec={py_app} -m textual_wgpu",
+                f"Icon={icon_path}",
+                "StartupWMClass=textual-wgpu",
+                "Terminal=false",
+                "Categories=Utility;Development;",
+                "",
+            ],
+        ),
+        encoding="utf-8",
+    )
+
+    viewer_cmd = find_viewer_command()
+    if viewer_cmd:
+        viewer_desktop = apps_dir / "textual-wgpu-viewer.desktop"
+        viewer_desktop.write_text(
+            "\n".join(
+                [
+                    "[Desktop Entry]",
+                    "Type=Application",
+                    "Name=textual-wgpu Viewer",
+                    "Comment=Rust wgpu Meta-OS Viewer",
+                    f"Exec={' '.join(viewer_cmd)}",
+                    f"Icon={icon_path}",
+                    "StartupWMClass=tw-viewer",
+                    "Terminal=false",
+                    "NoDisplay=true",
+                    "",
+                ],
+            ),
+            encoding="utf-8",
+        )
 
     auto_desktop: Path | None = None
     if autostart:
