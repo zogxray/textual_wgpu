@@ -555,7 +555,7 @@ def discover_all_resources(
     *,
     driver: Any = None,
     ports: tuple[int, ...] | None = None,
-    probe_timeout: float = 0.18,
+    probe_timeout: float = 0.8,
     include_local_fallback: bool = True,
 ) -> list[ResourceEntry]:
     """Discover all independent resources across local and SSH-bridged devices."""

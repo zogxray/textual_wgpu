@@ -71,7 +71,25 @@ def find_viewer_command() -> list[str]:
     return []
 
 
-def _tcp_open(host: str, port: int, timeout: float = 0.12) -> bool:
+def _listening_ports_proc() -> set[int] | None:
+    """Read local TCP LISTEN ports from /proc/net/tcp without opening dummy connections."""
+    p = Path("/proc/net/tcp")
+    if not p.is_file():
+        return None
+    ports: set[int] = set()
+    try:
+        for ln in p.read_text(encoding="utf-8", errors="ignore").splitlines()[1:]:
+            cols = ln.split()
+            if len(cols) >= 4 and cols[3] == "0A":  # TCP_LISTEN
+                _ip_hex, _, port_hex = cols[1].partition(":")
+                if port_hex:
+                    ports.add(int(port_hex, 16))
+        return ports
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _tcp_open(host: str, port: int, timeout: float = 0.15) -> bool:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
@@ -158,15 +176,41 @@ class TraySnapshot:
         )
 
 
-def collect_status_snapshot(*, ports: tuple[int, ...] = RESOURCE_PORTS) -> TraySnapshot:
-    local_ui_up = _tcp_open("127.0.0.1", LOCAL_UI_PORT)
-    phone_tunnel_up = _tcp_open("127.0.0.1", PHONE_TUNNEL_PORT)
+def collect_status_snapshot(
+    *,
+    ports: tuple[int, ...] = RESOURCE_PORTS,
+    check_proc_listen: bool = False,
+) -> TraySnapshot:
+    from concurrent.futures import ThreadPoolExecutor
+
+    listening = _listening_ports_proc() if check_proc_listen else None
+    if listening is not None:
+        local_ui_up = LOCAL_UI_PORT in listening
+        phone_tunnel_up = PHONE_TUNNEL_PORT in listening
+        probe_ports = tuple(p for p in ports if p in listening)
+    else:
+        local_ui_up = False
+        phone_tunnel_up = False
+        probe_ports = tuple(ports)
+
     local_res_up = False
     devices: list[TrayDevice] = []
     seen_ids: set[str] = set()
 
-    for port in ports:
-        info = _query_json_line("127.0.0.1", port, {"op": "list"}, timeout=0.18)
+    def _query_port(port: int) -> tuple[int, dict[str, Any] | None, list[dict[str, Any]]]:
+        info = _query_json_line("127.0.0.1", port, {"op": "list"}, timeout=0.9)
+        if not info or not info.get("ok"):
+            return port, None, []
+        sess_resp = _query_json_line("127.0.0.1", port, {"op": "sessions"}, timeout=0.5) or {}
+        sessions = list(sess_resp.get("sessions") or ()) if sess_resp.get("ok") else []
+        return port, info, sessions
+
+    results: list[tuple[int, dict[str, Any] | None, list[dict[str, Any]]]] = []
+    if probe_ports:
+        with ThreadPoolExecutor(max_workers=min(8, len(probe_ports))) as pool:
+            results = list(pool.map(_query_port, probe_ports))
+
+    for port, info, sessions in results:
         if not info or not info.get("ok"):
             continue
         if port == 7423:
@@ -176,8 +220,6 @@ def collect_status_snapshot(*, ports: tuple[int, ...] = RESOURCE_PORTS) -> TrayS
         if did in seen_ids:
             continue
         seen_ids.add(did)
-        sess_resp = _query_json_line("127.0.0.1", port, {"op": "sessions"}, timeout=0.18) or {}
-        sessions = list(sess_resp.get("sessions") or ()) if sess_resp.get("ok") else []
         devices.append(
             TrayDevice(
                 device_id=did,
@@ -506,12 +548,34 @@ def run_tray() -> int:
         return False
 
     def _poll_loop() -> None:
+        cached_by_port: dict[int, TrayDevice] = {}
+        misses_by_port: dict[int, int] = {}
         while True:
-            snap = collect_status_snapshot()
+            snap = collect_status_snapshot(check_proc_listen=True)
+            listening = _listening_ports_proc()
+            seen_ports = {d.port for d in snap.devices}
+            for d in snap.devices:
+                cached_by_port[d.port] = d
+                misses_by_port[d.port] = 0
+            # Keep peer devices across brief Wi-Fi SSH timeouts while the tunnel port is still LISTEN
+            for port, prev_dev in list(cached_by_port.items()):
+                if port in seen_ports:
+                    continue
+                if listening is not None and port not in listening:
+                    cached_by_port.pop(port, None)
+                    misses_by_port.pop(port, None)
+                    continue
+                misses_by_port[port] = misses_by_port.get(port, 0) + 1
+                if misses_by_port[port] < 3:
+                    snap.devices.append(prev_dev)
+                else:
+                    cached_by_port.pop(port, None)
+                    misses_by_port.pop(port, None)
+            snap.devices.sort(key=lambda d: d.port)
             GLib.idle_add(_apply_snapshot, snap)
-            time.sleep(2.0)
+            time.sleep(4.0)
 
-    initial = collect_status_snapshot()
+    initial = collect_status_snapshot(check_proc_listen=True)
     _apply_snapshot(initial)
     threading.Thread(target=_poll_loop, daemon=True).start()
     Gtk.main()
