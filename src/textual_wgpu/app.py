@@ -174,7 +174,23 @@ def _start_ui_ctl_server(app: Any) -> Any:
         return lambda: None
     sock_path = Path.home() / ".cache" / "textual-wgpu" / "ui_ctl.sock"
     sock_path.parent.mkdir(parents=True, exist_ok=True)
+    # Probe: if another process is already listening on this socket, don't steal it!
     if sock_path.exists():
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(0.1)
+        try:
+            probe.connect(str(sock_path))
+            probe.sendall(b'{"op":"ping"}\n')
+            probe.recv(256)
+            probe.close()
+            # Socket is alive — another app owns it. Don't unlink!
+            return lambda: None
+        except OSError:
+            try:
+                probe.close()
+            except OSError:
+                pass
+        # Socket file exists but nobody is listening — safe to unlink
         try:
             sock_path.unlink()
         except OSError:
@@ -210,8 +226,12 @@ def _start_ui_ctl_server(app: Any) -> Any:
                         break
                     buf.extend(b)
                 req = json.loads(buf.decode("utf-8", errors="replace") or "{}")
-                ok = _dispatch_ui_ctl_command(app, req) if isinstance(req, dict) else False
-                conn.sendall(b'{"ok":true}\n' if ok else b'{"ok":false}\n')
+                op = str(req.get("op") or "") if isinstance(req, dict) else ""
+                if op == "ping":
+                    conn.sendall(b'{"ok":true}\n')
+                else:
+                    ok = _dispatch_ui_ctl_command(app, req) if isinstance(req, dict) else False
+                    conn.sendall(b'{"ok":true}\n' if ok else b'{"ok":false}\n')
             except Exception:  # noqa: BLE001
                 try:
                     conn.sendall(b'{"ok":false}\n')

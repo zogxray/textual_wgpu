@@ -555,16 +555,13 @@ def discover_all_resources(
     *,
     driver: Any = None,
     ports: tuple[int, ...] | None = None,
-    probe_timeout: float = 0.8,
+    probe_timeout: float = 0.25,
     include_local_fallback: bool = True,
 ) -> list[ResourceEntry]:
     """Discover all independent resources across local and SSH-bridged devices."""
     from concurrent.futures import ThreadPoolExecutor
 
-    from .media_hub import ALL_RESOURCE_PORTS, ensure_resource_service, local_gpu_label, query_resource_server
-
-    if ports is None and "ANDROID_ROOT" not in os.environ:
-        ensure_resource_service()
+    from .media_hub import ALL_RESOURCE_PORTS, query_resource_server
 
     target_ports = tuple(ports) if ports is not None else ALL_RESOURCE_PORTS
     local = local_device_profile()
@@ -670,7 +667,7 @@ def discover_all_resources(
         for rkind, rid, rlabel in (
             ("speaker", "default", "Speaker"),
             ("clipboard", "default", "Clipboard"),
-            ("gpu", "vulkan", local_gpu_label()),
+            ("gpu", "vulkan", "Local GPU"),
         ):
             key = (local.device_id, rkind, rid)
             if key not in seen:

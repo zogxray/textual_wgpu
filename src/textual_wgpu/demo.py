@@ -1818,26 +1818,44 @@ class NodesScreen(Screen):
 
         drv = getattr(self.app, "_driver", None) if self.app is not None else None
         self._apps = discover_local_apps()
-        self._resources = discover_all_resources(driver=drv)
         self._sessions = self._collect_sessions()
         al = self.query_one("#apps-list", OptionList)
         al.clear_options()
         for a in self._apps:
             al.add_option(Option(f"{a.name} [{a.kind}] — {a.description}", id=a.app_id))
-        rl = self.query_one("#resources-list", OptionList)
-        rl.clear_options()
-        for r in self._resources:
-            rl.add_option(Option(self._resource_option_label(r), id=r.uid))
-        sl = self.query_one("#sessions-list", OptionList)
-        sl.clear_options()
-        if self._sessions:
-            for s in self._sessions:
-                sl.add_option(Option(self._session_option_label(s), id=str(s.get("session_id"))))
-        else:
-            sl.add_option(Option("(No spawned sessions yet — press N to spawn)", id="_none"))
-        self.query_one("#status", StatusBar).update(
-            f"F8 Directory · {len(self._resources)} resources · {len(self._sessions)} sessions · {len(self._apps)} apps",
-        )
+        self.query_one("#status", StatusBar).update("Scanning resources…")
+
+        def _worker() -> None:
+            resources = discover_all_resources(driver=drv)
+            sessions = self._collect_sessions()
+
+            def _apply() -> None:
+                self._resources = resources
+                self._sessions = sessions
+                rl = self.query_one("#resources-list", OptionList)
+                rl.clear_options()
+                for r in self._resources:
+                    rl.add_option(Option(self._resource_option_label(r), id=r.uid))
+                sl = self.query_one("#sessions-list", OptionList)
+                sl.clear_options()
+                if self._sessions:
+                    for s in self._sessions:
+                        sl.add_option(Option(self._session_option_label(s), id=str(s.get("session_id"))))
+                else:
+                    sl.add_option(Option("(No spawned sessions yet — press N to spawn)", id="_none"))
+                self.query_one("#status", StatusBar).update(
+                    f"F8 Directory · {len(self._resources)} resources · {len(self._sessions)} sessions · {len(self._apps)} apps",
+                )
+
+            loop = getattr(self.app, "_loop", None) if self.app is not None else None
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(_apply)
+            else:
+                _apply()
+
+        import threading
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def spawn_independent_session(self) -> None:
         from .remote.media_hub import resource_spawn_session
@@ -2041,28 +2059,58 @@ class ComposerScreen(Screen):
         from .remote.directory import ResourceEntry, discover_all_resources, local_device_profile
 
         drv = getattr(self.app, "_driver", None) if self.app is not None else None
-        all_res = discover_all_resources(driver=drv)
         local = local_device_profile()
-        self._eyes = [r for r in all_res if r.kind in ("camera", "clipboard", "files", "mic")]
-        self._eyes.append(
-            ResourceEntry(
-                device_id=local.device_id,
-                device_name=local.name,
-                device_kind=local.kind,
-                icon="🖥",
-                kind="ui_tree",
-                resource_id="active",
-                label="Live App UI State",
-                source="local",
-            ),
-        )
-        self._brains = [r for r in all_res if r.kind == "ai"]
-        self._speakers = [r for r in all_res if r.kind == "speaker"]
-        self._clipboards = [r for r in all_res if r.kind == "clipboard"]
-        if self._spk_idx >= len(self._speakers):
-            self._spk_idx = 0
-        if self._clip_idx >= len(self._clipboards):
-            self._clip_idx = 0
+
+        def _worker() -> None:
+            all_res = discover_all_resources(driver=drv)
+
+            def _apply() -> None:
+                self._eyes = [r for r in all_res if r.kind in ("camera", "clipboard", "files", "mic")]
+                self._eyes.append(
+                    ResourceEntry(
+                        device_id=local.device_id,
+                        device_name=local.name,
+                        device_kind=local.kind,
+                        icon="🖥",
+                        kind="ui_tree",
+                        resource_id="active",
+                        label="Live App UI State",
+                        source="local",
+                    ),
+                )
+                self._brains = [r for r in all_res if r.kind == "ai"]
+                self._speakers = [r for r in all_res if r.kind == "speaker"]
+                self._clipboards = [r for r in all_res if r.kind == "clipboard"]
+                if self._spk_idx >= len(self._speakers):
+                    self._spk_idx = 0
+                if self._clip_idx >= len(self._clipboards):
+                    self._clip_idx = 0
+                try:
+                    el = self.query_one("#comp-eyes-list", OptionList)
+                    el.clear_options()
+                    for r in self._eyes:
+                        el.add_option(Option(self._eye_label(r), id=r.uid))
+                    bl = self.query_one("#comp-brain-list", OptionList)
+                    bl.clear_options()
+                    for r in self._brains:
+                        bl.add_option(Option(self._brain_label(r), id=r.uid))
+                    self.query_one("#btn-comp-spk", Button).label = self._speaker_btn_label()
+                    self.query_one("#btn-comp-clip", Button).label = self._clip_btn_label()
+                    self.query_one("#status", StatusBar).update(
+                        f"F9 Composer · {len(self._eyes)} eyes · {len(self._brains)} AI brains · {len(self._speakers)} speakers",
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+            loop = getattr(self.app, "_loop", None) if self.app is not None else None
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(_apply)
+            else:
+                _apply()
+
+        import threading
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _eye_label(self, r: Any) -> str:
         return f"[{r.kind.upper():<7}] {r.display_label()}"
