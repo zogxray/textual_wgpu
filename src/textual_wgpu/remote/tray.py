@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-RESOURCE_PORTS = (7423, 7424, 7425, 7426, 7427)
+RESOURCE_PORTS = tuple(range(7423, 7456))
 PHONE_TUNNEL_PORT = 7422
 LOCAL_UI_PORT = 7420
 

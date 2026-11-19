@@ -366,7 +366,8 @@ impl russh::client::Handler for SshClientHandler {
         _originator_port: u32,
         _session: &mut russh::client::Session,
     ) -> Result<(), Self::Error> {
-        let target_port = if (7424..=7425).contains(&connected_port) {
+        // Resource Service reverse-forward ports: 7424..=7453 → route to local :7423
+        let target_port = if (7424..=7453).contains(&connected_port) {
             Some(7423u16)
         } else {
             self.reverse_local_port
@@ -819,20 +820,32 @@ pub fn spawn_ssh_session_cbs(
                 }
             }
 
-            // Expose local device Resource Service (127.0.0.1:7423) to remote peer at 7424..7425
-            for rport in 7424..=7425u32 {
+            // Expose local device Resource Service (127.0.0.1:7423) to remote peer.
+            // Try a wide range of reverse-forward ports so multiple phones can connect simultaneously.
+            let mut assigned_rport: Option<u32> = None;
+            for rport in 7424..=7453u32 {
                 if session.tcpip_forward("127.0.0.1", rport).await.is_ok() {
+                    assigned_rport = Some(rport);
                     break;
                 }
             }
+            if let Some(rp) = assigned_rport {
+                on_status(&format!("Resource tunnel: peer can reach us at :{rp}"));
+            }
             let session = Arc::new(session);
-            // Expose remote peer's Resource Service (127.0.0.1:7423) locally at 7426..7427 (non-overlapping!)
+            // Expose remote peer's Resource Service (127.0.0.1:7423) locally.
+            // Try a wide range of local listener ports so multiple phones can connect simultaneously.
             let mut res_listener = None;
-            for lport in 7426..=7427u16 {
+            let mut assigned_lport: Option<u16> = None;
+            for lport in 7426..=7455u16 {
                 if let Ok(l) = tokio::net::TcpListener::bind(("127.0.0.1", lport)).await {
                     res_listener = Some(l);
+                    assigned_lport = Some(lport);
                     break;
                 }
+            }
+            if let Some(lp) = assigned_lport {
+                on_status(&format!("Resource bridge: peer's :7423 at local :{lp}"));
             }
             let res_bridge_task = res_listener.map(|listener| {
                 let sess = Arc::clone(&session);
