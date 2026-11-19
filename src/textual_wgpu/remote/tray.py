@@ -569,6 +569,7 @@ def run_tray() -> int:
         _add_item("🎥 Open Media Studio (F7)", lambda: _navigate_or_open("media"))
         _add_item("🌐 Open Nodes & Resources (F8)", lambda: _navigate_or_open("nodes"))
         _add_item("🧩 Open Composer · Eyes/Knowledge/Hands (F9)", lambda: _navigate_or_open("composer"))
+        _add_item("🎵 Open Winamp Player · Cross-Device (F10)", lambda: _navigate_or_open("player"))
         _add_item("📱 Attach Phone Viewer (:7422)", lambda: _focus_or_spawn_viewer("127.0.0.1", PHONE_TUNNEL_PORT))
         menu.append(Gtk.SeparatorMenuItem())
         _add_item("▶ Start Local Resource Service (:7423)", _ensure_resource_service_bg)

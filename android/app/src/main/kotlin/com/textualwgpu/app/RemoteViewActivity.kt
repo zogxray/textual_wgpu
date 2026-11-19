@@ -303,6 +303,7 @@ class RemoteViewActivity : AppCompatActivity(), TwCallback {
             KeyEvent.KEYCODE_F8 -> "f8"
             KeyEvent.KEYCODE_F9 -> "f9"
             KeyEvent.KEYCODE_F10 -> "f10"
+            KeyEvent.KEYCODE_F10 -> "f10"
             else -> null
         }
         val ctrl = event.isCtrlPressed || ctrlArmed

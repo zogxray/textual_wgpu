@@ -351,6 +351,7 @@ fn map_ctl_mode_to_key(raw: &str) -> Option<&'static str> {
     else if raw.contains("\"media\"") { Some("f7") }
     else if raw.contains("\"nodes\"") { Some("f8") }
     else if raw.contains("\"composer\"") { Some("f9") }
+    else if raw.contains("\"player\"") { Some("f10") }
     else { None }
 }
 

@@ -238,6 +238,13 @@ def _builtin_apps() -> list[AppEntry]:
             kind="mode",
             target="composer",
         ),
+        AppEntry(
+            app_id="demo:player",
+            name="Winamp Player (Cross-Device)",
+            description="Cross-device file browser + parallel multi-speaker output",
+            kind="mode",
+            target="player",
+        ),
     ]
 
 

@@ -62,6 +62,7 @@ DEMO_LABELS: list[tuple[str, str]] = [
     ("media", "Media"),
     ("nodes", "Nodes & Apps"),
     ("composer", "Composer"),
+    ("player", "Player"),
 ]
 
 _OVERVIEW_MD = """\
@@ -80,12 +81,13 @@ _OVERVIEW_MD = """\
 | `F7` | **Media Studio** | Multi-cam independent planes (`C`/`B`), Mic (`M`), Speaker (`S`), Unified Files (`O`) |
 | `F8` | **Nodes & Apps** | Saved nodes, unified **System Resources**, App Directory & Running Sessions (`N`/`T`) |
 | `F9` | **Meta-OS Composer** | Compose **Eyes** (Cameras/Mic/Clip/Files/UI) + **Knowledge** (Local/Cloud AI) + **Hands** (Speaker/Clip/UI) |
+| `F10` | **Winamp Player** | Cross-device file browser + multi-speaker output · one file to N speakers in parallel |
 
 ## Navigation
 
 | Key | Action |
 |-----|--------|
-| `F1`–`F9` | Switch workspace |
+| `F1`–`F10` | Switch workspace |
 | `Tab` / `Shift+Tab` | Cycle focus across panels |
 | `↑` `↓` / `PgUp` `PgDn` / Wheel | Scroll or move selection |
 | `Ctrl+C` / Drag | Select & copy text |
@@ -2567,6 +2569,317 @@ class ComposerScreen(Screen):
         return super().on_key(key)
 
 
+class PlayerScreen(Screen):
+    """F10 · Winamp-style cross-device audio player.
+
+    Browse files on ANY connected device, pick audio, and play it to one or more
+    speaker resources in parallel — simultaneously. Each speaker output is independent.
+    """
+
+    DEFAULT_CSS = _SHARED_CSS + """
+    #player-main { height: 1fr; }
+    #player-left { width: 1fr; border: round $primary; }
+    #player-right { width: 1fr; border: round $primary; }
+    #player-left:focus-within, #player-right:focus-within { border: round $accent; }
+    #player-file-list { height: 1fr; }
+    #player-speaker-list { height: 1fr; }
+    #player-visualizer { height: 4; }
+    """
+
+    AUDIO_SUFFIXES = (".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".opus", ".wma")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._files: list[Any] = []  # ResourceEntry list (kind=files)
+        self._speakers: list[Any] = []  # ResourceEntry list (kind=speaker)
+        self._file_entries: list[tuple[bool, str, str, int]] = []  # (is_dir, name, path, size)
+        self._current_ep: tuple[str, int] | None = None  # (host, port) for current file device
+        self._current_path: str = ""
+        self._current_name: str = ""
+        self._pcm: bytes = b""
+        self._sr: int = 22050
+        self._ch: int = 1
+        self._dur: float = 0.0
+        self._env: list[float] = [0.05] * 48
+        self._playing: bool = False
+        self._pos: float = 0.0
+        self._active_sinks: list[Any] = []  # RemoteSpeakerSink instances
+        self._active_ep: tuple[str, int] | None = None  # speaker endpoint currently playing
+        self._tick_handle: Any = None
+
+    def compose(self):
+        yield _mode_bar(self, "player")
+
+        # Left: File browser (cross-device)
+        btn_open = Button("Open File (O)", id="btn-player-open", variant="primary", on_press=self.open_file)
+        btn_ref = Button("Refresh (R)", id="btn-player-refresh", on_press=self.refresh_resources)
+        file_btns = Horizontal(btn_open, btn_ref, id="player-file-btns")
+        file_btns.layout_hint_h = 36
+        file_list = OptionList(id="player-file-list")
+        file_info = Static("Pick a file from any device…", id="player-file-info")
+        left_inner = Vertical(file_btns, file_list, file_info, id="player-left-inner")
+        left = Panel(left_inner, title="FILE BROWSER · Any Device (O)", id="player-left")
+
+        # Right: Speaker selector + playback controls
+        spk_list = OptionList(id="player-speaker-list")
+        btn_play = Button("▶ Play (Space)", id="btn-player-play", variant="primary", on_press=self.toggle_play)
+        btn_stop = Button("■ Stop (X)", id="btn-player-stop", on_press=self.stop_play)
+        btn_add_spk = Button("+ Add Speaker (A)", id="btn-player-add", on_press=self.add_speaker_to_output)
+        btn_clear_spk = Button("Clear (Z)", id="btn-player-clear", on_press=self.clear_speakers)
+        ctrl_btns = Horizontal(btn_play, btn_stop, btn_add_spk, btn_clear_spk, id="player-ctrl-btns")
+        ctrl_btns.layout_hint_h = 36
+        now_playing = Static("No track loaded", id="player-now-playing")
+        bar = ProgressBar(100, id="player-progress")
+        spark = Sparkline(self._env, id="player-visualizer")
+        spark.layout_hint_h = 26
+        right_inner = Vertical(ctrl_btns, spk_list, now_playing, bar, spark, id="player-right-inner")
+        right = Panel(right_inner, title="OUTPUT · Speakers (parallel) · Space=Play · X=Stop", id="player-right")
+
+        yield Horizontal(left, right, id="player-main")
+        yield KeyBar([
+            ("O", "Open File", lambda: self.open_file()),
+            ("Space", "Play/Pause", lambda: self.toggle_play()),
+            ("X", "Stop", lambda: self.stop_play()),
+            ("A", "Add Speaker", lambda: self.add_speaker_to_output()),
+            ("Z", "Clear Speakers", lambda: self.clear_speakers()),
+            ("R", "Refresh", lambda: self.refresh_resources()),
+            ("Tab", "Panel", lambda: _focus_next(self)),
+            ("F1–F10", "Modes", None),
+            ("Q", "Quit", lambda: _quit(self)),
+        ])
+        yield StatusBar("F10 Player · Winamp-style · Cross-device files + parallel speaker output", id="status")
+
+    def on_screen_mount(self) -> None:
+        if self.app is not None and hasattr(self.app, "set_interval"):
+            self._tick_handle = self.app.set_interval(0.05, self._player_tick)
+        self.refresh_resources()
+
+    def on_screen_pause(self) -> None:
+        self.stop_play()
+        for s in self._active_sinks:
+            try:
+                s.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._active_sinks.clear()
+
+    def on_screen_unmount(self) -> None:
+        self.on_screen_pause()
+
+    def refresh_resources(self) -> None:
+        from .remote.directory import discover_all_resources
+
+        drv = getattr(self.app, "_driver", None) if self.app is not None else None
+        self._speakers = discover_all_resources(kind="speaker", driver=drv)
+        sl = self.query_one("#player-speaker-list", OptionList)
+        sl.clear_options()
+        for s in self._speakers:
+            sl.add_option(Option(f"{s.icon} {s.device_name} · Speaker (:{s.port})", id=s.uid))
+        self.query_one("#status", StatusBar).update(
+            f"F10 Player · {len(self._speakers)} speakers available · press O to open a file",
+        )
+
+    def open_file(self) -> None:
+        if self.app is None or not hasattr(self.app, "ask_open_file"):
+            return
+        suffixes = self.AUDIO_SUFFIXES
+        dl = Path.home() / "Downloads"
+        start_dir = dl if dl.is_dir() else Path.home()
+
+        def _on_path(p: Path | None) -> None:
+            if p is not None and p.is_file():
+                self._load_local_file(p)
+
+        self.app.ask_open_file(
+            start_dir,
+            _on_path,
+            title="Open Audio (Any Device)",
+            subtitle="Pick an audio file from any connected device",
+            suffixes=suffixes,
+            ok_label="Play",
+            unified_devices=True,
+            peer_file_callback=self._on_peer_file,
+        )
+
+    def _on_peer_file(self, name: str, data: bytes) -> None:
+        safe = Path(name or "audio.bin").name
+        dst = _media_asset_dir() / f"player_{safe}"
+        dst.write_bytes(data)
+        self._load_local_file(dst)
+
+    def _load_local_file(self, path: Path) -> None:
+        self.stop_play()
+        try:
+            from .remote.media_codec import decode_audio_file_pcm
+
+            pcm, sr, ch, env, dur = decode_audio_file_pcm(path, sample_rate=22050, channels=1)
+            self._pcm = pcm
+            self._sr = sr
+            self._ch = ch
+            self._env = env
+            self._dur = dur
+            self._current_name = path.name
+            self._current_path = str(path)
+            self._pos = 0.0
+            self._playing = False
+            self.query_one("#player-now-playing", Static).update(f"♪ {path.name} ({dur:.1f}s · {sr}Hz)")
+            self.query_one("#player-visualizer", Sparkline).data = list(env)
+            self.query_one("#player-progress", ProgressBar).progress = 0.0
+            self.query_one("#btn-player-play", Button).label = "▶ Play (Space)"
+            self.query_one("#status", StatusBar).update(f"F10 Player · loaded {path.name} · press Space to play")
+        except Exception as exc:  # noqa: BLE001
+            self.query_one("#status", StatusBar).update(f"F10 Player · load error: {exc}")
+
+    def toggle_play(self) -> None:
+        if not self._pcm:
+            self.query_one("#status", StatusBar).update("F10 Player · no track loaded (press O)")
+            return
+        if self._playing:
+            self._playing = False
+            self._stop_all_sinks()
+            self.query_one("#btn-player-play", Button).label = "▶ Play (Space)"
+            self.query_one("#status", StatusBar).update("F10 Player · paused")
+        else:
+            self._start_playback()
+            self.query_one("#btn-player-play", Button).label = "⏸ Pause (Space)"
+            self.query_one("#status", StatusBar).update(f"F10 Player · playing {self._current_name}")
+
+    def stop_play(self) -> None:
+        self._playing = False
+        self._pos = 0.0
+        self._stop_all_sinks()
+        try:
+            self.query_one("#btn-player-play", Button).label = "▶ Play (Space)"
+            self.query_one("#player-progress", ProgressBar).progress = 0.0
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _stop_all_sinks(self) -> None:
+        for s in self._active_sinks:
+            try:
+                s.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._active_sinks.clear()
+        if self.app is not None and hasattr(self.app, "stop_audio"):
+            self.app.stop_audio()
+
+    def _start_playback(self) -> None:
+        self._playing = True
+        # Play to local speaker (app.play_audio_pcm)
+        if self.app is not None and hasattr(self.app, "play_audio_pcm"):
+            self.app.play_audio_pcm(self._pcm, sample_rate=self._sr, channels=self._ch)
+        # Also play to any explicitly added remote speakers
+        for s in self._active_sinks:
+            try:
+                s.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._active_sinks.clear()
+        for ep_host, ep_port in self._added_speaker_eps:
+            try:
+                from .remote.media_hub import RemoteSpeakerSink
+
+                sink = RemoteSpeakerSink(ep_host, ep_port, sample_rate=self._sr, channels=self._ch)
+                threading.Thread(
+                    target=self._stream_to_sink,
+                    args=(sink, self._pcm, self._sr, self._ch),
+                    daemon=True,
+                ).start()
+                self._active_sinks.append(sink)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _stream_to_sink(self, sink: Any, pcm: bytes, sr: int, ch: int) -> None:
+        try:
+            chunk = 4096
+            for off in range(0, len(pcm), chunk):
+                if not self._playing:
+                    break
+                sink.write_pcm(pcm[off:off + chunk])
+        except Exception:  # noqa: BLE001
+            pass
+
+    _added_speaker_eps: list[tuple[str, int]] = []
+
+    def add_speaker_to_output(self) -> None:
+        sl = self.query_one("#player-speaker-list", OptionList)
+        idx = sl.highlighted
+        if idx is None or idx < 0 or idx >= len(self._speakers):
+            self.query_one("#status", StatusBar).update("F10 Player · select a speaker first")
+            return
+        spk = self._speakers[idx]
+        ep = (spk.host, spk.port)
+        if ep in self._added_speaker_eps:
+            self.query_one("#status", StatusBar).update(f"F10 Player · {spk.device_name} already added")
+            return
+        self._added_speaker_eps.append(ep)
+        self.query_one("#status", StatusBar).update(
+            f"F10 Player · + {spk.device_name} → {len(self._added_speaker_eps)} parallel speaker(s)",
+        )
+        # If currently playing, immediately start streaming to this new speaker
+        if self._playing:
+            try:
+                from .remote.media_hub import RemoteSpeakerSink
+
+                sink = RemoteSpeakerSink(spk.host, spk.port, sample_rate=self._sr, channels=self._ch)
+                threading.Thread(
+                    target=self._stream_to_sink,
+                    args=(sink, self._pcm, self._sr, self._ch),
+                    daemon=True,
+                ).start()
+                self._active_sinks.append(sink)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def clear_speakers(self) -> None:
+        self._added_speaker_eps.clear()
+        self._stop_all_sinks()
+        self.query_one("#status", StatusBar).update("F10 Player · cleared parallel speakers")
+
+    def _player_tick(self) -> None:
+        if self.app is None or getattr(self.app, "mode_key", None) != "player":
+            return
+        if self._playing:
+            self._pos += 0.05
+            if self._pos >= self._dur:
+                self._pos = self._dur
+                self._playing = False
+                self._stop_all_sinks()
+                try:
+                    self.query_one("#btn-player-play", Button).label = "▶ Play (Space)"
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                pct = min(100.0, (self._pos / max(0.1, self._dur)) * 100.0)
+                self.query_one("#player-progress", ProgressBar).progress = pct
+                shift = int((self._pos / max(0.1, self._dur)) * len(self._env)) % len(self._env)
+                self.query_one("#player-visualizer", Sparkline).data = self._env[shift:] + self._env[:shift]
+            except Exception:  # noqa: BLE001
+                pass
+
+    def on_key(self, key: str) -> bool:
+        if key == "o":
+            self.open_file()
+            return True
+        if key == "space":
+            self.toggle_play()
+            return True
+        if key == "x":
+            self.stop_play()
+            return True
+        if key == "a":
+            self.add_speaker_to_output()
+            return True
+        if key == "z":
+            self.clear_speakers()
+            return True
+        if key == "r":
+            self.refresh_resources()
+            return True
+        return super().on_key(key)
+
+
 def build_demo_app(theme: Theme | None = None, *, start: str = "overview") -> ModeApp:
     """Create the standalone ``textual-wgpu`` demo application."""
     modes: list[tuple[str, str, type[Screen]]] = [
@@ -2579,6 +2892,7 @@ def build_demo_app(theme: Theme | None = None, *, start: str = "overview") -> Mo
         ("media", "Media", MediaScreen),
         ("nodes", "Nodes & Apps", NodesScreen),
         ("composer", "Composer", ComposerScreen),
+        ("player", "Player", PlayerScreen),
     ]
     return ModeApp(
         modes,
