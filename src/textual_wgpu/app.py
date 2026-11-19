@@ -115,7 +115,7 @@ def _dispatch_ui_ctl_command(app: Any, req: dict[str, Any]) -> bool:
             app.request_draw()
 
         app.call_from_thread(_do_switch)
-        return True
+        return True  # Always return True so tray doesn't spawn a duplicate
 
     if op == "use_resource":
         rdata = req.get("resource") or {}
