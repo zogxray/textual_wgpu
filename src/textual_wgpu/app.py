@@ -587,6 +587,7 @@ class App:
         import subprocess
         import tempfile
         import wave
+        from pathlib import Path
 
         tmp = Path(tempfile.gettempdir()) / "textual-wgpu-local-audio.wav"
         with wave.open(str(tmp), "wb") as wf:
