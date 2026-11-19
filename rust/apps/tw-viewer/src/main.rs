@@ -943,14 +943,14 @@ fn main() {
             (target.to_string(), p)
         };
         spawn_tcp_session_cbs(host, port, cbs).expect("spawn tcp session")
+    } else if args.is_empty() {
+        // No args → just start the top-bar tray + resource service, don't open a window.
+        // The tray's menu opens the actual app/viewer when the user clicks.
+        eprintln!("[tw-viewer] Starting top-bar tray + resource service only.");
+        eprintln!("[tw-viewer] Use the tray menu to open apps, or run with --tcp / --ssh / --node to connect.");
+        return;
     } else {
-        let (program, cmd_args, envs) = if args.is_empty() {
-            (
-                find_hub_python(),
-                vec!["-m".into(), "textual_wgpu".into()],
-                vec![("TEXTUAL_WGPU_REMOTE".into(), "stdio".into())],
-            )
-        } else if args[0] == "--ssh" && args.len() >= 2 {
+        let (program, cmd_args, envs) = if args[0] == "--ssh" && args.len() >= 2 {
             let host = args[1].clone();
             let rest: Vec<String> = args[2..].iter().filter(|s| s.as_str() != "--").cloned().collect();
             let mut ssh_args = vec!["-T".into(), "-o".into(), "Compression=no".into(), host];
