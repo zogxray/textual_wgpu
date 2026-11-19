@@ -472,6 +472,7 @@ class ModeApp(App):
         ok_label: str = "Add",
         unified_devices: bool = False,
         peer_file_callback: Callable[[str, bytes], None] | None = None,
+        peer_folder_callback: Callable[[str, str, int, str], None] | None = None,
     ) -> None:
         """DirectoryTree + path field modal.
 
@@ -515,6 +516,7 @@ class ModeApp(App):
             "source_mode": "devices" if unified_devices else "local",
             "peer_stack": [],
             "peer_file_callback": peer_file_callback,
+            "peer_folder_callback": peer_folder_callback,
         }
         self._open_file_reload()
         self.request_draw()
@@ -780,6 +782,7 @@ class ModeApp(App):
         self._open_file["index"] = 0
         self._open_file["scroll"] = 0
         suf: set[str] = self._open_file["suffixes"]
+        kind = self._open_file.get("kind") or "file"
 
         def _worker() -> None:
             from .remote.media_hub import resource_fs_list
@@ -791,6 +794,8 @@ class ModeApp(App):
                 if modal is None or modal.get("source_mode") != "resource":
                     return
                 out: list[tuple[str, str, str]] = [("res_up", "", "↑ ..  (Back)")]
+                if kind == "folder" and req_path:
+                    out.append(("res_select_folder", req_path, f"✓ Select Folder ({Path(req_path).name or req_path})"))
                 for is_dir, name, fpath, size in raw_entries:
                     if is_dir:
                         out.append(("res_dir", fpath, f"▸ {name}/"))
@@ -806,11 +811,7 @@ class ModeApp(App):
                 modal["scroll"] = 0
                 self.request_draw()
 
-            loop = getattr(self, "_loop", None)
-            if loop is not None and loop.is_running():
-                loop.call_soon_threadsafe(_apply)
-            else:
-                _apply()
+            self.call_from_thread(_apply)
 
         threading.Thread(target=_worker, daemon=True).start()
         self.request_draw()
@@ -860,6 +861,8 @@ class ModeApp(App):
         self._open_file["source_mode"] = "android"
         self._open_file["path_value"] = f"phone://{req_path or 'Media'}"
         out: list[tuple[str, str, str]] = [("android_up", "", "↑ ..  (Back)")]
+        if (self._open_file.get("kind") or "file") == "folder" and req_path:
+            out.append(("android_select_folder", req_path, f"✓ Select Folder ({req_path})"))
         suf: set[str] = self._open_file["suffixes"]
         try:
             from com.textualwgpu.app import LocalMediaHelper  # type: ignore[import-not-found]
@@ -919,6 +922,25 @@ class ModeApp(App):
         """OK / Enter: validate and accept path."""
         if self._open_file is None:
             return
+        kind = self._open_file.get("kind") or "file"
+        src_mode = self._open_file.get("source_mode")
+        folder_cb = self._open_file.get("peer_folder_callback")
+        if kind == "folder" and callable(folder_cb):
+            if src_mode == "resource" and self._open_file.get("res_active"):
+                host, port = self._open_file["res_active"]
+                stack = self._open_file.get("res_stack") or [""]
+                fpath = stack[-1]
+                self._open_file = None
+                self._end_modal()
+                folder_cb("resource", host, int(port), fpath)
+                return
+            if src_mode in ("android", "peer"):
+                stack = self._open_file.get("peer_stack") or [""]
+                fpath = stack[-1]
+                self._open_file = None
+                self._end_modal()
+                folder_cb(str(src_mode), "", 0, fpath)
+                return
         text = raw.strip()
         if not text:
             return
@@ -1019,7 +1041,24 @@ class ModeApp(App):
             else:
                 self._open_file_load_resource_dir(ep[0], ep[1], stack[-1])
             return
+        if entry_kind == "res_select_folder":
+            ep = self._open_file.get("res_active")
+            folder_cb = self._open_file.get("peer_folder_callback")
+            self._open_file = None
+            self._end_modal()
+            if ep is not None and callable(folder_cb):
+                folder_cb("resource", ep[0], int(ep[1]), path_s)
+            return
+        if entry_kind == "android_select_folder":
+            folder_cb = self._open_file.get("peer_folder_callback")
+            self._open_file = None
+            self._end_modal()
+            if callable(folder_cb):
+                folder_cb("android", "", 0, path_s)
+            return
         if entry_kind == "res_file":
+            if kind == "folder":
+                return
             import threading
 
             ep = self._open_file.get("res_active")
@@ -1043,13 +1082,7 @@ class ModeApp(App):
                     if res is None:
                         return
                     name, data = res
-                    loop = getattr(self, "_loop", None)
-                    if loop is not None and loop.is_running():
-                        loop.call_soon_threadsafe(peer_cb, name, data)
-                        loop.call_soon_threadsafe(self.request_draw)
-                    else:
-                        peer_cb(name, data)
-                        self.request_draw()
+                    self.call_from_thread(peer_cb, name, data)
 
                 threading.Thread(target=_fetch, daemon=True).start()
             return

@@ -2606,19 +2606,29 @@ class PlayerScreen(Screen):
         self._active_sinks: list[Any] = []  # RemoteSpeakerSink instances
         self._active_ep: tuple[str, int] | None = None  # speaker endpoint currently playing
         self._tick_handle: Any = None
+        # Playlist support
+        self._playlist: list[Path] = []  # local paths to play in order
+        self._playlist_idx: int = -1
+        self._loading_playlist: bool = False
+        self._pending_remote_files: list[tuple[str, str, int, str, str]] = []
 
     def compose(self):
         yield _mode_bar(self, "player")
 
-        # Left: File browser (cross-device)
+        # Left: File browser / playlist (cross-device)
         btn_open = Button("Open File (O)", id="btn-player-open", variant="primary", on_press=self.open_file)
+        btn_folder = Button("Open Folder (F)", id="btn-player-folder", variant="primary", on_press=self.open_folder)
         btn_ref = Button("Refresh (R)", id="btn-player-refresh", on_press=self.refresh_resources)
-        file_btns = Horizontal(btn_open, btn_ref, id="player-file-btns")
-        file_btns.layout_hint_h = 36
+        btn_prev = Button("◀ Prev (,)", id="btn-player-prev", on_press=self.prev_track)
+        btn_next = Button("Next (.)", id="btn-player-next", on_press=self.next_track)
+        file_btns1 = Horizontal(btn_open, btn_folder, btn_ref, id="player-file-btns1")
+        file_btns1.layout_hint_h = 36
+        file_btns2 = Horizontal(btn_prev, btn_next, id="player-file-btns2")
+        file_btns2.layout_hint_h = 36
         file_list = OptionList(id="player-file-list")
-        file_info = Static("Pick a file from any device…", id="player-file-info")
-        left_inner = Vertical(file_btns, file_list, file_info, id="player-left-inner")
-        left = Panel(left_inner, title="FILE BROWSER · Any Device (O)", id="player-left")
+        file_info = Static("Press O for file or F for folder…", id="player-file-info")
+        left_inner = Vertical(file_btns1, file_btns2, file_list, file_info, id="player-left-inner")
+        left = Panel(left_inner, title="PLAYLIST · Any Device (O=file, F=folder)", id="player-left")
 
         # Right: Speaker selector + playback controls
         spk_list = OptionList(id="player-speaker-list")
@@ -2638,8 +2648,11 @@ class PlayerScreen(Screen):
         yield Horizontal(left, right, id="player-main")
         yield KeyBar([
             ("O", "Open File", lambda: self.open_file()),
+            ("F", "Open Folder", lambda: self.open_folder()),
             ("Space", "Play/Pause", lambda: self.toggle_play()),
             ("X", "Stop", lambda: self.stop_play()),
+            (",", "Prev", lambda: self.prev_track()),
+            (".", "Next", lambda: self.next_track()),
             ("A", "Add Speaker", lambda: self.add_speaker_to_output()),
             ("Z", "Clear Speakers", lambda: self.clear_speakers()),
             ("R", "Refresh", lambda: self.refresh_resources()),
@@ -2688,6 +2701,9 @@ class PlayerScreen(Screen):
 
         def _on_path(p: Path | None) -> None:
             if p is not None and p.is_file():
+                self._playlist = [p]
+                self._playlist_idx = 0
+                self._refresh_playlist_ui()
                 self._load_local_file(p)
 
         self.app.ask_open_file(
@@ -2700,6 +2716,172 @@ class PlayerScreen(Screen):
             unified_devices=True,
             peer_file_callback=self._on_peer_file,
         )
+
+    def open_folder(self) -> None:
+        if self.app is None or not hasattr(self.app, "ask_open_file"):
+            return
+        dl = Path.home() / "Downloads"
+        start_dir = dl if dl.is_dir() else Path.home()
+
+        def _on_folder(p: Path | None) -> None:
+            if p is not None and p.is_dir():
+                self._build_local_playlist(p)
+
+        self.app.ask_open_file(
+            start_dir,
+            _on_folder,
+            title="Open Folder for Playlist (Any Device)",
+            subtitle="Select a folder — all audio files inside become the playlist",
+            kind="folder",
+            ok_label="Scan",
+            unified_devices=True,
+            peer_folder_callback=self._on_peer_folder,
+        )
+
+    def _on_peer_folder(self, source: str, host: str, port: int, folder_path: str) -> None:
+        """Build playlist from a remote folder by listing + fetching audio files."""
+        self._loading_playlist = True
+        self.query_one("#status", StatusBar).update(f"Scanning {folder_path} for audio…")
+
+        def _worker() -> None:
+            if source == "resource":
+                from .remote.media_hub import resource_fs_list
+
+                entries = resource_fs_list(host, port, folder_path)
+            elif source == "android":
+                import json
+
+                from com.textualwgpu.app import LocalMediaHelper  # type: ignore[import-not-found]
+
+                raw = str(LocalMediaHelper.listMediaJson(folder_path) or "[]")
+                items = json.loads(raw)
+                entries = [
+                    (bool(it.get("d")), str(it.get("n") or ""), str(it.get("p") or ""), int(it.get("s") or 0))
+                    for it in items
+                ]
+            else:
+                entries = []
+
+            audio_files = [
+                (name, fpath, size)
+                for is_dir, name, fpath, size in entries
+                if not is_dir and Path(name).suffix.lower() in self.AUDIO_SUFFIXES
+            ]
+            audio_files.sort(key=lambda x: x[0].lower())
+
+            def _apply() -> None:
+                self._playlist = []
+                self._playlist_idx = -1
+                self._pending_remote_files = [(source, host, port, name, fpath) for name, fpath, _ in audio_files]
+                self._refresh_playlist_ui()
+                self._loading_playlist = False
+                if self._pending_remote_files:
+                    self.query_one("#status", StatusBar).update(
+                        f"F10 Player · {len(self._pending_remote_files)} tracks in playlist · press Space to play",
+                    )
+                    self.query_one("#player-file-info", Static).update(
+                        f"{len(self._pending_remote_files)} tracks ready · Space to play",
+                    )
+                else:
+                    self.query_one("#status", StatusBar).update("F10 Player · no audio files in folder")
+            self.call_from_thread(_apply)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _build_local_playlist(self, folder: Path) -> None:
+        self._playlist = []
+        self._playlist_idx = -1
+        for p in sorted(folder.iterdir(), key=lambda x: x.name.lower()):
+            if p.is_file() and p.suffix.lower() in self.AUDIO_SUFFIXES:
+                self._playlist.append(p)
+        self._pending_remote_files = []
+        self._refresh_playlist_ui()
+        if self._playlist:
+            self.query_one("#status", StatusBar).update(
+                f"F10 Player · {len(self._playlist)} tracks in {folder.name} · press Space to play",
+            )
+            self.query_one("#player-file-info", Static).update(
+                f"{len(self._playlist)} tracks from {folder.name}",
+            )
+        else:
+            self.query_one("#status", StatusBar).update(f"F10 Player · no audio files in {folder.name}")
+
+    def _refresh_playlist_ui(self) -> None:
+        fl = self.query_one("#player-file-list", OptionList)
+        fl.clear_options()
+        total = len(self._playlist) + len(getattr(self, "_pending_remote_files", []))
+        for i, p in enumerate(self._playlist):
+            marker = "▶ " if i == self._playlist_idx else "  "
+            fl.add_option(Option(f"{marker}{i+1}. {p.name}", id=f"pl_{i}"))
+        for i, rf in enumerate(getattr(self, "_pending_remote_files", [])):
+            name = rf[3]
+            fl.add_option(Option(f"  {len(self._playlist)+i+1}. {name} (remote)", id=f"rpl_{i}"))
+        if total == 0:
+            fl.add_option(Option("(empty playlist — press O for file or F for folder)", id="_empty"))
+
+    def prev_track(self) -> None:
+        if not self._playlist and not getattr(self, "_pending_remote_files", []):
+            return
+        if self._playlist_idx > 0:
+            self._play_track_at(self._playlist_idx - 1)
+        elif self._playlist_idx == 0 and self._pending_remote_files:
+            # Go back to remote files
+            self._play_next_remote()
+
+    def next_track(self) -> None:
+        if not self._playlist and not getattr(self, "_pending_remote_files", []):
+            return
+        if self._playlist_idx >= 0 and self._playlist_idx < len(self._playlist) - 1:
+            self._play_track_at(self._playlist_idx + 1)
+        elif self._pending_remote_files:
+            self._play_next_remote()
+
+    def _play_track_at(self, idx: int) -> None:
+        if idx < 0 or idx >= len(self._playlist):
+            return
+        self._playlist_idx = idx
+        self._refresh_playlist_ui()
+        self._load_local_file(self._playlist[idx])
+        self.toggle_play()
+
+    def _play_next_remote(self) -> None:
+        if not self._pending_remote_files:
+            return
+        source, host, port, name, fpath = self._pending_remote_files.pop(0)
+        self._refresh_playlist_ui()
+        self.query_one("#status", StatusBar).update(f"Loading {name} from remote device…")
+
+        def _fetch_and_play() -> None:
+            if source == "resource":
+                from .remote.media_hub import resource_fs_get
+
+                res = resource_fs_get(host, port, fpath)
+            elif source == "android":
+                from com.textualwgpu.app import LocalMediaHelper  # type: ignore[import-not-found]
+                from .remote.protocol import decode_client_file
+
+                packed = LocalMediaHelper.readMediaPack(fpath)
+                if packed is not None:
+                    n, raw = decode_client_file(bytes(packed))
+                    res = (n, raw)
+                else:
+                    res = None
+            else:
+                res = None
+            if res is None:
+                self.call_from_thread(self.next_track)
+                return
+
+            def _play() -> None:
+                safe_name, data = res
+                dst = _media_asset_dir() / f"player_{Path(safe_name).name}"
+                dst.write_bytes(data)
+                self._load_local_file(dst)
+                self.toggle_play()
+
+            self.call_from_thread(_play)
+
+        threading.Thread(target=_fetch_and_play, daemon=True).start()
 
     def _on_peer_file(self, name: str, data: bytes) -> None:
         safe = Path(name or "audio.bin").name
@@ -2843,6 +3025,7 @@ class PlayerScreen(Screen):
         if self._playing:
             self._pos += 0.05
             if self._pos >= self._dur:
+                # Track finished — auto-advance to next track
                 self._pos = self._dur
                 self._playing = False
                 self._stop_all_sinks()
@@ -2850,6 +3033,11 @@ class PlayerScreen(Screen):
                     self.query_one("#btn-player-play", Button).label = "▶ Play (Space)"
                 except Exception:  # noqa: BLE001
                     pass
+                # Auto-advance
+                if self._playlist_idx >= 0 and self._playlist_idx < len(self._playlist) - 1:
+                    self._play_track_at(self._playlist_idx + 1)
+                elif self._pending_remote_files:
+                    self._play_next_remote()
             try:
                 pct = min(100.0, (self._pos / max(0.1, self._dur)) * 100.0)
                 self.query_one("#player-progress", ProgressBar).progress = pct
@@ -2862,11 +3050,20 @@ class PlayerScreen(Screen):
         if key == "o":
             self.open_file()
             return True
+        if key == "f":
+            self.open_folder()
+            return True
         if key == "space":
             self.toggle_play()
             return True
         if key == "x":
             self.stop_play()
+            return True
+        if key == ",":
+            self.prev_track()
+            return True
+        if key == ".":
+            self.next_track()
             return True
         if key == "a":
             self.add_speaker_to_output()
