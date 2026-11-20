@@ -712,8 +712,6 @@ class ResourceServer:
                 return
             if op == "play_file":
                 # Tell this device to play a file, optionally from a remote file device.
-                # {"op":"play_file","path":"/path/to/audio.mp3","sr":22050,"ch":1,
-                #  "source_host":"127.0.0.1","source_port":7424,"source_path":"/remote/path.mp3"}
                 sr = int(req.get("sr") or 22050)
                 ch = int(req.get("ch") or 1)
                 local_path = str(req.get("path") or "")
@@ -721,42 +719,40 @@ class ResourceServer:
                 source_port = int(req.get("source_port") or 0)
                 source_path = str(req.get("source_path") or "")
 
-                def _decode_and_play() -> None:
-                    try:
-                        from .media_codec import decode_audio_file_pcm
-
-                        if local_path and Path(local_path).is_file():
-                            file_path = local_path
-                        elif source_host and source_port > 0 and source_path:
-                            from .media_hub import resource_fs_get
-
-                            res = resource_fs_get(source_host, source_port, source_path)
-                            if res is None:
-                                conn.sendall((json.dumps({"ok": False, "error": "file not found on source device"}) + "\n").encode("utf-8"))
-                                return
-                            name, data = res
-                            tmp = cache_dir() / f"play_file_{name}"
-                            tmp.write_bytes(data)
-                            file_path = tmp
-                        else:
-                            conn.sendall(b'{"ok":false,"error":"no path or source specified"}\n')
+                # Resolve the file path
+                try:
+                    if local_path and Path(local_path).is_file():
+                        file_path = local_path
+                    elif source_host and source_port > 0 and source_path:
+                        res = resource_fs_get(source_host, source_port, source_path)
+                        if res is None:
+                            conn.sendall(b'{"ok":false,"error":"file not found on source device"}\n')
                             return
+                        name, data = res
+                        tmp = cache_dir() / f"play_file_{name}"
+                        tmp.write_bytes(data)
+                        file_path = str(tmp)
+                    else:
+                        conn.sendall(b'{"ok":false,"error":"no path or source specified"}\n')
+                        return
 
-                        pcm, dec_sr, dec_ch, env, dur = decode_audio_file_pcm(file_path, sample_rate=sr, channels=ch)
-                        sink = self._speaker_sink_factory(sr, ch)
-                        conn.sendall((json.dumps({"ok": True, "name": Path(file_path).name, "dur": dur, "size": len(pcm)}) + "\n").encode("utf-8"))
-                        chunk = 8192
-                        for off in range(0, len(pcm), chunk):
-                            sink.write(pcm[off:off + chunk])
-                        sink.close()
-                    except Exception as exc:  # noqa: BLE001
-                        try:
-                            conn.sendall((json.dumps({"ok": False, "error": str(exc)}) + "\n").encode("utf-8"))
-                        except OSError:
-                            pass
+                    # Decode locally
+                    from .media_codec import decode_audio_file_pcm
 
-                conn.settimeout(None)
-                threading.Thread(target=_decode_and_play, daemon=True).start()
+                    pcm, dec_sr, dec_ch, env, dur = decode_audio_file_pcm(file_path, sample_rate=sr, channels=ch)
+                    # Send response BEFORE playing so client doesn't block
+                    conn.sendall((json.dumps({"ok": True, "name": Path(file_path).name, "dur": dur, "size": len(pcm)}) + "\n").encode("utf-8"))
+                    # Now play on local speaker (synchronous — blocks until done)
+                    sink = self._speaker_sink_factory(sr, ch)
+                    chunk = 8192
+                    for off in range(0, len(pcm), chunk):
+                        sink.write(pcm[off:off + chunk])
+                    sink.close()
+                except Exception as exc:  # noqa: BLE001
+                    try:
+                        conn.sendall((json.dumps({"ok": False, "error": str(exc)}) + "\n").encode("utf-8"))
+                    except OSError:
+                        pass
                 return
             if op == "ai_infer":
                 from .ai_resource import run_ai_inference
@@ -1413,9 +1409,10 @@ def resource_play_file(
     another device's Resource Service (``source_host``/``source_port``/``source_path``).
 
     Returns {"ok": true, "name": ..., "dur": ..., "size": ...} on success.
+    Blocks until the speaker device finishes decoding (playback may still be ongoing).
     """
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(5.0)
+    s.settimeout(30.0)
     try:
         s.connect((speaker_host, int(speaker_port)))
         req: dict[str, Any] = {
