@@ -2580,6 +2580,7 @@ class PlayerScreen(Screen):
     #player-main { height: 1fr; }
     #player-left { width: 1fr; border: round $primary; }
     #player-right { width: 1fr; border: round $primary; }
+    #player-pipeline { height: 8; border: round $accent; }
     #player-left:focus-within, #player-right:focus-within { border: round $accent; }
     #player-file-list { height: 1fr; }
     #player-speaker-list { height: 1fr; }
@@ -2590,10 +2591,10 @@ class PlayerScreen(Screen):
 
     def __init__(self) -> None:
         super().__init__()
-        self._files: list[Any] = []  # ResourceEntry list (kind=files)
-        self._speakers: list[Any] = []  # ResourceEntry list (kind=speaker)
-        self._file_entries: list[tuple[bool, str, str, int]] = []  # (is_dir, name, path, size)
-        self._current_ep: tuple[str, int] | None = None  # (host, port) for current file device
+        self._files: list[Any] = []
+        self._speakers: list[Any] = []
+        self._file_entries: list[tuple[bool, str, str, int]] = []
+        self._current_ep: tuple[str, int] | None = None
         self._current_path: str = ""
         self._current_name: str = ""
         self._pcm: bytes = b""
@@ -2603,15 +2604,21 @@ class PlayerScreen(Screen):
         self._env: list[float] = [0.05] * 48
         self._playing: bool = False
         self._pos: float = 0.0
-        self._active_sinks: list[Any] = []  # RemoteSpeakerSink instances
-        self._active_ep: tuple[str, int] | None = None  # speaker endpoint currently playing
+        self._active_sinks: list[Any] = []
+        self._active_ep: tuple[str, int] | None = None
         self._tick_handle: Any = None
-        # Playlist support
-        self._playlist: list[Path] = []  # local paths to play in order
+        self._playlist: list[Path] = []
         self._playlist_idx: int = -1
         self._loading_playlist: bool = False
         self._pending_remote_files: list[tuple[str, str, int, str, str]] = []
-        self._current_source: dict[str, Any] = {}  # where the current track came from
+        self._current_source: dict[str, Any] = {}
+        # Pipeline status tracking
+        self._pipeline_input_device: str = ""      # e.g. "💻 ZOG · /home/..."
+        self._pipeline_input_file: str = ""        # e.g. "song.mp3 (3.2MB)"
+        self._pipeline_stream: str = ""            # e.g. "ffmpeg → pw-play (44.1kHz stereo)"
+        self._pipeline_output_device: str = ""     # e.g. "💻 ZOG · Speaker"
+        self._pipeline_output_sink: str = ""       # e.g. "Tiger Lake-H Speaker"
+        self._pipeline_status: str = "idle"        # idle | loading | playing | error | finished
 
     def compose(self):
         yield _mode_bar(self, "player")
@@ -2631,7 +2638,7 @@ class PlayerScreen(Screen):
         left_inner = Vertical(file_btns1, file_btns2, file_list, file_info, id="player-left-inner")
         left = Panel(left_inner, title="PLAYLIST · Any Device (O=file, F=folder)", id="player-left")
 
-        # Right: Speaker selector + playback controls
+        # Right: Speaker selector + playback controls + pipeline diagram
         spk_list = OptionList(id="player-speaker-list")
         btn_play = Button("▶ Play (Space)", id="btn-player-play", variant="primary", on_press=self.toggle_play)
         btn_stop = Button("■ Stop (X)", id="btn-player-stop", on_press=self.stop_play)
@@ -2639,11 +2646,15 @@ class PlayerScreen(Screen):
         btn_clear_spk = Button("Clear (Z)", id="btn-player-clear", on_press=self.clear_speakers)
         ctrl_btns = Horizontal(btn_play, btn_stop, btn_add_spk, btn_clear_spk, id="player-ctrl-btns")
         ctrl_btns.layout_hint_h = 36
+
+        # Pipeline status diagram (shows the full audio routing path)
+        pipeline = RichText(self._build_pipeline_text(), id="player-pipeline", can_focus=False)
+
         now_playing = Static("No track loaded", id="player-now-playing")
         bar = ProgressBar(100, id="player-progress")
         spark = Sparkline(self._env, id="player-visualizer")
         spark.layout_hint_h = 26
-        right_inner = Vertical(ctrl_btns, spk_list, now_playing, bar, spark, id="player-right-inner")
+        right_inner = Vertical(ctrl_btns, pipeline, spk_list, now_playing, bar, spark, id="player-right-inner")
         right = Panel(right_inner, title="OUTPUT · Speakers (parallel) · Space=Play · X=Stop", id="player-right")
 
         yield Horizontal(left, right, id="player-main")
@@ -2679,6 +2690,74 @@ class PlayerScreen(Screen):
 
     def on_screen_unmount(self) -> None:
         self.on_screen_pause()
+
+    def _build_pipeline_text(self) -> Text:
+        """Build the audio routing pipeline diagram."""
+        from rich.style import Style
+        from rich.text import Text as RichText
+
+        t = RichText()
+        t.append(" AUDIO PIPELINE\n", style=Style(bold=True, color="cyan"))
+
+        # Status indicator
+        status_colors = {
+            "idle": ("dim", "○ idle"),
+            "loading": ("yellow", "◐ loading…"),
+            "playing": ("green", "▶ playing"),
+            "error": ("red", "✗ error"),
+            "finished": ("blue", "■ finished"),
+        }
+        color, icon = status_colors.get(self._pipeline_status, ("dim", "○ idle"))
+        t.append(f"  {icon}\n", style=Style(color=color, bold=True))
+
+        # Input device (where the file lives)
+        inp = self._pipeline_input_device or "(no file loaded)"
+        t.append("  📁 INPUT DEVICE  ", style=Style(bold=True, color="cyan"))
+        t.append(f"{inp}\n", style=Style(dim=True))
+
+        # Input file
+        f = self._pipeline_input_file or "—"
+        t.append("  🎵 INPUT FILE    ", style=Style(bold=True, color="cyan"))
+        t.append(f"{f}\n", style=Style(dim=True))
+
+        # Stream path (how the audio is decoded and transported)
+        s = self._pipeline_stream or "—"
+        t.append("  📡 STREAM PATH   ", style=Style(bold=True, color="cyan"))
+        t.append(f"{s}\n", style=Style(dim=True))
+
+        # Output device (which speaker resource is selected)
+        o = self._pipeline_output_device or "(no speaker — using default local output)"
+        t.append("  🔊 OUTPUT DEVICE ", style=Style(bold=True, color="cyan"))
+        t.append(f"{o}\n", style=Style(dim=True))
+
+        # Output sound device (actual hardware sink, e.g. PipeWire sink name)
+        sk = self._pipeline_output_sink or "—"
+        t.append("  🎧 OUTPUT SINK   ", style=Style(bold=True, color="cyan"))
+        t.append(f"{sk}\n", style=Style(dim=True))
+
+        # Show added parallel speakers
+        if self._added_speaker_eps:
+            t.append(f"  └─ {len(self._added_speaker_eps)} parallel speaker(s) added\n", style=Style(color="yellow"))
+
+        # Show playlist status
+        total = len(self._playlist) + len(getattr(self, "_pending_remote_files", []))
+        if total > 0:
+            cur = self._playlist_idx + 1 if self._playlist_idx >= 0 else 0
+            t.append(f"  📋 PLAYLIST      ", style=Style(bold=True, color="cyan"))
+            t.append(f"{cur}/{total} tracks\n", style=Style(dim=True))
+
+        return t
+
+    def _update_pipeline(self) -> None:
+        """Update the pipeline diagram widget on the UI."""
+        try:
+            self.query_one("#player-pipeline", RichText).update(self._build_pipeline_text(), home=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _set_pipeline_status(self, status: str) -> None:
+        self._pipeline_status = status
+        self._update_pipeline()
 
     def refresh_resources(self) -> None:
         import threading
@@ -2815,15 +2894,19 @@ class PlayerScreen(Screen):
                 self._playlist.append(p)
         self._pending_remote_files = []
         self._refresh_playlist_ui()
-        if self._playlist:
+        total = len(self._playlist)
+        if total:
             self.query_one("#status", StatusBar).update(
-                f"F10 Player · {len(self._playlist)} tracks in {folder.name} · press Space to play",
+                f"F10 Player · {total} tracks in {folder.name} · press Space to play",
             )
             self.query_one("#player-file-info", Static).update(
-                f"{len(self._playlist)} tracks from {folder.name}",
+                f"{total} tracks from {folder.name}",
             )
+            self._pipeline_input_device = f"💻 Local · {folder}"
+            self._set_pipeline_status("idle")
         else:
             self.query_one("#status", StatusBar).update(f"F10 Player · no audio files in {folder.name}")
+            self._set_pipeline_status("idle")
 
     def _refresh_playlist_ui(self) -> None:
         fl = self.query_one("#player-file-list", OptionList)
@@ -2914,6 +2997,9 @@ class PlayerScreen(Screen):
         # Clear focus so Space/Pause keys reach the screen instead of a button
         if self.app is not None:
             self.app.set_focus(None)
+        self._set_pipeline_status("loading")
+        self._pipeline_input_file = path.name
+        self._pipeline_input_device = f"💻 Local · {path.parent}"
         # For local playback we don't need to decode the whole file upfront —
         # pw-play can decode MP3/OGG/FLAC/WAV natively.
         # We only need the duration for the progress bar, so probe quickly.
@@ -3006,6 +3092,7 @@ class PlayerScreen(Screen):
         self._playing = False
         self._pos = 0.0
         self._stop_all_sinks()
+        self._set_pipeline_status("idle")
         try:
             self.query_one("#btn-player-play", Button).label = "▶ Play (Space)"
             self.query_one("#player-progress", ProgressBar).progress = 0.0
@@ -3024,21 +3111,65 @@ class PlayerScreen(Screen):
 
     def _start_playback(self) -> None:
         self._playing = True
+        self._set_pipeline_status("loading")
+
+        # Determine output device label
+        if self._added_speaker_eps:
+            spk_labels = []
+            for h, p, _ in self._added_speaker_eps:
+                for s in self._speakers:
+                    if s.host == h and s.port == p:
+                        spk_labels.append(f"{s.icon} {s.device_name}")
+                        break
+                else:
+                    spk_labels.append(f":{p}")
+            self._pipeline_output_device = " + ".join(spk_labels)
+        else:
+            self._pipeline_output_device = "💻 Local default speaker"
+
+        # Detect PipeWire default sink name
+        try:
+            import subprocess as _sp
+
+            r = _sp.run(["pw-cli", "dump", "short"], capture_output=True, text=True, timeout=0.5)
+            if r.returncode == 0:
+                for ln in r.stdout.splitlines():
+                    if "audio_sink" in ln and "[link]" not in ln:
+                        parts = ln.split('"')
+                        if len(parts) >= 2:
+                            self._pipeline_output_sink = parts[1]
+                            break
+            if not self._pipeline_output_sink:
+                self._pipeline_output_sink = "PipeWire default"
+        except Exception:  # noqa: BLE001
+            self._pipeline_output_sink = "PipeWire default"
 
         # Local speaker: play file directly via ffmpeg → pw-play (no WAV temp file!)
         if self.app is not None:
             if self._pcm:
-                # We have decoded PCM (remote file or fallback) — use play_audio_pcm
                 if hasattr(self.app, "play_audio_pcm"):
                     self.app.play_audio_pcm(self._pcm, sample_rate=self._sr, channels=self._ch)
+                    self._pipeline_stream = f"PCM {self._sr}Hz {self._ch}ch → pw-play"
             elif self._current_path and hasattr(self.app, "play_audio_file"):
-                # Stream-decode the file directly — no temp WAV!
                 ok, detail = self.app.play_audio_file(self._current_path)
                 if not ok:
                     self.query_one("#status", StatusBar).update(f"F10 Player · ❌ {detail}")
+                    self._set_pipeline_status("error")
+                    self._pipeline_stream = f"❌ {detail}"
                     self._playing = False
                     self.query_one("#btn-player-play", Button).label = "▶ Play (Space)"
                     return
+                self._pipeline_stream = detail
+            # Query real backend
+            if hasattr(self.app, "audio_playback_status"):
+                _alive, backend, err = self.app.audio_playback_status()
+                if backend:
+                    self._pipeline_stream = backend
+                if err:
+                    self._pipeline_stream = f"❌ {err}"
+                    self._set_pipeline_status("error")
+
+        self._set_pipeline_status("playing")
 
         # For remote speakers: tell each speaker device to play the file directly
         for s in self._active_sinks:
@@ -3120,6 +3251,8 @@ class PlayerScreen(Screen):
         # Build file_info so the speaker device knows where to fetch the file
         file_info = self._build_file_info()
         self._added_speaker_eps.append((spk.host, spk.port, file_info))
+        self._pipeline_output_device = f"{spk.icon} {spk.device_name}"
+        self._update_pipeline()
         self.query_one("#status", StatusBar).update(
             f"F10 Player · + {spk.device_name} → {len(self._added_speaker_eps)} parallel speaker(s)",
         )
@@ -3153,33 +3286,34 @@ class PlayerScreen(Screen):
         self._added_speaker_eps.clear()
         self._stop_all_sinks()
         self.query_one("#status", StatusBar).update("F10 Player · cleared parallel speakers")
+
     def _player_tick(self) -> None:
         if self.app is None or getattr(self.app, "mode_key", None) != "player":
             return
         if self._playing:
             self._pos += 0.05
-            # Check if audio process has exited (track finished)
             if self.app is not None and hasattr(self.app, "audio_playback_status"):
                 is_alive, backend, err = self.app.audio_playback_status()
                 if err and not is_alive:
                     self._playing = False
                     self._stop_all_sinks()
+                    self._set_pipeline_status("error")
+                    self._pipeline_stream = f"❌ {err}"
                     try:
                         self.query_one("#btn-player-play", Button).label = "▶ Play (Space)"
                         self.query_one("#status", StatusBar).update(f"F10 Player · ❌ {err}")
                     except Exception:  # noqa: BLE001
                         pass
                 elif not is_alive and not self._added_speaker_eps:
-                    # Local playback finished — auto-advance
                     if self._pos >= self._dur:
                         self._pos = self._dur
                         self._playing = False
                         self._stop_all_sinks()
+                        self._set_pipeline_status("finished")
                         try:
                             self.query_one("#btn-player-play", Button).label = "▶ Play (Space)"
                         except Exception:  # noqa: BLE001
                             pass
-                        # Auto-advance
                         if self._playlist_idx >= 0 and self._playlist_idx < len(self._playlist) - 1:
                             self._play_track_at(self._playlist_idx + 1)
                         elif self._pending_remote_files:
@@ -3189,6 +3323,10 @@ class PlayerScreen(Screen):
                 self.query_one("#player-progress", ProgressBar).progress = pct
                 shift = int((self._pos / max(0.1, self._dur)) * len(self._env)) % len(self._env)
                 self.query_one("#player-visualizer", Sparkline).data = self._env[shift:] + self._env[:shift]
+                cnt = getattr(self, "_pipeline_tick_count", 0) + 1
+                self._pipeline_tick_count = cnt
+                if cnt % 5 == 0:
+                    self._update_pipeline()
             except Exception:  # noqa: BLE001
                 pass
 
