@@ -575,106 +575,243 @@ class App:
             return clip
         return self._clipboard or None
 
-    def play_audio_pcm(self, pcm: bytes, *, sample_rate: int = 22050, channels: int = 1) -> None:
+    def play_audio_pcm(self, pcm: bytes, *, sample_rate: int = 22050, channels: int = 1) -> bool:
         """Play PCM16 audio locally or stream it to the remote client when remote."""
         drv = getattr(self, "_driver", None)
         on_play = getattr(drv, "on_audio_play", None)
         if callable(on_play):
             on_play(pcm, sample_rate=sample_rate, channels=channels)
-            return
-        self.stop_audio()
-        import shutil
-        import subprocess
-
-        # Stream PCM directly to pw-play stdin — no WAV temp file needed
-        for tool in ("pw-play", "paplay", "aplay"):
-            exe = shutil.which(tool)
-            if not exe:
-                continue
-            args = [exe]
-            if tool == "pw-play":
-                args = ["pw-play", "--format=s16", f"--rate={int(sample_rate)}", f"--channels={int(max(1, channels))}", "-"]
-            elif tool == "paplay":
-                args = ["paplay", "--raw", "--format=s16le", f"--rate={int(sample_rate)}", f"--channels={int(max(1, channels))}"]
-            elif tool == "aplay":
-                args = ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", str(int(sample_rate)), "-c", str(int(max(1, channels))), "-"]
-            try:
-                self._audio_proc = subprocess.Popen(
-                    args,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                # Write PCM in a thread so we don't block the UI loop
-                import threading
-
-                proc = self._audio_proc
-
-                def _write() -> None:
-                    try:
-                        if proc.stdin is not None:
-                            proc.stdin.write(pcm)
-                            proc.stdin.close()
-                            proc.wait(timeout=10)
-                    except Exception:  # noqa: BLE001
-                        pass
-
-                threading.Thread(target=_write, daemon=True).start()
-                break
-            except OSError:
-                self._audio_proc = None
-
-    def play_audio_file(self, path: str) -> bool:
-        """Play an audio file (MP3, WAV, OGG, etc.) directly via pw-play/ffplay — no temp WAV.
-
-        Returns True if playback started successfully.
-        """
-        drv = getattr(self, "_driver", None)
-        on_play = getattr(drv, "on_audio_play", None)
-        if callable(on_play):
-            # Remote: decode to PCM and send (fallback)
-            from .remote.media_codec import decode_audio_file_pcm
-            pcm, sr, ch, _env, _dur = decode_audio_file_pcm(path, sample_rate=22050, channels=1)
-            on_play(pcm, sample_rate=sr, channels=ch)
+            self._audio_backend = "remote AUDIO_PCM"
+            self._audio_error = ""
             return True
         self.stop_audio()
         import shutil
         import subprocess
+        import threading
 
-        # Try pw-play directly (PipeWire can decode MP3/OGG/FLAC/WAV natively)
-        for tool, args in (
-            ("pw-play", ["pw-play", path]),
-            ("ffplay", ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path]),
-            ("aplay", ["aplay", "-q", path]),
-        ):
+        sr = max(8000, int(sample_rate))
+        ch = max(1, min(2, int(channels)))
+        for tool in ("pw-play", "paplay", "aplay"):
             exe = shutil.which(tool)
             if not exe:
                 continue
+            if tool == "pw-play":
+                args = [exe, "--media-role=Music", "--format=s16", f"--rate={sr}", f"--channels={ch}", "-"]
+            elif tool == "paplay":
+                args = [exe, "--raw", "--format=s16le", f"--rate={sr}", f"--channels={ch}"]
+            else:
+                args = [exe, "-q", "-t", "raw", "-f", "S16_LE", "-r", str(sr), "-c", str(ch), "-"]
             try:
-                self._audio_proc = subprocess.Popen(
+                proc = subprocess.Popen(
                     args,
+                    stdin=subprocess.PIPE,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                 )
+                self._audio_proc = proc
+                self._audio_procs = [proc]
+                self._audio_backend = f"{tool} ({sr}Hz {ch}ch)"
+                self._audio_error = ""
+
+                def _write(p: subprocess.Popen = proc, name: str = tool) -> None:
+                    try:
+                        if p.stdin is not None:
+                            for off in range(0, len(pcm), 8192):
+                                if p.poll() is not None:
+                                    break
+                                p.stdin.write(pcm[off : off + 8192])
+                            p.stdin.close()
+                        err = p.stderr.read().decode("utf-8", errors="replace").strip() if p.stderr else ""
+                        rc = p.wait()
+                        if rc not in (0, -15, -9, 143) and err:
+                            self._audio_error = f"{name} (rc={rc}): {err.splitlines()[-1]}"
+                    except OSError:
+                        pass
+
+                threading.Thread(target=_write, daemon=True).start()
                 return True
-            except OSError:
-                continue
+            except OSError as exc:
+                self._audio_error = f"{tool}: {exc}"
+                self._audio_proc = None
+                self._audio_procs = []
+        self._audio_error = "No audio output backend found (pw-play / paplay / aplay)"
         return False
 
+    def play_audio_file(
+        self,
+        path: str,
+        *,
+        start_sec: float = 0.0,
+        on_error: Callable[[str], None] | None = None,
+    ) -> tuple[bool, str]:
+        """Stream-decode and play any audio file (MP3, M4A, FLAC, OGG, WAV) with zero temp WAV files.
+
+        Returns ``(ok, detail_or_error)``.
+        """
+        from pathlib import Path
+        import shutil
+        import subprocess
+        import threading
+
+        p = Path(path).expanduser()
+        if not p.is_file():
+            msg = f"Audio file not found: {path}"
+            self._audio_error = msg
+            return False, msg
+
+        drv = getattr(self, "_driver", None)
+        on_play = getattr(drv, "on_audio_play", None)
+        if callable(on_play):
+            try:
+                from .remote.media_codec import decode_audio_file_pcm
+
+                pcm, sr, ch, _env, _dur = decode_audio_file_pcm(p, sample_rate=22050, channels=1)
+                if start_sec > 0.05:
+                    skip = int(start_sec * sr * ch * 2) & ~1
+                    pcm = pcm[skip:]
+                on_play(pcm, sample_rate=sr, channels=ch)
+                self._audio_backend = f"remote AUDIO_PCM ({sr}Hz)"
+                self._audio_error = ""
+                return True, self._audio_backend
+            except Exception as exc:  # noqa: BLE001
+                msg = f"Remote audio decode failed: {exc}"
+                self._audio_error = msg
+                return False, msg
+
+        self.stop_audio()
+        ff = shutil.which("ffmpeg")
+        pw = shutil.which("pw-play")
+        pa = shutil.which("paplay")
+        ap = shutil.which("aplay")
+        ffp = shutil.which("ffplay")
+
+        def _watch_proc(proc: subprocess.Popen, label: str) -> None:
+            try:
+                err_raw = proc.stderr.read() if proc.stderr is not None else b""
+                rc = proc.wait()
+                if rc not in (0, -15, -9, 143, 255):
+                    err_txt = err_raw.decode("utf-8", errors="replace").strip()
+                    last_ln = err_txt.splitlines()[-1] if err_txt else f"exit code {rc}"
+                    msg = f"{label}: {last_ln}"
+                    self._audio_error = msg
+                    if callable(on_error):
+                        self.call_from_thread(on_error, msg)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 1) Universal streaming pipeline: ffmpeg -> pw-play / paplay / aplay (supports MP3, M4A, AAC, OGG, FLAC, WAV, WMA + seeking)
+        sink_cmd: list[str] | None = None
+        sink_name = ""
+        if pw:
+            sink_cmd = [pw, "--media-role=Music", "--format=s16", "--rate=44100", "--channels=2", "-"]
+            sink_name = "pw-play"
+        elif pa:
+            sink_cmd = [pa, "--raw", "--format=s16le", "--rate=44100", "--channels=2"]
+            sink_name = "paplay"
+        elif ap:
+            sink_cmd = [ap, "-q", "-t", "raw", "-f", "S16_LE", "-r", "44100", "-c", "2", "-"]
+            sink_name = "aplay"
+
+        if ff and sink_cmd is not None:
+            dec_cmd = [ff, "-nostdin", "-v", "error"]
+            if start_sec > 0.05:
+                dec_cmd.extend(["-ss", f"{start_sec:.2f}"])
+            dec_cmd.extend(["-i", str(p), "-vn", "-f", "s16le", "-ar", "44100", "-ac", "2", "pipe:1"])
+            try:
+                dec_proc = subprocess.Popen(
+                    dec_cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                sink_proc = subprocess.Popen(
+                    sink_cmd,
+                    stdin=dec_proc.stdout,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                if dec_proc.stdout is not None:
+                    dec_proc.stdout.close()  # Allow SIGPIPE if sink exits
+                self._audio_proc = sink_proc
+                self._audio_procs = [dec_proc, sink_proc]
+                self._audio_backend = f"ffmpeg → {sink_name} (44.1kHz stereo)"
+                self._audio_error = ""
+                threading.Thread(target=_watch_proc, args=(dec_proc, "ffmpeg"), daemon=True).start()
+                threading.Thread(target=_watch_proc, args=(sink_proc, sink_name), daemon=True).start()
+                return True, self._audio_backend
+            except OSError as exc:
+                self._audio_error = f"ffmpeg/{sink_name}: {exc}"
+
+        # 2) Fallback: ffplay or direct pw-play
+        for label, cmd in (
+            ("ffplay", [ffp, "-nodisp", "-autoexit", "-loglevel", "error", *(["-ss", f"{start_sec:.2f}"] if start_sec > 0.05 else []), str(p)] if ffp else None),
+            ("pw-play", [pw, "--media-role=Music", str(p)] if pw else None),
+        ):
+            if not cmd:
+                continue
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+                self._audio_proc = proc
+                self._audio_procs = [proc]
+                self._audio_backend = label
+                self._audio_error = ""
+                threading.Thread(target=_watch_proc, args=(proc, label), daemon=True).start()
+                return True, label
+            except OSError as exc:
+                self._audio_error = f"{label}: {exc}"
+
+        msg = self._audio_error or "No audio backend available (install ffmpeg + pw-play/ffplay)"
+        self._audio_error = msg
+        return False, msg
+
+    def audio_playback_status(self) -> tuple[bool, str, str]:
+        """Return ``(is_playing_locally, backend_label, last_error)``."""
+        procs = list(getattr(self, "_audio_procs", None) or ())
+        if not procs and getattr(self, "_audio_proc", None) is not None:
+            procs = [self._audio_proc]
+        alive = any(p is not None and p.poll() is None for p in procs)
+        return (
+            alive,
+            str(getattr(self, "_audio_backend", "") or ""),
+            str(getattr(self, "_audio_error", "") or ""),
+        )
+
     def stop_audio(self) -> None:
-        """Stop active PCM audio playback (locally or on remote client)."""
+        """Stop active audio playback (locally or on remote client)."""
         drv = getattr(self, "_driver", None)
         on_stop = getattr(drv, "on_audio_stop", None)
         if callable(on_stop):
             on_stop()
             return
+        procs = list(getattr(self, "_audio_procs", None) or ())
         proc = getattr(self, "_audio_proc", None)
-        if proc is not None:
+        if proc is not None and proc not in procs:
+            procs.append(proc)
+        for p in procs:
             try:
-                proc.terminate()
+                if p.stdin is not None:
+                    p.stdin.close()
             except Exception:  # noqa: BLE001
                 pass
-            self._audio_proc = None
+            try:
+                p.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+        for p in procs:
+            try:
+                p.wait(timeout=0.15)
+            except Exception:  # noqa: BLE001
+                try:
+                    p.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._audio_proc = None
+        self._audio_procs = []
 
     def request_client_file(
         self,

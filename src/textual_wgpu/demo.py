@@ -2947,7 +2947,7 @@ class PlayerScreen(Screen):
             self.query_one("#player-visualizer", Sparkline).data = list(self._env)
             self.query_one("#player-progress", ProgressBar).progress = 0.0
             self.query_one("#btn-player-play", Button).label = "▶ Play (Space)"
-            self.query_one("#status", StatusBar).update(f"F10 Player · loaded {path.name} · press Space to play")
+            self.query_one("#status", StatusBar).update(f"F10 Player · ♪ loaded {path.name} ({dur:.1f}s) — press Space to play")
         except Exception as exc:  # noqa: BLE001
             # Fallback: old approach — decode full PCM
             try:
@@ -2984,7 +2984,17 @@ class PlayerScreen(Screen):
         else:
             self._start_playback()
             self.query_one("#btn-player-play", Button).label = "⏸ Pause (Space)"
-            self.query_one("#status", StatusBar).update(f"F10 Player · playing {self._current_name}")
+            # Show real backend status
+            if self.app is not None and hasattr(self.app, "audio_playback_status"):
+                _ok, backend, err = self.app.audio_playback_status()
+                if err:
+                    self.query_one("#status", StatusBar).update(f"F10 Player · ❌ {err}")
+                elif backend:
+                    self.query_one("#status", StatusBar).update(f"F10 Player · ▶ {self._current_name} [{backend}]")
+                else:
+                    self.query_one("#status", StatusBar).update(f"F10 Player · playing {self._current_name}")
+            else:
+                self.query_one("#status", StatusBar).update(f"F10 Player · playing {self._current_name}")
 
     def stop_play(self) -> None:
         self._playing = False
@@ -3009,7 +3019,7 @@ class PlayerScreen(Screen):
     def _start_playback(self) -> None:
         self._playing = True
 
-        # Local speaker: play file directly via pw-play/ffplay (no WAV temp file!)
+        # Local speaker: play file directly via ffmpeg → pw-play (no WAV temp file!)
         if self.app is not None:
             if self._pcm:
                 # We have decoded PCM (remote file or fallback) — use play_audio_pcm
@@ -3017,7 +3027,12 @@ class PlayerScreen(Screen):
                     self.app.play_audio_pcm(self._pcm, sample_rate=self._sr, channels=self._ch)
             elif self._current_path and hasattr(self.app, "play_audio_file"):
                 # Stream-decode the file directly — no temp WAV!
-                self.app.play_audio_file(self._current_path)
+                ok, detail = self.app.play_audio_file(self._current_path)
+                if not ok:
+                    self.query_one("#status", StatusBar).update(f"F10 Player · ❌ {detail}")
+                    self._playing = False
+                    self.query_one("#btn-player-play", Button).label = "▶ Play (Space)"
+                    return
 
         # For remote speakers: tell each speaker device to play the file directly
         for s in self._active_sinks:
@@ -3137,20 +3152,32 @@ class PlayerScreen(Screen):
             return
         if self._playing:
             self._pos += 0.05
-            if self._pos >= self._dur:
-                # Track finished — auto-advance to next track
-                self._pos = self._dur
-                self._playing = False
-                self._stop_all_sinks()
-                try:
-                    self.query_one("#btn-player-play", Button).label = "▶ Play (Space)"
-                except Exception:  # noqa: BLE001
-                    pass
-                # Auto-advance
-                if self._playlist_idx >= 0 and self._playlist_idx < len(self._playlist) - 1:
-                    self._play_track_at(self._playlist_idx + 1)
-                elif self._pending_remote_files:
-                    self._play_next_remote()
+            # Check if audio process has exited (track finished)
+            if self.app is not None and hasattr(self.app, "audio_playback_status"):
+                is_alive, backend, err = self.app.audio_playback_status()
+                if err and not is_alive:
+                    self._playing = False
+                    self._stop_all_sinks()
+                    try:
+                        self.query_one("#btn-player-play", Button).label = "▶ Play (Space)"
+                        self.query_one("#status", StatusBar).update(f"F10 Player · ❌ {err}")
+                    except Exception:  # noqa: BLE001
+                        pass
+                elif not is_alive and not self._added_speaker_eps:
+                    # Local playback finished — auto-advance
+                    if self._pos >= self._dur:
+                        self._pos = self._dur
+                        self._playing = False
+                        self._stop_all_sinks()
+                        try:
+                            self.query_one("#btn-player-play", Button).label = "▶ Play (Space)"
+                        except Exception:  # noqa: BLE001
+                            pass
+                        # Auto-advance
+                        if self._playlist_idx >= 0 and self._playlist_idx < len(self._playlist) - 1:
+                            self._play_track_at(self._playlist_idx + 1)
+                        elif self._pending_remote_files:
+                            self._play_next_remote()
             try:
                 pct = min(100.0, (self._pos / max(0.1, self._dur)) * 100.0)
                 self.query_one("#player-progress", ProgressBar).progress = pct

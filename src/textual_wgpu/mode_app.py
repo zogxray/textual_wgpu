@@ -773,6 +773,8 @@ class ModeApp(App):
         entries = []
         if self._open_file.get("unified"):
             entries.append(("devices_root", "", "↑ ..  (Switch Device)"))
+        if kind == "folder":
+            entries.append(("select_folder", str(folder), f"✓ Select This Folder ({folder.name or str(folder)})"))
         if folder.parent != folder:
             entries.append(("up", str(folder.parent), f"↑ ..  ({folder.parent})"))
         try:
@@ -1039,6 +1041,9 @@ class ModeApp(App):
         entry_kind, path_s, _label = entries[idx]
         kind = self._open_file.get("kind") or "file"
         if entry_kind == "info":
+            return
+        if entry_kind == "select_folder":
+            self._open_file_accept(Path(path_s))
             return
         if entry_kind == "devices_root":
             self._open_file["source_mode"] = "devices"
