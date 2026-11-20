@@ -708,32 +708,63 @@ class ModeApp(App):
     def _open_file_reload(self) -> None:
         assert self._open_file is not None
         if self._open_file.get("source_mode") == "devices":
-            from .remote.directory import discover_all_resources, local_device_profile
+            # Show local entries immediately, load remote devices in background
+            from .remote.directory import local_device_profile
 
             local = local_device_profile()
             drv = getattr(self, "_driver", None)
-            file_resources = discover_all_resources(kind="files", driver=drv)
             entries: list[tuple[str, str, str]] = []
-            res_endpoints: dict[str, tuple[str, int]] = {}
-            for res in file_resources:
-                if res.device_id == local.device_id:
-                    if local.kind == "android":
-                        entries.append(("android_dir", "", f"{local.icon} {local.name} (Downloads / Media)/"))
-                    else:
-                        dl = Path.home() / "Downloads"
-                        if dl.is_dir():
-                            entries.append(("dir", str(dl), f"{local.icon} {local.name} · Downloads/"))
-                        entries.append(("dir", str(Path.home()), f"{local.icon} {local.name} · Home/"))
-                elif res.port > 0:
-                    res_endpoints[res.uid] = (res.host, res.port)
-                    entries.append(("res_root", res.uid, f"{res.icon} {res.device_name} (Downloads / Media)/"))
-                else:
-                    entries.append(("peer_dir", "", f"{res.icon} {res.device_name} (Downloads / Media)/"))
-            self._open_file["res_endpoints"] = res_endpoints
+            if local.kind == "android":
+                entries.append(("android_dir", "", f"{local.icon} {local.name} (Downloads / Media)/"))
+            else:
+                dl = Path.home() / "Downloads"
+                if dl.is_dir():
+                    entries.append(("dir", str(dl), f"{local.icon} {local.name} · Downloads/"))
+                entries.append(("dir", str(Path.home()), f"{local.icon} {local.name} · Home/"))
+            entries.append(("info", "", "  Scanning other devices…"))
+            self._open_file["res_endpoints"] = {}
             self._open_file["entries"] = entries
-            self._open_file["index"] = min(self._open_file["index"], max(0, len(entries) - 1))
+            self._open_file["index"] = 0
             self._open_file["path_value"] = "Select device…"
             self._open_file_ensure_visible()
+            self.request_draw()
+
+            # Discover remote file devices in background thread
+            def _worker() -> None:
+                from .remote.directory import discover_all_resources
+
+                file_resources = discover_all_resources(kind="files", driver=drv)
+
+                def _apply() -> None:
+                    modal = self._open_file
+                    if modal is None or modal.get("source_mode") != "devices":
+                        return
+                    out: list[tuple[str, str, str]] = []
+                    res_endpoints: dict[str, tuple[str, int]] = {}
+                    for res in file_resources:
+                        if res.device_id == local.device_id:
+                            if local.kind == "android":
+                                out.append(("android_dir", "", f"{local.icon} {local.name} (Downloads / Media)/"))
+                            else:
+                                dl = Path.home() / "Downloads"
+                                if dl.is_dir():
+                                    out.append(("dir", str(dl), f"{local.icon} {local.name} · Downloads/"))
+                                out.append(("dir", str(Path.home()), f"{local.icon} {local.name} · Home/"))
+                        elif res.port > 0:
+                            res_endpoints[res.uid] = (res.host, res.port)
+                            out.append(("res_root", res.uid, f"{res.icon} {res.device_name} (Downloads / Media)/"))
+                        else:
+                            out.append(("peer_dir", "", f"{res.icon} {res.device_name} (Downloads / Media)/"))
+                    modal["res_endpoints"] = res_endpoints
+                    modal["entries"] = out
+                    modal["index"] = min(int(modal["index"]), max(0, len(out) - 1))
+                    self.request_draw()
+
+                self.call_from_thread(_apply)
+
+            import threading
+
+            threading.Thread(target=_worker, daemon=True).start()
             return
 
         folder: Path = self._open_file["folder"]

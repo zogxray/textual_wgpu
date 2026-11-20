@@ -585,28 +585,81 @@ class App:
         self.stop_audio()
         import shutil
         import subprocess
-        import tempfile
-        import wave
-        from pathlib import Path
 
-        tmp = Path(tempfile.gettempdir()) / "textual-wgpu-local-audio.wav"
-        with wave.open(str(tmp), "wb") as wf:
-            wf.setnchannels(max(1, int(channels)))
-            wf.setsampwidth(2)
-            wf.setframerate(max(8000, int(sample_rate)))
-            wf.writeframes(pcm)
+        # Stream PCM directly to pw-play stdin — no WAV temp file needed
         for tool in ("pw-play", "paplay", "aplay"):
             exe = shutil.which(tool)
-            if exe:
-                try:
-                    self._audio_proc = subprocess.Popen(
-                        [exe, str(tmp)],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                except OSError:
-                    self._audio_proc = None
+            if not exe:
+                continue
+            args = [exe]
+            if tool == "pw-play":
+                args = ["pw-play", "--format=s16", f"--rate={int(sample_rate)}", f"--channels={int(max(1, channels))}", "-"]
+            elif tool == "paplay":
+                args = ["paplay", "--raw", "--format=s16le", f"--rate={int(sample_rate)}", f"--channels={int(max(1, channels))}"]
+            elif tool == "aplay":
+                args = ["aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", str(int(sample_rate)), "-c", str(int(max(1, channels))), "-"]
+            try:
+                self._audio_proc = subprocess.Popen(
+                    args,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                # Write PCM in a thread so we don't block the UI loop
+                import threading
+
+                proc = self._audio_proc
+
+                def _write() -> None:
+                    try:
+                        if proc.stdin is not None:
+                            proc.stdin.write(pcm)
+                            proc.stdin.close()
+                            proc.wait(timeout=10)
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                threading.Thread(target=_write, daemon=True).start()
                 break
+            except OSError:
+                self._audio_proc = None
+
+    def play_audio_file(self, path: str) -> bool:
+        """Play an audio file (MP3, WAV, OGG, etc.) directly via pw-play/ffplay — no temp WAV.
+
+        Returns True if playback started successfully.
+        """
+        drv = getattr(self, "_driver", None)
+        on_play = getattr(drv, "on_audio_play", None)
+        if callable(on_play):
+            # Remote: decode to PCM and send (fallback)
+            from .remote.media_codec import decode_audio_file_pcm
+            pcm, sr, ch, _env, _dur = decode_audio_file_pcm(path, sample_rate=22050, channels=1)
+            on_play(pcm, sample_rate=sr, channels=ch)
+            return True
+        self.stop_audio()
+        import shutil
+        import subprocess
+
+        # Try pw-play directly (PipeWire can decode MP3/OGG/FLAC/WAV natively)
+        for tool, args in (
+            ("pw-play", ["pw-play", path]),
+            ("ffplay", ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path]),
+            ("aplay", ["aplay", "-q", path]),
+        ):
+            exe = shutil.which(tool)
+            if not exe:
+                continue
+            try:
+                self._audio_proc = subprocess.Popen(
+                    args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return True
+            except OSError:
+                continue
+        return False
 
     def stop_audio(self) -> None:
         """Stop active PCM audio playback (locally or on remote client)."""

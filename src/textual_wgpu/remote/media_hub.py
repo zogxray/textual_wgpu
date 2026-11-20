@@ -719,8 +719,8 @@ class ResourceServer:
                 source_port = int(req.get("source_port") or 0)
                 source_path = str(req.get("source_path") or "")
 
-                # Resolve the file path
                 try:
+                    # Resolve the file path
                     if local_path and Path(local_path).is_file():
                         file_path = local_path
                     elif source_host and source_port > 0 and source_path:
@@ -736,18 +736,56 @@ class ResourceServer:
                         conn.sendall(b'{"ok":false,"error":"no path or source specified"}\n')
                         return
 
-                    # Decode locally
-                    from .media_codec import decode_audio_file_pcm
+                    # Get duration for the client
+                    import shutil as _sh
 
-                    pcm, dec_sr, dec_ch, env, dur = decode_audio_file_pcm(file_path, sample_rate=sr, channels=ch)
-                    # Send response BEFORE playing so client doesn't block
-                    conn.sendall((json.dumps({"ok": True, "name": Path(file_path).name, "dur": dur, "size": len(pcm)}) + "\n").encode("utf-8"))
-                    # Now play on local speaker (synchronous — blocks until done)
-                    sink = self._speaker_sink_factory(sr, ch)
-                    chunk = 8192
-                    for off in range(0, len(pcm), chunk):
-                        sink.write(pcm[off:off + chunk])
-                    sink.close()
+                    dur = 0.0
+                    ffprobe = _sh.which("ffprobe")
+                    if ffprobe:
+                        import subprocess as _sp
+
+                        rp = _sp.run(
+                            [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file_path],
+                            capture_output=True, text=True, timeout=3.0,
+                        )
+                        if rp.returncode == 0 and rp.stdout.strip():
+                            dur = float(rp.stdout.strip())
+
+                    # Send response BEFORE playing
+                    conn.sendall((json.dumps({"ok": True, "name": Path(file_path).name, "dur": dur, "size": 0}) + "\n").encode("utf-8"))
+
+                    # Play directly via pw-play/ffplay — no temp WAV, stream-decode!
+                    played = False
+                    for tool, args in (
+                        ("pw-play", ["pw-play", file_path]),
+                        ("ffplay", ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", file_path]),
+                        ("aplay", ["aplay", "-q", file_path]),
+                    ):
+                        exe = _sh.which(tool)
+                        if not exe:
+                            continue
+                        try:
+                            proc = subprocess.Popen(
+                                args,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
+                            proc.wait(timeout=max(10, dur + 5))
+                            played = True
+                            break
+                        except Exception:  # noqa: BLE001
+                            continue
+
+                    if not played:
+                        # Fallback: decode to PCM and stream to speaker
+                        from .media_codec import decode_audio_file_pcm
+
+                        pcm, dec_sr, dec_ch, _env, _dur2 = decode_audio_file_pcm(file_path, sample_rate=sr, channels=ch)
+                        sink = self._speaker_sink_factory(sr, ch)
+                        chunk = 8192
+                        for off in range(0, len(pcm), chunk):
+                            sink.write(pcm[off:off + chunk])
+                        sink.close()
                 except Exception as exc:  # noqa: BLE001
                     try:
                         conn.sendall((json.dumps({"ok": False, "error": str(exc)}) + "\n").encode("utf-8"))

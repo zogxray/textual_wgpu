@@ -2681,17 +2681,28 @@ class PlayerScreen(Screen):
         self.on_screen_pause()
 
     def refresh_resources(self) -> None:
+        import threading
+
         from .remote.directory import discover_all_resources
 
         drv = getattr(self.app, "_driver", None) if self.app is not None else None
-        self._speakers = discover_all_resources(kind="speaker", driver=drv)
-        sl = self.query_one("#player-speaker-list", OptionList)
-        sl.clear_options()
-        for s in self._speakers:
-            sl.add_option(Option(f"{s.icon} {s.device_name} · Speaker (:{s.port})", id=s.uid))
-        self.query_one("#status", StatusBar).update(
-            f"F10 Player · {len(self._speakers)} speakers available · press O to open a file",
-        )
+
+        def _worker() -> None:
+            speakers = discover_all_resources(kind="speaker", driver=drv)
+
+            def _apply() -> None:
+                self._speakers = speakers
+                sl = self.query_one("#player-speaker-list", OptionList)
+                sl.clear_options()
+                for s in self._speakers:
+                    sl.add_option(Option(f"{s.icon} {s.device_name} · Speaker (:{s.port})", id=s.uid))
+                self.query_one("#status", StatusBar).update(
+                    f"F10 Player · {len(self._speakers)} speakers · press O for file, F for folder",
+                )
+
+            self.call_from_thread(_apply)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def open_file(self) -> None:
         if self.app is None or not hasattr(self.app, "ask_open_file"):
@@ -2893,30 +2904,72 @@ class PlayerScreen(Screen):
 
     def _load_local_file(self, path: Path) -> None:
         self.stop_play()
+        # For local playback we don't need to decode the whole file upfront —
+        # pw-play can decode MP3/OGG/FLAC/WAV natively.
+        # We only need the duration for the progress bar, so probe quickly.
         try:
-            from .remote.media_codec import decode_audio_file_pcm
+            from .remote.media_codec import probe_media_file
 
-            pcm, sr, ch, env, dur = decode_audio_file_pcm(path, sample_rate=22050, channels=1)
-            self._pcm = pcm
-            self._sr = sr
-            self._ch = ch
-            self._env = env
+            info = probe_media_file(path)
+            dur = float(info.get("fps", 0))
+            # ffprobe doesn't give duration directly in our probe; estimate from size
+            # For the progress bar, use ffprobe to get duration
+            import shutil as _sh
+
+            ffprobe = _sh.which("ffprobe")
+            if ffprobe:
+                import subprocess as _sp
+
+                res = _sp.run(
+                    [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+                    capture_output=True, text=True, timeout=3.0,
+                )
+                if res.returncode == 0 and res.stdout.strip():
+                    dur = float(res.stdout.strip())
+            if dur <= 0:
+                dur = 4.0  # fallback
+
+            self._pcm = b""  # Don't decode — play_audio_file streams directly
+            self._sr = 22050
+            self._ch = 1
+            self._env = [0.05] * 48
             self._dur = dur
             self._current_name = path.name
             self._current_path = str(path)
             self._current_source = {"type": "local", "path": str(path)}
             self._pos = 0.0
             self._playing = False
-            self.query_one("#player-now-playing", Static).update(f"♪ {path.name} ({dur:.1f}s · {sr}Hz)")
-            self.query_one("#player-visualizer", Sparkline).data = list(env)
+            self.query_one("#player-now-playing", Static).update(f"♪ {path.name} ({dur:.1f}s)")
+            self.query_one("#player-visualizer", Sparkline).data = list(self._env)
             self.query_one("#player-progress", ProgressBar).progress = 0.0
             self.query_one("#btn-player-play", Button).label = "▶ Play (Space)"
             self.query_one("#status", StatusBar).update(f"F10 Player · loaded {path.name} · press Space to play")
         except Exception as exc:  # noqa: BLE001
-            self.query_one("#status", StatusBar).update(f"F10 Player · load error: {exc}")
+            # Fallback: old approach — decode full PCM
+            try:
+                from .remote.media_codec import decode_audio_file_pcm
+
+                pcm, sr, ch, env, dur = decode_audio_file_pcm(path, sample_rate=22050, channels=1)
+                self._pcm = pcm
+                self._sr = sr
+                self._ch = ch
+                self._env = env
+                self._dur = dur
+                self._current_name = path.name
+                self._current_path = str(path)
+                self._current_source = {"type": "local", "path": str(path)}
+                self._pos = 0.0
+                self._playing = False
+                self.query_one("#player-now-playing", Static).update(f"♪ {path.name} ({dur:.1f}s · {sr}Hz)")
+                self.query_one("#player-visualizer", Sparkline).data = list(env)
+                self.query_one("#player-progress", ProgressBar).progress = 0.0
+                self.query_one("#btn-player-play", Button).label = "▶ Play (Space)"
+                self.query_one("#status", StatusBar).update(f"F10 Player · loaded {path.name} · press Space to play")
+            except Exception as exc2:  # noqa: BLE001
+                self.query_one("#status", StatusBar).update(f"F10 Player · load error: {exc2}")
 
     def toggle_play(self) -> None:
-        if not self._pcm:
+        if not self._current_path:
             self.query_one("#status", StatusBar).update("F10 Player · no track loaded (press O)")
             return
         if self._playing:
@@ -2952,12 +3005,17 @@ class PlayerScreen(Screen):
     def _start_playback(self) -> None:
         self._playing = True
 
-        # For local speaker: decode + play via app.play_audio_pcm (already decoded)
-        if self.app is not None and hasattr(self.app, "play_audio_pcm"):
-            self.app.play_audio_pcm(self._pcm, sample_rate=self._sr, channels=self._ch)
+        # Local speaker: play file directly via pw-play/ffplay (no WAV temp file!)
+        if self.app is not None:
+            if self._pcm:
+                # We have decoded PCM (remote file or fallback) — use play_audio_pcm
+                if hasattr(self.app, "play_audio_pcm"):
+                    self.app.play_audio_pcm(self._pcm, sample_rate=self._sr, channels=self._ch)
+            elif self._current_path and hasattr(self.app, "play_audio_file"):
+                # Stream-decode the file directly — no temp WAV!
+                self.app.play_audio_file(self._current_path)
 
         # For remote speakers: tell each speaker device to play the file directly
-        # (the speaker device fetches from the file device and decodes locally)
         for s in self._active_sinks:
             try:
                 s.close()
@@ -3047,22 +3105,23 @@ class PlayerScreen(Screen):
     def _build_file_info(self) -> dict[str, Any]:
         """Build file_info dict describing where the current track lives."""
         info: dict[str, Any] = {"local_path": "", "source_host": "", "source_port": 0, "source_path": ""}
-        # If we have a local copy (already decoded), use local_path
-        if self._current_path and Path(self._current_path).is_file():
+        src = getattr(self, "_current_source", {}) or {}
+        if src.get("type") == "local" and self._current_path:
+            # File is on this device — remote speakers should fetch from our :7423
+            from .remote.media_hub import RESOURCE_SERVICE_PORT
+
             info["local_path"] = self._current_path
-        # If the current track came from a remote device, store source info
-        if hasattr(self, "_current_source") and self._current_source:
-            src = self._current_source
-            if src.get("type") == "resource":
-                info["source_host"] = src.get("host", "")
-                info["source_port"] = src.get("port", 0)
-                info["source_path"] = src.get("path", "")
-                info["local_path"] = ""  # speaker device should fetch from source
-            elif src.get("type") == "android":
-                info["source_host"] = src.get("host", "")
-                info["source_port"] = src.get("port", 0)
-                info["source_path"] = src.get("path", "")
-                info["local_path"] = ""
+            info["source_host"] = "127.0.0.1"
+            info["source_port"] = RESOURCE_SERVICE_PORT
+            info["source_path"] = self._current_path
+        elif src.get("type") == "resource":
+            info["source_host"] = src.get("host", "")
+            info["source_port"] = src.get("port", 0)
+            info["source_path"] = src.get("path", "")
+        elif src.get("type") == "android":
+            info["source_host"] = src.get("host", "")
+            info["source_port"] = src.get("port", 0)
+            info["source_path"] = src.get("path", "")
         return info
 
     def clear_speakers(self) -> None:

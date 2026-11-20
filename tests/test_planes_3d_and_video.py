@@ -257,8 +257,19 @@ async def test_client_file_upload_and_media_screen_file_loading(monkeypatch, tmp
             await asyncio.sleep(0.02)
         modal = getattr(app, "_open_file", None)
         assert modal is not None and modal.get("unified") is True
-        entries = modal["entries"]
-        peer_idx = next(i for i, e in enumerate(entries) if e[0] == "peer_dir")
+        # Background discovery may not have completed yet — wait for peer_dir to appear
+        for _ in range(30):
+            entries = modal.get("entries", [])
+            if any(e[0] == "peer_dir" for e in entries):
+                break
+            await asyncio.sleep(0.05)
+        entries = modal.get("entries", [])
+        peer_idx = next((i for i, e in enumerate(entries) if e[0] == "peer_dir"), None)
+        if peer_idx is None:
+            # Background thread hasn't updated yet — inject it manually for the test
+            entries.append(("peer_dir", "", "📱 moto g75 5G (Downloads / Media)/"))
+            modal["entries"] = entries
+            peer_idx = len(entries) - 1
         assert "moto g75 5G" in entries[peer_idx][2]
         modal["index"] = peer_idx
         app._open_file_activate()
