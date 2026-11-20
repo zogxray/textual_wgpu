@@ -710,6 +710,54 @@ class ResourceServer:
                     except Exception:  # noqa: BLE001
                         pass
                 return
+            if op == "play_file":
+                # Tell this device to play a file, optionally from a remote file device.
+                # {"op":"play_file","path":"/path/to/audio.mp3","sr":22050,"ch":1,
+                #  "source_host":"127.0.0.1","source_port":7424,"source_path":"/remote/path.mp3"}
+                sr = int(req.get("sr") or 22050)
+                ch = int(req.get("ch") or 1)
+                local_path = str(req.get("path") or "")
+                source_host = str(req.get("source_host") or "")
+                source_port = int(req.get("source_port") or 0)
+                source_path = str(req.get("source_path") or "")
+
+                def _decode_and_play() -> None:
+                    try:
+                        from .media_codec import decode_audio_file_pcm
+
+                        if local_path and Path(local_path).is_file():
+                            file_path = local_path
+                        elif source_host and source_port > 0 and source_path:
+                            from .media_hub import resource_fs_get
+
+                            res = resource_fs_get(source_host, source_port, source_path)
+                            if res is None:
+                                conn.sendall((json.dumps({"ok": False, "error": "file not found on source device"}) + "\n").encode("utf-8"))
+                                return
+                            name, data = res
+                            tmp = cache_dir() / f"play_file_{name}"
+                            tmp.write_bytes(data)
+                            file_path = tmp
+                        else:
+                            conn.sendall(b'{"ok":false,"error":"no path or source specified"}\n')
+                            return
+
+                        pcm, dec_sr, dec_ch, env, dur = decode_audio_file_pcm(file_path, sample_rate=sr, channels=ch)
+                        sink = self._speaker_sink_factory(sr, ch)
+                        conn.sendall((json.dumps({"ok": True, "name": Path(file_path).name, "dur": dur, "size": len(pcm)}) + "\n").encode("utf-8"))
+                        chunk = 8192
+                        for off in range(0, len(pcm), chunk):
+                            sink.write(pcm[off:off + chunk])
+                        sink.close()
+                    except Exception as exc:  # noqa: BLE001
+                        try:
+                            conn.sendall((json.dumps({"ok": False, "error": str(exc)}) + "\n").encode("utf-8"))
+                        except OSError:
+                            pass
+
+                conn.settimeout(None)
+                threading.Thread(target=_decode_and_play, daemon=True).start()
+                return
             if op == "ai_infer":
                 from .ai_resource import run_ai_inference
 
@@ -1341,6 +1389,58 @@ def resource_stop_session(host: str, port: int, session_id: str, *, timeout: flo
         return bool(data.get("ok"))
     except (OSError, json.JSONDecodeError):
         return False
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def resource_play_file(
+    speaker_host: str,
+    speaker_port: int,
+    *,
+    local_path: str = "",
+    source_host: str = "",
+    source_port: int = 0,
+    source_path: str = "",
+    sample_rate: int = 22050,
+    channels: int = 1,
+) -> dict[str, Any] | None:
+    """Tell the speaker device to decode and play a file on its own audio output.
+
+    The file can be local to the speaker device (``local_path``) or fetched from
+    another device's Resource Service (``source_host``/``source_port``/``source_path``).
+
+    Returns {"ok": true, "name": ..., "dur": ..., "size": ...} on success.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5.0)
+    try:
+        s.connect((speaker_host, int(speaker_port)))
+        req: dict[str, Any] = {
+            "op": "play_file",
+            "sr": int(sample_rate),
+            "ch": int(channels),
+        }
+        if local_path:
+            req["path"] = local_path
+        elif source_host and source_port > 0 and source_path:
+            req["source_host"] = source_host
+            req["source_port"] = int(source_port)
+            req["source_path"] = source_path
+        else:
+            return None
+        s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+        line = _read_line(s)
+        if not line:
+            return None
+        data = json.loads(line)
+        if isinstance(data, dict) and data.get("ok"):
+            return data
+        return None
+    except (OSError, json.JSONDecodeError):
+        return None
     finally:
         try:
             s.close()

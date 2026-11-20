@@ -84,6 +84,73 @@ object LocalResourceServer {
         out.flush()
     }
 
+    private fun decodeAudioFile(ctx: Context, path: String, targetSr: Int, targetCh: Int): ByteArray? {
+        try {
+            val extractor = MediaExtractor()
+            extractor.setDataSource(path)
+            var audioTrack = -1
+            for (i in 0 until extractor.trackCount) {
+                val fmt = extractor.getTrackFormat(i)
+                val mime = fmt.getString(MediaFormat.KEY_MIME) ?: ""
+                if (mime.startsWith("audio/")) {
+                    audioTrack = i
+                    break
+                }
+            }
+            if (audioTrack < 0) return null
+            extractor.selectTrack(audioTrack)
+            val inputFormat = extractor.getTrackFormat(audioTrack)
+            val mime = inputFormat.getString(MediaFormat.KEY_MIME) ?: "audio/mp4a-latm"
+            val codec = MediaCodec.createDecoderByType(mime)
+            codec.configure(inputFormat, null, null, 0)
+            codec.start()
+
+            val out = ByteArrayOutputStream()
+            val info = MediaCodec.BufferInfo()
+            val timeoutUs = 5000L
+            var sawEos = false
+
+            while (true) {
+                if (!sawEos) {
+                    val inIdx = codec.dequeueInputBuffer(timeoutUs)
+                    if (inIdx >= 0) {
+                        val inBuf = codec.getInputBuffer(inIdx) ?: continue
+                        val n = extractor.readSampleData(inBuf, 0)
+                        if (n < 0) {
+                            codec.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            sawEos = true
+                        } else {
+                            codec.queueInputBuffer(inIdx, 0, n, extractor.sampleTime.coerceAtLeast(0L), 0)
+                            extractor.advance()
+                        }
+                    }
+                }
+                val outIdx = codec.dequeueOutputBuffer(info, timeoutUs)
+                if (outIdx >= 0) {
+                    val outBuf = codec.getOutputBuffer(outIdx)
+                    if (outBuf != null && info.size > 0) {
+                        outBuf.position(info.offset)
+                        val chunk = ByteArray(info.size)
+                        outBuf.get(chunk)
+                        out.write(chunk)
+                    }
+                    codec.releaseOutputBuffer(outIdx, false)
+                    if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) break
+                }
+            }
+            codec.stop()
+            codec.release()
+            extractor.release()
+
+            // If target format matches, return raw PCM
+            // For simplicity, return raw decoded PCM (player handles sample rate)
+            return out.toByteArray()
+        } catch (t: Throwable) {
+            TwLog.err("TwRes", "decodeAudioFile failed", t)
+            return null
+        }
+    }
+
     private fun handleConn(ctx: Context, conn: Socket) {
         try {
             conn.soTimeout = 5000
@@ -192,6 +259,97 @@ object LocalResourceServer {
                     val txt = req.optString("text", "")
                     LocalMediaHelper.setClipboardText(ctx, txt)
                     writeJsonLine(out, JSONObject().apply { put("ok", true) })
+                }
+                "play_file" -> {
+                    val sr = req.optInt("sr", 22050)
+                    val ch = req.optInt("ch", 1)
+                    val localPath = req.optString("path", "")
+                    val sourceHost = req.optString("source_host", "")
+                    val sourcePort = req.optInt("source_port", 0)
+                    val sourcePath = req.optString("source_path", "")
+
+                    Thread({
+                        try {
+                            var filePath = localPath
+                            if (filePath.isEmpty() && sourceHost.isNotEmpty() && sourcePort > 0 && sourcePath.isNotEmpty()) {
+                                // Fetch from remote resource server
+                                val s = Socket(sourceHost, sourcePort)
+                                s.soTimeout = 5000
+                                s.getOutputStream().write(("{\"op\":\"fs_get\",\"path\":\"$sourcePath\"}\n").toByteArray())
+                                // Read JSON header line
+                                val hdrBuf = ByteArrayOutputStream()
+                                while (hdrBuf.size() < 65536) {
+                                    val b = s.getInputStream().read()
+                                    if (b < 0 || b == '\n'.code) break
+                                    hdrBuf.write(b)
+                                }
+                                val hdr = JSONObject(hdrBuf.toString(Charsets.UTF_8.name()))
+                                if (!hdr.optBoolean("ok", false)) {
+                                    writeJsonLine(out, JSONObject().apply {
+                                        put("ok", false)
+                                        put("error", "file not found on source")
+                                    })
+                                    s.close()
+                                    return@Thread
+                                }
+                                val name = hdr.optString("name", "audio.bin")
+                                val size = hdr.optInt("size", 0)
+                                val data = ByteArray(size)
+                                val dis = java.io.DataInputStream(s.getInputStream())
+                                dis.readFully(data)
+                                s.close()
+                                val tmpFile = java.io.File(ctx.cacheDir, "play_file_$name")
+                                tmpFile.writeBytes(data)
+                                filePath = tmpFile.absolutePath
+                            }
+                            if (filePath.isEmpty()) {
+                                writeJsonLine(out, JSONObject().apply {
+                                    put("ok", false)
+                                    put("error", "no path specified")
+                                })
+                                return@Thread
+                            }
+                            // Decode audio using MediaExtractor + MediaCodec
+                            val pcm = decodeAudioFile(ctx, filePath, sr, ch)
+                            if (pcm == null || pcm.isEmpty()) {
+                                writeJsonLine(out, JSONObject().apply {
+                                    put("ok", false)
+                                    put("error", "decode failed")
+                                })
+                                return@Thread
+                            }
+                            val track = LocalMediaHelper.createSpeakerTrack(sr, ch)
+                            if (track == null) {
+                                writeJsonLine(out, JSONObject().apply {
+                                    put("ok", false)
+                                    put("error", "speaker unavailable")
+                                })
+                                return@Thread
+                            }
+                            conn.soTimeout = 0
+                            val dur = pcm.size.toFloat() / (sr * ch * 2)
+                            writeJsonLine(out, JSONObject().apply {
+                                put("ok", true)
+                                put("name", java.io.File(filePath).name)
+                                put("dur", dur.toDouble())
+                                put("size", pcm.size)
+                            })
+                            track.write(pcm, 0, pcm.size)
+                            Thread.sleep(250)
+                            try { track.stop() } catch (_: Throwable) {}
+                            try { track.release() } catch (_: Throwable) {}
+                        } catch (t: Throwable) {
+                            try {
+                                writeJsonLine(out, JSONObject().apply {
+                                    put("ok", false)
+                                    put("error", t.message ?: "play_file failed")
+                                })
+                            } catch (_: Throwable) {}
+                        }
+                    }, "tw-play-file").apply {
+                        isDaemon = true
+                        start()
+                    }
                 }
                 "play" -> {
                     val sr = req.optInt("sr", 16000)

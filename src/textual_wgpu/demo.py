@@ -2611,6 +2611,7 @@ class PlayerScreen(Screen):
         self._playlist_idx: int = -1
         self._loading_playlist: bool = False
         self._pending_remote_files: list[tuple[str, str, int, str, str]] = []
+        self._current_source: dict[str, Any] = {}  # where the current track came from
 
     def compose(self):
         yield _mode_bar(self, "player")
@@ -2887,6 +2888,7 @@ class PlayerScreen(Screen):
         safe = Path(name or "audio.bin").name
         dst = _media_asset_dir() / f"player_{safe}"
         dst.write_bytes(data)
+        self._current_source = {"type": "local", "path": str(dst)}
         self._load_local_file(dst)
 
     def _load_local_file(self, path: Path) -> None:
@@ -2902,6 +2904,7 @@ class PlayerScreen(Screen):
             self._dur = dur
             self._current_name = path.name
             self._current_path = str(path)
+            self._current_source = {"type": "local", "path": str(path)}
             self._pos = 0.0
             self._playing = False
             self.query_one("#player-now-playing", Static).update(f"♪ {path.name} ({dur:.1f}s · {sr}Hz)")
@@ -2948,29 +2951,63 @@ class PlayerScreen(Screen):
 
     def _start_playback(self) -> None:
         self._playing = True
-        # Play to local speaker (app.play_audio_pcm)
+
+        # For local speaker: decode + play via app.play_audio_pcm (already decoded)
         if self.app is not None and hasattr(self.app, "play_audio_pcm"):
             self.app.play_audio_pcm(self._pcm, sample_rate=self._sr, channels=self._ch)
-        # Also play to any explicitly added remote speakers
+
+        # For remote speakers: tell each speaker device to play the file directly
+        # (the speaker device fetches from the file device and decodes locally)
         for s in self._active_sinks:
             try:
                 s.close()
             except Exception:  # noqa: BLE001
                 pass
         self._active_sinks.clear()
-        for ep_host, ep_port in self._added_speaker_eps:
-            try:
-                from .remote.media_hub import RemoteSpeakerSink
 
-                sink = RemoteSpeakerSink(ep_host, ep_port, sample_rate=self._sr, channels=self._ch)
-                threading.Thread(
-                    target=self._stream_to_sink,
-                    args=(sink, self._pcm, self._sr, self._ch),
-                    daemon=True,
-                ).start()
-                self._active_sinks.append(sink)
-            except Exception:  # noqa: BLE001
-                pass
+        for ep_host, ep_port, file_info in self._added_speaker_eps:
+            self._play_file_on_speaker(ep_host, ep_port, file_info)
+
+    def _play_file_on_speaker(self, spk_host: str, spk_port: int, file_info: dict[str, Any]) -> None:
+        """Tell a speaker device to play a file. Uses play_file so the speaker device
+        decodes the file locally — no PCM streaming across the network."""
+
+        def _worker() -> None:
+            from .remote.media_hub import resource_play_file
+
+            result = resource_play_file(
+                spk_host,
+                spk_port,
+                local_path=file_info.get("local_path", ""),
+                source_host=file_info.get("source_host", ""),
+                source_port=file_info.get("source_port", 0),
+                source_path=file_info.get("source_path", ""),
+                sample_rate=22050,
+                channels=1,
+            )
+            if result is None:
+                # Fallback: stream PCM directly (old approach)
+                try:
+                    from .remote.media_hub import RemoteSpeakerSink
+
+                    sink = RemoteSpeakerSink(spk_host, spk_port, sample_rate=self._sr, channels=self._ch)
+                    self._active_sinks.append(sink)
+                    threading.Thread(
+                        target=self._stream_to_sink,
+                        args=(sink, self._pcm, self._sr, self._ch),
+                        daemon=True,
+                    ).start()
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                dur = result.get("dur", 0)
+                self.call_from_thread(
+                    lambda: self.query_one("#status", StatusBar).update(
+                        f"F10 Player · playing on {spk_host}:{spk_port} ({dur:.1f}s)",
+                    )
+                )
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _stream_to_sink(self, sink: Any, pcm: bytes, sr: int, ch: int) -> None:
         try:
@@ -2982,7 +3019,7 @@ class PlayerScreen(Screen):
         except Exception:  # noqa: BLE001
             pass
 
-    _added_speaker_eps: list[tuple[str, int]] = []
+    _added_speaker_eps: list[tuple[str, int, dict[str, Any]]] = []
 
     def add_speaker_to_output(self) -> None:
         sl = self.query_one("#player-speaker-list", OptionList)
@@ -2992,33 +3029,46 @@ class PlayerScreen(Screen):
             return
         spk = self._speakers[idx]
         ep = (spk.host, spk.port)
-        if ep in self._added_speaker_eps:
-            self.query_one("#status", StatusBar).update(f"F10 Player · {spk.device_name} already added")
-            return
-        self._added_speaker_eps.append(ep)
+        # Check if already added (compare just host:port)
+        for h, p, _ in self._added_speaker_eps:
+            if (h, p) == ep:
+                self.query_one("#status", StatusBar).update(f"F10 Player · {spk.device_name} already added")
+                return
+        # Build file_info so the speaker device knows where to fetch the file
+        file_info = self._build_file_info()
+        self._added_speaker_eps.append((spk.host, spk.port, file_info))
         self.query_one("#status", StatusBar).update(
             f"F10 Player · + {spk.device_name} → {len(self._added_speaker_eps)} parallel speaker(s)",
         )
-        # If currently playing, immediately start streaming to this new speaker
+        # If currently playing, immediately start playing on this new speaker
         if self._playing:
-            try:
-                from .remote.media_hub import RemoteSpeakerSink
+            self._play_file_on_speaker(spk.host, spk.port, file_info)
 
-                sink = RemoteSpeakerSink(spk.host, spk.port, sample_rate=self._sr, channels=self._ch)
-                threading.Thread(
-                    target=self._stream_to_sink,
-                    args=(sink, self._pcm, self._sr, self._ch),
-                    daemon=True,
-                ).start()
-                self._active_sinks.append(sink)
-            except Exception:  # noqa: BLE001
-                pass
+    def _build_file_info(self) -> dict[str, Any]:
+        """Build file_info dict describing where the current track lives."""
+        info: dict[str, Any] = {"local_path": "", "source_host": "", "source_port": 0, "source_path": ""}
+        # If we have a local copy (already decoded), use local_path
+        if self._current_path and Path(self._current_path).is_file():
+            info["local_path"] = self._current_path
+        # If the current track came from a remote device, store source info
+        if hasattr(self, "_current_source") and self._current_source:
+            src = self._current_source
+            if src.get("type") == "resource":
+                info["source_host"] = src.get("host", "")
+                info["source_port"] = src.get("port", 0)
+                info["source_path"] = src.get("path", "")
+                info["local_path"] = ""  # speaker device should fetch from source
+            elif src.get("type") == "android":
+                info["source_host"] = src.get("host", "")
+                info["source_port"] = src.get("port", 0)
+                info["source_path"] = src.get("path", "")
+                info["local_path"] = ""
+        return info
 
     def clear_speakers(self) -> None:
         self._added_speaker_eps.clear()
         self._stop_all_sinks()
         self.query_one("#status", StatusBar).update("F10 Player · cleared parallel speakers")
-
     def _player_tick(self) -> None:
         if self.app is None or getattr(self.app, "mode_key", None) != "player":
             return
