@@ -2896,14 +2896,16 @@ class PlayerScreen(Screen):
         self._refresh_playlist_ui()
         total = len(self._playlist)
         if total:
+            # Auto-load the first track so Space can play it immediately
+            self._playlist_idx = 0
+            self._refresh_playlist_ui()
+            self._load_local_file(self._playlist[0])
             self.query_one("#status", StatusBar).update(
-                f"F10 Player · {total} tracks in {folder.name} · press Space to play",
+                f"F10 Player · {total} tracks in {folder.name} · Space to play 1/{total}",
             )
             self.query_one("#player-file-info", Static).update(
                 f"{total} tracks from {folder.name}",
             )
-            self._pipeline_input_device = f"💻 Local · {folder}"
-            self._set_pipeline_status("idle")
         else:
             self.query_one("#status", StatusBar).update(f"F10 Player · no audio files in {folder.name}")
             self._set_pipeline_status("idle")
