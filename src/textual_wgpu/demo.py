@@ -2700,7 +2700,11 @@ class PlayerScreen(Screen):
                     f"F10 Player · {len(self._speakers)} speakers · press O for file, F for folder",
                 )
 
-            self.call_from_thread(_apply)
+            loop = getattr(self.app, "_loop", None) if self.app is not None else None
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(_apply)
+            else:
+                _apply()
 
         threading.Thread(target=_worker, daemon=True).start()
 
