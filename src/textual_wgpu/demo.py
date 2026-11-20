@@ -2896,19 +2896,18 @@ class PlayerScreen(Screen):
         self._refresh_playlist_ui()
         total = len(self._playlist)
         if total:
-            # Auto-load the first track so Space can play it immediately
-            self._playlist_idx = 0
-            self._refresh_playlist_ui()
-            self._load_local_file(self._playlist[0])
+            # Just show the list. User selects a track and presses Space.
             self.query_one("#status", StatusBar).update(
-                f"F10 Player · {total} tracks in {folder.name} · Space to play 1/{total}",
+                f"F10 Player · {total} tracks in {folder.name} · ↑↓ to select · Space to play",
             )
             self.query_one("#player-file-info", Static).update(
                 f"{total} tracks from {folder.name}",
             )
+            # Highlight first track but don't load it
+            self.query_one("#player-file-list", OptionList).highlighted = 0
         else:
             self.query_one("#status", StatusBar).update(f"F10 Player · no audio files in {folder.name}")
-            self._set_pipeline_status("idle")
+        self._set_pipeline_status("idle")
 
     def _refresh_playlist_ui(self) -> None:
         fl = self.query_one("#player-file-list", OptionList)
@@ -2947,6 +2946,24 @@ class PlayerScreen(Screen):
         self._refresh_playlist_ui()
         self._load_local_file(self._playlist[idx])
         self.toggle_play()
+
+    def _play_selected_playlist_track(self) -> None:
+        """Play the currently highlighted track in the playlist list."""
+        fl = self.query_one("#player-file-list", OptionList)
+        idx = fl.highlighted
+        if idx is None or idx < 0:
+            return
+        if self._playlist and idx < len(self._playlist):
+            self._play_track_at(idx)
+        elif self._pending_remote_files:
+            # Remote tracks: play from pending list
+            offset = len(self._playlist)
+            ri = idx - offset
+            if ri >= 0 and ri < len(self._pending_remote_files):
+                # Move to front and play
+                item = self._pending_remote_files.pop(ri)
+                self._pending_remote_files.insert(0, item)
+                self._play_next_remote()
 
     def _play_next_remote(self) -> None:
         if not self._pending_remote_files:
@@ -3306,20 +3323,19 @@ class PlayerScreen(Screen):
                         self.query_one("#status", StatusBar).update(f"F10 Player · ❌ {err}")
                     except Exception:  # noqa: BLE001
                         pass
-                elif not is_alive and not self._added_speaker_eps:
-                    if self._pos >= self._dur:
-                        self._pos = self._dur
-                        self._playing = False
-                        self._stop_all_sinks()
-                        self._set_pipeline_status("finished")
-                        try:
-                            self.query_one("#btn-player-play", Button).label = "▶ Play (Space)"
-                        except Exception:  # noqa: BLE001
-                            pass
-                        if self._playlist_idx >= 0 and self._playlist_idx < len(self._playlist) - 1:
-                            self._play_track_at(self._playlist_idx + 1)
-                        elif self._pending_remote_files:
-                            self._play_next_remote()
+                elif not is_alive and not self._added_speaker_eps and self._pos > self._dur - 0.1:
+                    # Track finished — auto-advance to next
+                    self._playing = False
+                    self._stop_all_sinks()
+                    self._set_pipeline_status("finished")
+                    try:
+                        self.query_one("#btn-player-play", Button).label = "▶ Play (Space)"
+                    except Exception:  # noqa: BLE001
+                        pass
+                    if self._playlist_idx >= 0 and self._playlist_idx < len(self._playlist) - 1:
+                        self._play_track_at(self._playlist_idx + 1)
+                    elif self._pending_remote_files:
+                        self._play_next_remote()
             try:
                 pct = min(100.0, (self._pos / max(0.1, self._dur)) * 100.0)
                 self.query_one("#player-progress", ProgressBar).progress = pct
@@ -3339,8 +3355,17 @@ class PlayerScreen(Screen):
         if key == "f":
             self.open_folder()
             return True
+        if key == "enter":
+            # Enter on playlist = select & play that track
+            self._play_selected_playlist_track()
+            return True
         if key == "space":
-            self.toggle_play()
+            # Space: if a playlist track is highlighted and nothing loaded, play it.
+            # Otherwise toggle play/pause.
+            if not self._current_path and self._playlist:
+                self._play_selected_playlist_track()
+            else:
+                self.toggle_play()
             return True
         if key == "x":
             self.stop_play()
