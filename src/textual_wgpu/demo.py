@@ -2721,6 +2721,9 @@ class PlayerScreen(Screen):
                 self._playlist_idx = 0
                 self._refresh_playlist_ui()
                 self._load_local_file(p)
+                # Clear focus so Space reaches toggle_play instead of activating the button
+                if self.app is not None:
+                    self.app.set_focus(None)
 
         self.app.ask_open_file(
             start_dir,
@@ -2908,6 +2911,9 @@ class PlayerScreen(Screen):
 
     def _load_local_file(self, path: Path) -> None:
         self.stop_play()
+        # Clear focus so Space/Pause keys reach the screen instead of a button
+        if self.app is not None:
+            self.app.set_focus(None)
         # For local playback we don't need to decode the whole file upfront —
         # pw-play can decode MP3/OGG/FLAC/WAV natively.
         # We only need the duration for the progress bar, so probe quickly.
