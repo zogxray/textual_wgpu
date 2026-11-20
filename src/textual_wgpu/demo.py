@@ -2701,14 +2701,14 @@ class PlayerScreen(Screen):
 
         # Status indicator
         status_colors = {
-            "idle": ("dim", "○ idle"),
-            "loading": ("yellow", "◐ loading…"),
-            "playing": ("green", "▶ playing"),
-            "error": ("red", "✗ error"),
-            "finished": ("blue", "■ finished"),
+            "idle": ("", "○ idle", True),
+            "loading": ("yellow", "◐ loading…", True),
+            "playing": ("green", "▶ playing", True),
+            "error": ("red", "✗ error", True),
+            "finished": ("blue", "■ finished", True),
         }
-        color, icon = status_colors.get(self._pipeline_status, ("dim", "○ idle"))
-        t.append(f"  {icon}\n", style=Style(color=color, bold=True))
+        color, icon, bold = status_colors.get(self._pipeline_status, ("", "○ idle", True))
+        t.append(f"  {icon}\n", style=Style(color=color) if color else Style(dim=True, bold=True))
 
         # Input device (where the file lives)
         inp = self._pipeline_input_device or "(no file loaded)"
